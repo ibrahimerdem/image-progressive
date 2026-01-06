@@ -44,11 +44,11 @@ class Generator(nn.Module):
 
         self.text_embedding = nn.Sequential(
             nn.Linear(self.input_dim , self.embed_dim),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Dropout(0.2),
             nn.Linear(self.embed_dim, self.embed_out_dim),
             nn.BatchNorm1d(self.embed_out_dim),
-            nn.LeakyReLU(0.2, inplace=True)
+            nn.LeakyReLU(0.2, inplace=False)
         )
 
         self.fc_no_image = nn.Linear(self.noise_dim + self.embed_out_dim, 1024 * 4 * 4)
@@ -135,33 +135,33 @@ class Discriminator(nn.Module):
         self.input_dim = input_dim
 
         self.conv1 = nn.Conv2d(self.channels, 32, 4, 2, 1)
-        self.relu1 = nn.LeakyReLU(0.2, inplace=True)
+        self.relu1 = nn.LeakyReLU(0.2, inplace=False)
 
         self.conv2 = nn.Conv2d(32, 64, 4, 2, 1)
         self.bn2 = nn.BatchNorm2d(64)
-        self.relu2 = nn.LeakyReLU(0.2, inplace=True)
+        self.relu2 = nn.LeakyReLU(0.2, inplace=False)
 
         self.conv3 = nn.Conv2d(64, 128, 4, 2, 1)
         self.bn3 = nn.BatchNorm2d(128)
-        self.relu3 = nn.LeakyReLU(0.2, inplace=True)
+        self.relu3 = nn.LeakyReLU(0.2, inplace=False)
 
         self.attn = SelfAttention(128)
 
         self.conv4 = nn.Conv2d(128, 256, 4, 2, 1)
         self.bn4 = nn.BatchNorm2d(256)
-        self.relu4 = nn.LeakyReLU(0.2, inplace=True)
+        self.relu4 = nn.LeakyReLU(0.2, inplace=False)
 
         self.conv5 = nn.Conv2d(256, 512, 4, 2, 1)
         self.bn5 = nn.BatchNorm2d(512)
-        self.relu5 = nn.LeakyReLU(0.2, inplace=True)
+        self.relu5 = nn.LeakyReLU(0.2, inplace=False)
 
         self.text_embedding = nn.Sequential(
             nn.Linear(self.input_dim, self.embed_dim),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Dropout(0.1),
             nn.Linear(self.embed_dim, self.embed_out_dim),
             nn.BatchNorm1d(self.embed_out_dim),
-            nn.LeakyReLU(0.2, inplace=True)
+            nn.LeakyReLU(0.2, inplace=False)
         )
 
         self.output = nn.Conv2d(512 + self.embed_out_dim, 1, 4, 1, 0, bias=False)

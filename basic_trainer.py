@@ -316,6 +316,10 @@ def _ddp_train_worker(
         input_dim=feature_dim,
     ).to(device)
 
+    # Convert BatchNorm to SyncBatchNorm for DDP
+    generator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(generator)
+    discriminator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(discriminator)
+
     criterion = nn.BCELoss().to(device)
     l2_loss = nn.MSELoss().to(device)
     l1_loss = nn.L1Loss().to(device)
@@ -338,7 +342,7 @@ def _ddp_train_worker(
         elif rank == 0:
             print(f"[DDP] Checkpoint path {checkpoint_path} not found, starting from scratch")
 
-    generator = DDP(generator, device_ids=[rank])
+    generator = DDP(generator, device_ids=[rank], find_unused_parameters=True)
     discriminator = DDP(discriminator, device_ids=[rank])
 
     save_dir = "checkpoints"
@@ -510,6 +514,24 @@ def _ddp_train_worker(
                         "val_clip": avg_val_clip,
                     }
                 )
+
+                # Save checkpoint after validation
+                val_ckpt = os.path.join(save_dir, f"{model_name}_{ver}_epoch_{epoch}.pth")
+                torch.save(
+                    {
+                        "generator_state_dict": generator.module.state_dict(),
+                        "discriminator_state_dict": discriminator.module.state_dict(),
+                        "g_optimizer_state_dict": g_optimizer.state_dict(),
+                        "d_optimizer_state_dict": d_optimizer.state_dict(),
+                        "epoch": epoch,
+                        "val_l1": avg_val_l1,
+                        "val_psnr": avg_val_psnr,
+                        "val_ssim": avg_val_ssim,
+                        "val_clip": avg_val_clip,
+                    },
+                    val_ckpt,
+                )
+                print(f"[DDP] Checkpoint saved to {val_ckpt}")
         elif rank == 0:
             elapsed = time.time() - start_time
             print(
