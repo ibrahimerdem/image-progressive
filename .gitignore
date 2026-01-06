@@ -1,0 +1,30 @@
+# extensions
+*.egg-info
+*.py[cod]
+
+# envs
+.pt13
+.pt2
+.venv
+.env
+.env.*
+
+# directories
+/checkpoints
+/dist
+/outputs
+/build
+/src
+/.vscode
+**/__pycache__/
+
+# data
+/data
+/datasets
+/logs
+/results
+/samples
+
+# others
+commands.txt
+encoder_epoch_*.pth
