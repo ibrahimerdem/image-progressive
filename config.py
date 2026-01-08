@@ -33,6 +33,14 @@ L1_FACTOR = 50.0
 L2_FACTOR = 150.0
 VAL_EPOCH = 5
 
+# Stable diffusion defaults
+SD_LR = 2e-4
+SD_TIMESTEPS = 1000
+SD_SAMPLE_STEPS = 250
+SD_VAL_STEPS = 3
+SD_SAMPLE_BATCH = 4
+SD_LOG_INTERVAL = 20
+
 # Devices for training (indices as seen by the system)
 # Used by run_train.sh and DDP world size.
 DEVICE_IDS = [0, 1]
