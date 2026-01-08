@@ -51,8 +51,9 @@ class Generator(nn.Module):
             nn.LeakyReLU(0.2, inplace=False)
         )
 
-        self.fc_no_image = nn.Linear(self.noise_dim + self.embed_out_dim, 1024 * 4 * 4)
-        self.fc_with_image = nn.Linear(self.noise_dim + self.embed_out_dim + 512, 1024 * 4 * 4)
+        # Start from 6x6 feature map so 7 upsampling stages reach 768x768
+        self.fc_no_image = nn.Linear(self.noise_dim + self.embed_out_dim, 1024 * 6 * 6)
+        self.fc_with_image = nn.Linear(self.noise_dim + self.embed_out_dim + 512, 1024 * 6 * 6)
 
         if initial_image:
             if image_encoder is not None:
@@ -109,16 +110,16 @@ class Generator(nn.Module):
             z = self.fc_no_image(combined_features)
             image_features = None
 
-        z = z.view(z.shape[0], 1024, 4, 4)
+        z = z.view(z.shape[0], 1024, 6, 6)
 
-        z = F.relu(self.bn1(self.deconv1(z)))  # 8x8x512
-        z = F.relu(self.bn2(self.deconv2(z)))  # 16x16x256
-        z = F.relu(self.bn3(self.deconv3(z)))  # 32x32x128      
-        z = F.relu(self.bn4(self.deconv4(z)))  # 64x64x64      
+        z = F.relu(self.bn1(self.deconv1(z)))  # 12x12x512
+        z = F.relu(self.bn2(self.deconv2(z)))  # 24x24x256
+        z = F.relu(self.bn3(self.deconv3(z)))  # 48x48x128      
+        z = F.relu(self.bn4(self.deconv4(z)))  # 96x96x64      
         z = self.attn(z)
-        z = F.relu(self.bn5(self.deconv5(z)))  # 128x128x32
-        z = F.relu(self.bn6(self.deconv6(z)))  # 256x256x16
-        z = self.tanh(self.deconv7(z))  # 512x512x3
+        z = F.relu(self.bn5(self.deconv5(z)))  # 192x192x32
+        z = F.relu(self.bn6(self.deconv6(z)))  # 384x384x16
+        z = self.tanh(self.deconv7(z))  # 768x768x3
 
         return z
 

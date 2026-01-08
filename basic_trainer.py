@@ -496,7 +496,7 @@ def _ddp_train_worker(
             if rank == 0:
                 elapsed = time.time() - start_time
                 print(
-                    f"[DDP] Epoch [{epoch}/{num_epochs}] - "
+                    f"[DDP] Epoch [{epoch}/{start_epoch + num_epochs}] - "
                     f"Train D: {avg_d_loss:.4f}, Train G: {avg_g_loss:.4f}, "
                     f"Val L1: {avg_val_l1:.4f}, Val CLIP: {avg_val_clip:.4f} "
                     f"(PSNR: {avg_val_psnr:.2f}, SSIM: {avg_val_ssim:.4f}) | "
@@ -535,7 +535,7 @@ def _ddp_train_worker(
         elif rank == 0:
             elapsed = time.time() - start_time
             print(
-                f"[DDP] Epoch [{epoch}/{num_epochs}] - "
+                f"[DDP] Epoch [{epoch}/{start_epoch + num_epochs}] - "
                 f"Train D: {avg_d_loss:.4f}, Train G: {avg_g_loss:.4f} "
                 f"(no validation this epoch) | Time: {elapsed:.2f}s"
             )
@@ -554,7 +554,7 @@ def _ddp_train_worker(
             {
                 "generator_state_dict": generator.module.state_dict(),
                 "discriminator_state_dict": discriminator.module.state_dict(),
-                "epoch": num_epochs - 1,
+                "epoch": epoch,
             },
             final_ckpt,
         )
