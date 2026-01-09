@@ -260,6 +260,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 epoch,
             )
 
+        # Keep all ranks in sync before the next epoch to avoid collective timeouts
+        if dist.is_initialized():
+            dist.barrier()
+
         if rank == 0:
             elapsed = time.time() - start_time
             if val_metrics:
