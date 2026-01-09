@@ -26,12 +26,12 @@ ENCODER_PATH = "checkpoints/encoder_epoch_50.pth"
 FREEZE_ENCODER = True
 
 # Model / training defaults
-NOISE_DIM = 128
+NOISE_DIM = 100
 FIXED_G_LR = 0.0001
 FIXED_D_LR = 0.0001
 BCE_FACTOR = 1.0
-L1_FACTOR = 10.0
-L2_FACTOR = 100.0
+L1_FACTOR = 50.0
+L2_FACTOR = 150.0
 VAL_EPOCH = 5
 
 # Devices for training (indices as seen by the system)
