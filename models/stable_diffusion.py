@@ -1,3 +1,4 @@
+import copy
 import math
 from typing import Optional
 
@@ -73,7 +74,7 @@ class InitialImageEncoder(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, cond_dim: int):
+    def __init__(self, in_channels: int, out_channels: int, cond_dim: int, dropout: float = 0.1):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.norm1 = nn.GroupNorm(8, out_channels)
@@ -81,6 +82,7 @@ class ResidualBlock(nn.Module):
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act = nn.SiLU()
         self.film = nn.Linear(cond_dim, out_channels * 2)
+        self.dropout = nn.Dropout(dropout)
         if in_channels != out_channels:
             self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
@@ -88,6 +90,7 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         h = self.act(self.norm1(self.conv1(x)))
+        h = self.dropout(h)
         h = self.norm2(self.conv2(h))
         film = self.film(cond).unsqueeze(-1).unsqueeze(-1)
         scale, shift = film.chunk(2, dim=1)
@@ -95,28 +98,70 @@ class ResidualBlock(nn.Module):
         return self.act(h + self.residual(x))
 
 
-class SimpleUNet(nn.Module):
+class AttentionBlock(nn.Module):
+    def __init__(self, channels: int, num_heads: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, channels)
+        self.attn = nn.MultiheadAttention(channels, num_heads)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        normed = self.norm(x)
+        flat = normed.view(b, c, -1).permute(2, 0, 1)
+        attn_out, _ = self.attn(flat, flat, flat)
+        attn_out = attn_out.permute(1, 2, 0).view(b, c, h, w)
+        return x + attn_out
+
+
+class DownBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, cond_dim: int, attn: bool):
+        super().__init__()
+        self.res = ResidualBlock(in_channels, out_channels, cond_dim)
+        self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
+        self.downsample = nn.AvgPool2d(2)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor):
+        h = self.res(x, cond)
+        if self.attn is not None:
+            h = self.attn(h)
+        return self.downsample(h), h
+
+
+class UpBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, cond_dim: int, attn: bool):
+        super().__init__()
+        self.res = ResidualBlock(in_channels, out_channels, cond_dim)
+        self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, cond: torch.Tensor):
+        h = torch.cat([x, skip], dim=1)
+        h = self.res(h, cond)
+        if self.attn is not None:
+            h = self.attn(h)
+        return self.upsample(h)
+
+
+class ImprovedUNet(nn.Module):
     def __init__(self, in_channels: int, base_channels: int, cond_dim: int):
         super().__init__()
-        self.pool = nn.AvgPool2d(2)
-        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
         self.inc = ResidualBlock(in_channels, base_channels, cond_dim)
-        self.down1 = ResidualBlock(base_channels, base_channels * 2, cond_dim)
-        self.down2 = ResidualBlock(base_channels * 2, base_channels * 4, cond_dim)
+        self.down1 = DownBlock(base_channels, base_channels * 2, cond_dim, attn=False)
+        self.down2 = DownBlock(base_channels * 2, base_channels * 4, cond_dim, attn=True)
         self.mid = ResidualBlock(base_channels * 4, base_channels * 4, cond_dim)
-        self.up3 = ResidualBlock(base_channels * 8, base_channels * 2, cond_dim)
-        self.up2 = ResidualBlock(base_channels * 4, base_channels, cond_dim)
-        self.up1 = ResidualBlock(base_channels * 2, base_channels, cond_dim)
+        self.up3 = UpBlock(base_channels * 8, base_channels * 2, cond_dim, attn=True)
+        self.up2 = UpBlock(base_channels * 4, base_channels, cond_dim, attn=False)
+        self.up1 = UpBlock(base_channels * 2, base_channels, cond_dim, attn=False)
         self.out_conv = nn.Conv2d(base_channels, in_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         h1 = self.inc(x, cond)
-        h2 = self.down1(self.pool(h1), cond)
-        h3 = self.down2(self.pool(h2), cond)
-        middle = self.mid(self.pool(h3), cond)
-        u3 = self.up3(torch.cat([self.upsample(middle), h3], dim=1), cond)
-        u2 = self.up2(torch.cat([self.upsample(u3), h2], dim=1), cond)
-        u1 = self.up1(torch.cat([self.upsample(u2), h1], dim=1), cond)
+        d2, skip1 = self.down1(h1, cond)
+        d3, skip2 = self.down2(d2, cond)
+        middle = self.mid(d3, cond)
+        u3 = self.up3(middle, skip2, cond)
+        u2 = self.up2(u3, skip1, cond)
+        u1 = self.up1(u2, h1, cond)
         return self.out_conv(u1)
 
 
@@ -204,8 +249,10 @@ class StableDiffusionConditioned(nn.Module):
         self.feature_projection = FeatureProjector(input_dim, cond_dim)
         self.time_embedding = TimeEmbedding(cond_dim)
         self.initial_encoder = InitialImageEncoder(cfg.CHANNELS, cond_dim)
-        # Reduce base channels to lower memory footprint
-        self.unet = SimpleUNet(cfg.CHANNELS, base_channels=96, cond_dim=cond_dim)
+        self.unet = ImprovedUNet(cfg.CHANNELS, base_channels=cfg.SD_BASE_CHANNELS, cond_dim=cond_dim)
+        self.time_scale = nn.Parameter(torch.tensor(0.8))
+        self.feature_scale = nn.Parameter(torch.tensor(1.0))
+        self.initial_scale = nn.Parameter(torch.tensor(1.0))
 
         if initial_encoder_ckpt:
             self._load_initial_encoder(initial_encoder_ckpt)
@@ -220,9 +267,11 @@ class StableDiffusionConditioned(nn.Module):
         features: torch.Tensor,
         initial_image: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        cond = 0.7 * self.time_embedding(timesteps) + self.feature_projection(features)
+        time_emb = self.time_embedding(timesteps) * self.time_scale
+        feature_emb = self.feature_projection(features) * self.feature_scale
+        cond = time_emb + feature_emb
         if self.use_initial and initial_image is not None:
-            cond = cond + self.initial_encoder(initial_image)
+            cond = cond + self.initial_encoder(initial_image) * self.initial_scale
         return self.unet(noisy_image, cond)
 
     def _load_initial_encoder(self, ckpt_path: str) -> None:
@@ -268,3 +317,26 @@ class StableDiffusionPipeline:
 
     def sample(self, features: torch.Tensor, initial_image: Optional[torch.Tensor] = None, steps: Optional[int] = None) -> torch.Tensor:
         return self.schedule.sample(self.model, features, initial_image, steps)
+
+
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.9995):
+        self.decay = decay
+        self.ema = copy.deepcopy(model)
+        self.ema.eval()
+        for param in self.ema.parameters():
+            param.requires_grad = False
+
+    def update(self, source: nn.Module):
+        src = source.module if isinstance(source, nn.parallel.DistributedDataParallel) else source
+        with torch.no_grad():
+            ema_params = dict(self.ema.named_parameters())
+            for name, param in src.named_parameters():
+                if name in ema_params and param.dtype.is_floating_point:
+                    ema_params[name].mul_(self.decay).add_(param, alpha=1.0 - self.decay)
+
+    def state_dict(self):
+        return self.ema.state_dict()
+
+    def to(self, device):
+        self.ema.to(device)

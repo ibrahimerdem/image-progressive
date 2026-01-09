@@ -44,6 +44,11 @@ SD_EMB_DIM = 384
 SD_VAL_STEPS = 1
 SD_SAMPLE_BATCH = 2
 SD_LOG_INTERVAL = 10
+SD_BASE_CHANNELS = 96
+SD_ATTENTION_HEADS = 4
+SD_ATTENTION_RESOLUTION = [32, 16]
+SD_EMA_DECAY = 0.9995
+SD_GRAD_CLIP = 1.0
 
 # Devices for training (indices as seen by the system)
 # Used by run_train.sh and DDP world size.

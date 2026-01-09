@@ -11,7 +11,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 import config as cfg
-from models.stable_diffusion import GaussianDiffusion, StableDiffusionConditioned, StableDiffusionPipeline
+from torch.amp import autocast, GradScaler
+
+from models.stable_diffusion import (
+    GaussianDiffusion,
+    ModelEMA,
+    StableDiffusionConditioned,
+    StableDiffusionPipeline,
+)
 from utils.dataset import create_dataloaders
 from utils.training import (
     MetricsLogger,
@@ -85,7 +92,7 @@ def _run_validation(
     clip_count = 0
     total_samples = 0
 
-    autocast_ctx = (lambda: torch.amp.autocast("cuda")) if device.type == "cuda" else (lambda: nullcontext())
+    autocast_ctx = (lambda: autocast(device_type="cuda")) if device.type == "cuda" else (lambda: nullcontext())
 
     for idx, (initial_images, features, target_images, _) in enumerate(val_loader):
         features = features.to(device)
@@ -155,6 +162,13 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     pipeline = StableDiffusionPipeline(model.module, diffusion)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.SD_LR)
+    use_amp = device.type == "cuda"
+    scaler = GradScaler("cuda") if use_amp else None
+    amp_ctx = lambda: autocast(device_type="cuda") if use_amp else nullcontext()
+
+    ema_helper = ModelEMA(base_model, cfg.SD_EMA_DECAY)
+    ema_helper.to(device)
+    ema_pipeline = StableDiffusionPipeline(ema_helper.ema, diffusion) if rank == 0 else None
 
     start_epoch = 0
     if retrain and checkpoint_path:
@@ -195,12 +209,24 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             initials = initial_images.to(device)
             cond_initial = initials if cfg.INITIAL_IMAGE else None
 
-            loss = diffusion.p_loss(model, targets, features, cond_initial)
+            with amp_ctx():
+                loss = diffusion.p_loss(model, targets, features, cond_initial)
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                if cfg.SD_GRAD_CLIP and cfg.SD_GRAD_CLIP > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SD_GRAD_CLIP)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if cfg.SD_GRAD_CLIP and cfg.SD_GRAD_CLIP > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SD_GRAD_CLIP)
+                optimizer.step()
 
+            ema_helper.update(model)
             epoch_loss += loss.item()
             steps += 1
 
