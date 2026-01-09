@@ -84,9 +84,9 @@ def denormalize_image(image: torch.Tensor) -> torch.Tensor:
     return (image + 1) / 2
 
 def calculate_psnr(img1, img2):
-    """Calculate PSNR between two images"""
-    img1 = denormalize_image(img1).cpu().numpy()
-    img2 = denormalize_image(img2).cpu().numpy()
+    """Calculate PSNR between two images. Detach to avoid grad issues during validation."""
+    img1 = denormalize_image(img1.detach()).cpu().numpy()
+    img2 = denormalize_image(img2.detach()).cpu().numpy()
     
     # Convert from [B, C, H, W] to [B, H, W, C]
     img1 = np.transpose(img1, (0, 2, 3, 1))
@@ -100,9 +100,9 @@ def calculate_psnr(img1, img2):
     return np.mean(psnr_values)
 
 def calculate_ssim(img1, img2):
-    """Calculate SSIM between two images"""
-    img1 = denormalize_image(img1).cpu().numpy()
-    img2 = denormalize_image(img2).cpu().numpy()
+    """Calculate SSIM between two images. Detach to avoid grad issues during validation."""
+    img1 = denormalize_image(img1.detach()).cpu().numpy()
+    img2 = denormalize_image(img2.detach()).cpu().numpy()
     
     # Convert from [B, C, H, W] to [B, H, W, C]
     img1 = np.transpose(img1, (0, 2, 3, 1))
@@ -129,10 +129,10 @@ def visualize_results(
         axes = axes.reshape(1, -1)
     
     for i in range(num_samples):
-        # Denormalize images
-        initial = denormalize_image(initial_images[i]).cpu().permute(1, 2, 0).numpy()
-        generated = denormalize_image(generated_images[i]).cpu().permute(1, 2, 0).numpy()
-        target = denormalize_image(target_images[i]).cpu().permute(1, 2, 0).numpy()
+        # Detach and denormalize images
+        initial = denormalize_image(initial_images[i].detach()).cpu().permute(1, 2, 0).numpy()
+        generated = denormalize_image(generated_images[i].detach()).cpu().permute(1, 2, 0).numpy()
+        target = denormalize_image(target_images[i].detach()).cpu().permute(1, 2, 0).numpy()
         
         # Clip to [0, 1]
         initial = np.clip(initial, 0, 1)

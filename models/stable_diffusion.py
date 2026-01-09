@@ -189,15 +189,29 @@ class GaussianDiffusion(nn.Module):
 
 
 class StableDiffusionConditioned(nn.Module):
-    def __init__(self, input_dim: int, use_initial: bool = True, cond_dim: Optional[int] = None):
+    def __init__(
+        self,
+        input_dim: int,
+        use_initial: bool = True,
+        cond_dim: Optional[int] = None,
+        initial_encoder_ckpt: Optional[str] = None,
+        freeze_initial_encoder: bool = False,
+    ):
         super().__init__()
         if cond_dim is None:
-            cond_dim = cfg.EMBEDDING_OUT_DIM * 2
+            cond_dim = cfg.SD_EMB_DIM * 2
         self.use_initial = use_initial
         self.feature_projection = FeatureProjector(input_dim, cond_dim)
         self.time_embedding = TimeEmbedding(cond_dim)
         self.initial_encoder = InitialImageEncoder(cfg.CHANNELS, cond_dim)
-        self.unet = SimpleUNet(cfg.CHANNELS, base_channels=64, cond_dim=cond_dim)
+        # Reduce base channels to lower memory footprint
+        self.unet = SimpleUNet(cfg.CHANNELS, base_channels=96, cond_dim=cond_dim)
+
+        if initial_encoder_ckpt:
+            self._load_initial_encoder(initial_encoder_ckpt)
+        if freeze_initial_encoder:
+            for p in self.initial_encoder.parameters():
+                p.requires_grad = False
 
     def forward(
         self,
@@ -206,10 +220,45 @@ class StableDiffusionConditioned(nn.Module):
         features: torch.Tensor,
         initial_image: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        cond = self.time_embedding(timesteps) + self.feature_projection(features)
+        cond = 0.7 * self.time_embedding(timesteps) + self.feature_projection(features)
         if self.use_initial and initial_image is not None:
             cond = cond + self.initial_encoder(initial_image)
         return self.unet(noisy_image, cond)
+
+    def _load_initial_encoder(self, ckpt_path: str) -> None:
+        if not ckpt_path or not isinstance(ckpt_path, str):
+            return
+        if not torch.cuda.is_available():
+            map_location = "cpu"
+        else:
+            map_location = torch.device("cuda")
+        try:
+            state = torch.load(ckpt_path, map_location=map_location)
+        except FileNotFoundError:
+            print(f"[SD] Initial encoder checkpoint not found: {ckpt_path}")
+            return
+
+        # Accept common checkpoint formats
+        candidate_keys = [
+            "initial_encoder",
+            "encoder",
+            "model_state_dict",
+            "state_dict",
+        ]
+        loaded = False
+        for key in candidate_keys:
+            if isinstance(state, dict) and key in state:
+                missing, unexpected = self.initial_encoder.load_state_dict(state[key], strict=False)
+                loaded = True
+                print(f"[SD] Loaded initial encoder from {ckpt_path} (missing: {len(missing)}, unexpected: {len(unexpected)})")
+                break
+
+        if not loaded:
+            try:
+                missing, unexpected = self.initial_encoder.load_state_dict(state, strict=False)
+                print(f"[SD] Loaded initial encoder from {ckpt_path} (missing: {len(missing)}, unexpected: {len(unexpected)})")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[SD] Failed to load initial encoder from {ckpt_path}: {exc}")
 
 
 class StableDiffusionPipeline:

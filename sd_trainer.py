@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -84,16 +85,17 @@ def _run_validation(
     clip_count = 0
     total_samples = 0
 
-    for idx, (initial_images, features, target_images, _) in enumerate(val_loader):
-        if idx >= cfg.SD_VAL_STEPS:
-            break
+    autocast_ctx = (lambda: torch.amp.autocast("cuda")) if device.type == "cuda" else (lambda: nullcontext())
 
+    for idx, (initial_images, features, target_images, _) in enumerate(val_loader):
         features = features.to(device)
         targets = target_images.to(device)
         initials = initial_images.to(device)
         cond_initial = initials if cfg.INITIAL_IMAGE else None
 
-        samples = pipeline.sample(features, cond_initial, steps=cfg.SD_SAMPLE_STEPS)
+        with torch.no_grad():
+            with autocast_ctx():
+                samples = pipeline.sample(features, cond_initial, steps=cfg.SD_SAMPLE_STEPS)
         batch_size = targets.size(0)
 
         total_samples += batch_size
@@ -141,7 +143,12 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 
     feature_dim = train_loader.dataset.input_data.shape[1]
 
-    base_model = StableDiffusionConditioned(input_dim=feature_dim, use_initial=cfg.INITIAL_IMAGE)
+    base_model = StableDiffusionConditioned(
+        input_dim=feature_dim,
+        use_initial=cfg.INITIAL_IMAGE,
+        initial_encoder_ckpt=cfg.SD_INITIAL_ENCODER_CKPT or None,
+        freeze_initial_encoder=cfg.SD_FREEZE_INITIAL_ENCODER,
+    )
     diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
 
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
@@ -209,7 +216,12 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         avg_loss = (loss_tensor[0] / total_steps).item()
 
         val_metrics = None
-        if rank == 0 and val_loader is not None:
+        should_validate = (
+            rank == 0
+            and val_loader is not None
+            and (cfg.VAL_EPOCH <= 1 or epoch % cfg.VAL_EPOCH == 0)
+        )
+        if should_validate:
             val_metrics = _run_validation(
                 model,
                 pipeline,
@@ -241,10 +253,11 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 })
             else:
                 print(f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | Time: {elapsed:.2f}s")
-                metrics_logger.log({"epoch": epoch, "train_loss": avg_loss.item()})
+                metrics_logger.log({"epoch": epoch, "train_loss": avg_loss})
 
-            checkpoint_path = _save_checkpoint(model, optimizer, epoch, save_dir, version)
-            print(f"[SD] Checkpoint saved: {checkpoint_path}")
+            if should_validate:
+                checkpoint_path = _save_checkpoint(model, optimizer, epoch, save_dir, version)
+                print(f"[SD] Checkpoint saved: {checkpoint_path}")
 
     _cleanup_ddp()
 
