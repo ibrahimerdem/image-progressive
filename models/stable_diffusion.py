@@ -135,7 +135,8 @@ class UpBlock(nn.Module):
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor, cond: torch.Tensor):
-        x = self.upsample(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = self.upsample(x)
         h = torch.cat([x, skip], dim=1)
         h = self.res(h, cond)
         if self.attn is not None:
