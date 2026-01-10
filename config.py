@@ -23,6 +23,7 @@ FEATURE_MAXS = [30,42,95,40,1.62,-0.5,4,7,7000]
 INITIAL_IMAGE = True
 ENCODER_PATH = "checkpoints/encoder_epoch_50.pth"
 FREEZE_ENCODER = True
+ENCODER_FEATURE_DIM = 512
 
 # Model / training defaults
 NOISE_DIM = 128
@@ -32,6 +33,13 @@ BCE_FACTOR = 1.0
 L1_FACTOR = 50.0
 L2_FACTOR = 150.0
 VAL_EPOCH = 5
+VAE_NOISE_DIM = 128
+VAE_LATENT_DIM = 256
+VAE_HIDDEN_DIM = 512
+VAE_LR = 0.0001
+VAE_RECON_FACTOR = 1.0
+VAE_KL_FACTOR = 0.001
+VAE_SAVE_EVERY = 1
 
 # Devices for training (indices as seen by the system)
 # Used by run_train.sh and DDP world size.
