@@ -24,7 +24,7 @@ class SelfAttention(nn.Module):
 
 
 class ConditionalVAE(nn.Module):
-    """Condition a VAE on encoded images and structured recipe features."""
+    """Condition a VAE on raw initial images and structured recipe features."""
 
     def __init__(
         self,
@@ -80,11 +80,38 @@ class ConditionalVAE(nn.Module):
         self.deconv7 = nn.ConvTranspose2d(16, channels, kernel_size=4, stride=2, padding=1, bias=False)
         self.output_activation = nn.Tanh()
 
+        self.image_encoder = nn.Sequential(
+            nn.Conv2d(channels, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(512, 1024, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(1024),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.image_embedding = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(1024 * 4 * 4, encoded_dim),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
     def encode(self, meta_features: torch.Tensor):
         hidden = self.meta_latent(meta_features)
         mu = self.mu_head(hidden)
         logvar = self.logvar_head(hidden)
         return mu, logvar
+
+    def encode_image(self, initial_image: torch.Tensor):
+        encoded = self.image_encoder(initial_image)
+        return self.image_embedding(encoded)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor, noise: torch.Tensor):
         std = torch.exp(0.5 * logvar)
@@ -112,15 +139,16 @@ class ConditionalVAE(nn.Module):
 
     def forward(
         self,
-        encoded_image: torch.Tensor,
+        initial_image: torch.Tensor,
         meta_features: torch.Tensor,
         noise: torch.Tensor | None = None,
     ):  # noqa: D401
         if noise is None:
-            noise = torch.randn(encoded_image.size(0), self.noise_dim, device=encoded_image.device)
+            noise = torch.randn(initial_image.size(0), self.noise_dim, device=initial_image.device)
         elif noise.size(1) != self.noise_dim:
             raise ValueError(f"Expected noise dim {self.noise_dim}, got {noise.size(1)}")
 
+        encoded_image = self.encode_image(initial_image)
         mu, logvar = self.encode(meta_features)
         latent = self.reparameterize(mu, logvar, noise)
         reconstruction = self.decode(latent, encoded_image, meta_features)

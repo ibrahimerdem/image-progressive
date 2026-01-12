@@ -9,7 +9,6 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from models.conditional_vae import ConditionalVAE
-from models.image_encoder import load_trained_encoder
 from utils.dataset import create_dataloaders
 from utils.training import (
     calculate_psnr,
@@ -28,11 +27,6 @@ def get_device() -> torch.device:
         return torch.device(f"cuda:{device_ids[0]}")
     return torch.device("cpu")
 
-
-def encode_initial_features(encoder: nn.Module, images: torch.Tensor) -> torch.Tensor:
-    with torch.no_grad():
-        outputs = encoder(images)
-    return outputs["global"]
 
 
 def save_checkpoint(path: str, vae: nn.Module, optimizer: torch.optim.Optimizer, epoch: int) -> None:
@@ -69,7 +63,6 @@ def _cleanup_ddp() -> None:
 
 def evaluate(
     vae: nn.Module,
-    encoder: nn.Module,
     val_loader,
     device: torch.device,
     epoch: int,
@@ -91,10 +84,9 @@ def evaluate(
             initial = initial.to(device)
             meta = meta.to(device)
             target = target.to(device)
-            encoded = encode_initial_features(encoder, initial)
 
             noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
-            outputs = vae(encoded, meta, noise)
+            outputs = vae(initial, meta, noise)
             reconstruction = outputs["reconstruction"]
             vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
             rec_loss = l1_loss(reconstruction, target).item()
@@ -125,7 +117,7 @@ def evaluate(
                 )
 
     if total_samples == 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     avg_loss = total_loss / total_samples
     avg_psnr = total_psnr / total_samples
@@ -137,7 +129,6 @@ def evaluate(
 
 def train_single(
     vae: nn.Module,
-    encoder: nn.Module,
     train_loader,
     val_loader,
     device: torch.device,
@@ -164,10 +155,6 @@ def train_single(
         print(f"Loading checkpoint {checkpoint_path}")
         start_epoch = load_checkpoint(checkpoint_path, vae, optimizer)
 
-    encoder.eval()
-    for param in encoder.parameters():
-        param.requires_grad = False
-
     clip_model, clip_preprocess = load_clip_model(device)
 
     for epoch in range(start_epoch + 1, start_epoch + epochs + 1):
@@ -179,10 +166,8 @@ def train_single(
             initial = initial.to(device)
             meta = meta.to(device)
             target = target.to(device)
-            encoded = encode_initial_features(encoder, initial)
-
             noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
-            outputs = vae(encoded, meta, noise)
+            outputs = vae(initial, meta, noise)
             reconstruction = outputs["reconstruction"]
 
             rec_loss = l1_loss(reconstruction, target)
@@ -206,7 +191,7 @@ def train_single(
         val_metrics = (0.0, 0.0, 0.0, 0.0, 0.0)
 
         if val_loader and (epoch % cfg.VAL_EPOCH == 0):
-            val_metrics = evaluate(vae, encoder, val_loader, device, epoch, sample_dir, clip_model, clip_preprocess)
+            val_metrics = evaluate(vae, val_loader, device, epoch, sample_dir, clip_model, clip_preprocess)
 
         avg_val_loss, avg_psnr, avg_ssim, avg_val_l1, avg_val_clip = val_metrics
         elapsed = time.time() - epoch_start
@@ -235,7 +220,6 @@ def train_single(
 
 def evaluate_ddp(
     vae: nn.Module,
-    encoder: nn.Module,
     val_loader,
     device: torch.device,
     epoch: int,
@@ -259,10 +243,9 @@ def evaluate_ddp(
             initial = initial.to(device)
             meta = meta.to(device)
             target = target.to(device)
-            encoded = encode_initial_features(encoder, initial)
 
             noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
-            outputs = vae(encoded, meta, noise)
+            outputs = vae(initial, meta, noise)
             reconstruction = outputs["reconstruction"]
             vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
             rec_loss = l1_loss(reconstruction, target).item()
@@ -332,15 +315,6 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     feature_dim = train_loader.dataset.input_data.shape[1]
 
-    encoder = load_trained_encoder(
-        cfg.ENCODER_PATH,
-        device=device,
-        feature_dim=cfg.ENCODER_FEATURE_DIM,
-    )
-    encoder.eval()
-    for param in encoder.parameters():
-        param.requires_grad = False
-
     clip_model, clip_preprocess = load_clip_model(device)
 
     vae = ConditionalVAE(
@@ -385,10 +359,9 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 initial = initial.to(device)
                 meta = meta.to(device)
                 target = target.to(device)
-                encoded = encode_initial_features(encoder, initial)
 
                 noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
-                outputs = vae(encoded, meta, noise)
+                outputs = vae(initial, meta, noise)
                 reconstruction = outputs["reconstruction"]
 
                 vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
@@ -413,7 +386,6 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             if val_loader and (epoch % cfg.VAL_EPOCH == 0):
                 val_loss, val_psnr, val_ssim, val_l1, val_clip = evaluate_ddp(
                     vae,
-                    encoder,
                     val_loader,
                     device,
                     epoch,
@@ -503,12 +475,6 @@ def main() -> None:
 
     feature_dim = train_loader.dataset.input_data.shape[1]
 
-    encoder = load_trained_encoder(
-        cfg.ENCODER_PATH,
-        device=device,
-        feature_dim=cfg.ENCODER_FEATURE_DIM,
-    )
-
     vae = ConditionalVAE(
         encoded_dim=cfg.ENCODER_FEATURE_DIM,
         meta_dim=feature_dim,
@@ -521,7 +487,6 @@ def main() -> None:
     print("Starting VAE training")
     train_single(
         vae=vae,
-        encoder=encoder,
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
