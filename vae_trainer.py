@@ -16,6 +16,8 @@ from utils.training import (
     calculate_ssim,
     MetricsLogger,
     save_random_sample_pairs,
+    load_clip_model,
+    compute_clip_metrics_batch,
 )
 import config as cfg
 
@@ -52,9 +54,12 @@ def load_checkpoint(path: str, vae: nn.Module, optimizer: torch.optim.Optimizer 
 
 def _setup_ddp(rank: int, world_size: int) -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ.setdefault("MASTER_PORT", "29512")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    device_ids = getattr(cfg, "DEVICE_IDS", list(range(world_size)))
+    torch.cuda.set_device(device_ids[rank])
 
 
 def _cleanup_ddp() -> None:
@@ -69,11 +74,15 @@ def evaluate(
     device: torch.device,
     epoch: int,
     sample_dir: str,
+    clip_model,
+    clip_preprocess,
 ):
     vae.eval()
     total_loss = 0.0
     total_psnr = 0.0
     total_ssim = 0.0
+    total_l1 = 0.0
+    total_clip = 0.0
     total_samples = 0
     l1_loss = nn.L1Loss()
 
@@ -87,15 +96,22 @@ def evaluate(
             noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
             outputs = vae(encoded, meta, noise)
             reconstruction = outputs["reconstruction"]
+            vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
             rec_loss = l1_loss(reconstruction, target).item()
-            kl = vae.kl_loss(outputs["mu"], outputs["logvar"]).item()
-            total_loss += (cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl) * target.shape[0]
+            kl = vae_module.kl_loss(outputs["mu"], outputs["logvar"]).item()
+            batch_size = target.shape[0]
+            total_loss += (cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl) * batch_size
+            total_l1 += rec_loss * batch_size
 
             batch_psnr = calculate_psnr(reconstruction, target)
             batch_ssim = calculate_ssim(reconstruction, target)
-            total_psnr += batch_psnr * target.shape[0]
-            total_ssim += batch_ssim * target.shape[0]
-            total_samples += target.shape[0]
+            total_psnr += batch_psnr * batch_size
+            total_ssim += batch_ssim * batch_size
+            total_samples += batch_size
+
+            if clip_model is not None and clip_preprocess is not None:
+                clip_sum, _ = compute_clip_metrics_batch(reconstruction, target, clip_model, clip_preprocess, device)
+                total_clip += clip_sum
 
             if batch_idx == 0:
                 save_random_sample_pairs(
@@ -114,7 +130,9 @@ def evaluate(
     avg_loss = total_loss / total_samples
     avg_psnr = total_psnr / total_samples
     avg_ssim = total_ssim / total_samples
-    return avg_loss, avg_psnr, avg_ssim
+    avg_l1 = total_l1 / total_samples
+    avg_clip = total_clip / max(total_samples, 1)
+    return avg_loss, avg_psnr, avg_ssim, avg_l1, avg_clip
 
 
 def train_single(
@@ -150,6 +168,8 @@ def train_single(
     for param in encoder.parameters():
         param.requires_grad = False
 
+    clip_model, clip_preprocess = load_clip_model(device)
+
     for epoch in range(start_epoch + 1, start_epoch + epochs + 1):
         vae.train()
         epoch_loss = 0.0
@@ -166,7 +186,8 @@ def train_single(
             reconstruction = outputs["reconstruction"]
 
             rec_loss = l1_loss(reconstruction, target)
-            kl = vae.kl_loss(outputs["mu"], outputs["logvar"])
+            vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
+            kl = vae_module.kl_loss(outputs["mu"], outputs["logvar"])
             loss = cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl
 
             optimizer.zero_grad()
@@ -182,17 +203,17 @@ def train_single(
                 )
 
         avg_train_loss = epoch_loss / max(len(train_loader), 1)
-        val_metrics = (0.0, 0.0, 0.0)
+        val_metrics = (0.0, 0.0, 0.0, 0.0, 0.0)
 
         if val_loader and (epoch % cfg.VAL_EPOCH == 0):
-            val_metrics = evaluate(vae, encoder, val_loader, device, epoch, sample_dir)
+            val_metrics = evaluate(vae, encoder, val_loader, device, epoch, sample_dir, clip_model, clip_preprocess)
 
-        avg_val_loss, avg_psnr, avg_ssim = val_metrics
+        avg_val_loss, avg_psnr, avg_ssim, avg_val_l1, avg_val_clip = val_metrics
         elapsed = time.time() - epoch_start
 
         print(
             f"Epoch {epoch} finished (train_loss={avg_train_loss:.4f}, val_loss={avg_val_loss:.4f}, "
-            f"PSNR={avg_psnr:.2f}, SSIM={avg_ssim:.4f}) | Time: {elapsed:.2f}s"
+            f"L1={avg_val_l1:.4f}, CLIP={avg_val_clip:.4f}, PSNR={avg_psnr:.2f}, SSIM={avg_ssim:.4f}) | Time: {elapsed:.2f}s"
         )
 
         log_entry = {
@@ -201,10 +222,12 @@ def train_single(
             "val_loss": avg_val_loss,
             "val_psnr": avg_psnr,
             "val_ssim": avg_ssim,
+            "val_l1": avg_val_l1,
+            "val_clip": avg_val_clip,
         }
         metrics_logger.log(log_entry)
 
-        if epoch % cfg.VAE_SAVE_EVERY == 0:
+        if val_loader and (epoch % cfg.VAL_EPOCH == 0):
             ckpt_path = os.path.join(save_dir, f"vae_{version}_epoch_{epoch}.pth")
             save_checkpoint(ckpt_path, vae, optimizer, epoch)
             print(f"Checkpoint saved to {ckpt_path}")
@@ -218,11 +241,15 @@ def evaluate_ddp(
     epoch: int,
     sample_dir: str,
     rank: int,
-) -> tuple[float, float, float]:
+    clip_model,
+    clip_preprocess,
+) -> tuple[float, float, float, float, float]:
     vae.eval()
     total_loss = torch.tensor(0.0, device=device)
     total_psnr = torch.tensor(0.0, device=device)
     total_ssim = torch.tensor(0.0, device=device)
+    total_l1 = torch.tensor(0.0, device=device)
+    total_clip = torch.tensor(0.0, device=device)
     total_samples = torch.tensor(0, device=device)
     l1_loss = nn.L1Loss()
     first_saved = False
@@ -237,18 +264,24 @@ def evaluate_ddp(
             noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
             outputs = vae(encoded, meta, noise)
             reconstruction = outputs["reconstruction"]
+            vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
             rec_loss = l1_loss(reconstruction, target).item()
-            kl = vae.kl_loss(outputs["mu"], outputs["logvar"]).item()
+            kl = vae_module.kl_loss(outputs["mu"], outputs["logvar"]).item()
             batch_size = target.shape[0]
 
             local_loss = (cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl) * batch_size
             total_loss += local_loss
+            total_l1 += rec_loss * batch_size
 
             batch_psnr = calculate_psnr(reconstruction, target)
             batch_ssim = calculate_ssim(reconstruction, target)
             total_psnr += batch_psnr * batch_size
             total_ssim += batch_ssim * batch_size
             total_samples += batch_size
+
+            if clip_model is not None and clip_preprocess is not None:
+                clip_sum, _ = compute_clip_metrics_batch(reconstruction, target, clip_model, clip_preprocess, device)
+                total_clip += clip_sum
 
             if not first_saved and rank == 0:
                 save_random_sample_pairs(
@@ -262,17 +295,26 @@ def evaluate_ddp(
                 )
                 first_saved = True
 
-    _tensor = torch.stack([total_loss, total_psnr, total_ssim, total_samples.to(torch.float32)])
+    _tensor = torch.stack([
+        total_loss,
+        total_psnr,
+        total_ssim,
+        total_l1,
+        total_clip,
+        total_samples.to(torch.float32),
+    ])
     dist.all_reduce(_tensor, op=dist.ReduceOp.SUM)
 
-    total_loss, total_psnr, total_ssim, total_samples = _tensor.tolist()
+    total_loss, total_psnr, total_ssim, total_l1, total_clip, total_samples = _tensor.tolist()
     if total_samples == 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     avg_loss = total_loss / total_samples
     avg_psnr = total_psnr / total_samples
     avg_ssim = total_ssim / total_samples
-    return avg_loss, avg_psnr, avg_ssim
+    avg_l1 = total_l1 / total_samples
+    avg_clip = total_clip / max(total_samples, 1)
+    return avg_loss, avg_psnr, avg_ssim, avg_l1, avg_clip
 
 
 def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
@@ -299,6 +341,8 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     for param in encoder.parameters():
         param.requires_grad = False
 
+    clip_model, clip_preprocess = load_clip_model(device)
+
     vae = ConditionalVAE(
         encoded_dim=cfg.ENCODER_FEATURE_DIM,
         meta_dim=feature_dim,
@@ -308,7 +352,8 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         channels=cfg.CHANNELS,
     ).to(device)
     vae = nn.SyncBatchNorm.convert_sync_batchnorm(vae)
-    vae = DDP(vae, device_ids=[rank])
+    ddp_device_ids = [cfg.DEVICE_IDS[rank]] if hasattr(cfg, "DEVICE_IDS") else [rank]
+    vae = DDP(vae, device_ids=ddp_device_ids)
 
     optimizer = torch.optim.Adam(vae.parameters(), lr=cfg.VAE_LR, betas=(0.5, 0.999))
 
@@ -326,77 +371,86 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     metrics_logger = MetricsLogger(log_dir, f"vae_ddp_training_log.csv") if rank == 0 else None
 
-    for epoch in range(start_epoch + 1, start_epoch + args.epochs + 1):
-        if hasattr(train_loader, "sampler") and isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
-            train_loader.sampler.set_epoch(epoch)
+    try:
+        for epoch in range(start_epoch + 1, start_epoch + args.epochs + 1):
+            if hasattr(train_loader, "sampler") and isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+                train_loader.sampler.set_epoch(epoch)
 
-        vae.train()
-        total_loss = 0.0
-        total_samples = 0
-        epoch_start = time.time()
+            vae.train()
+            total_loss = 0.0
+            total_samples = 0
+            epoch_start = time.time()
 
-        for batch_idx, (initial, meta, target, _) in enumerate(train_loader):
-            initial = initial.to(device)
-            meta = meta.to(device)
-            target = target.to(device)
-            encoded = encode_initial_features(encoder, initial)
+            for batch_idx, (initial, meta, target, _) in enumerate(train_loader):
+                initial = initial.to(device)
+                meta = meta.to(device)
+                target = target.to(device)
+                encoded = encode_initial_features(encoder, initial)
 
-            noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
-            outputs = vae(encoded, meta, noise)
-            reconstruction = outputs["reconstruction"]
+                noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
+                outputs = vae(encoded, meta, noise)
+                reconstruction = outputs["reconstruction"]
 
-            rec_loss = nn.L1Loss()(reconstruction, target)
-            kl = vae.kl_loss(outputs["mu"], outputs["logvar"])
-            loss = cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl
+                vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
+                rec_loss = nn.L1Loss()(reconstruction, target)
+                kl = vae_module.kl_loss(outputs["mu"], outputs["logvar"])
+                loss = cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
-            batch_size = target.shape[0]
-            total_loss += loss.item() * batch_size
-            total_samples += batch_size
+                batch_size = target.shape[0]
+                total_loss += loss.item() * batch_size
+                total_samples += batch_size
 
-        loss_tensor = torch.tensor([total_loss, total_samples], device=device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        summed_loss, summed_samples = loss_tensor.tolist()
-        avg_train_loss = summed_loss / max(summed_samples, 1)
+            loss_tensor = torch.tensor([total_loss, total_samples], device=device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            summed_loss, summed_samples = loss_tensor.tolist()
+            avg_train_loss = summed_loss / max(summed_samples, 1)
 
-        val_loss, val_psnr, val_ssim = (0.0, 0.0, 0.0)
-        if val_loader and (epoch % cfg.VAL_EPOCH == 0):
-            val_loss, val_psnr, val_ssim = evaluate_ddp(
-                vae,
-                encoder,
-                val_loader,
-                device,
-                epoch,
-                sample_dir,
-                rank,
-            )
+            val_loss, val_psnr, val_ssim, val_l1, val_clip = (0.0, 0.0, 0.0, 0.0, 0.0)
+            if val_loader and (epoch % cfg.VAL_EPOCH == 0):
+                val_loss, val_psnr, val_ssim, val_l1, val_clip = evaluate_ddp(
+                    vae,
+                    encoder,
+                    val_loader,
+                    device,
+                    epoch,
+                    sample_dir,
+                    rank,
+                    clip_model,
+                    clip_preprocess,
+                )
 
-        if rank == 0:
-            elapsed = time.time() - epoch_start
-            print(
-                f"DDP Epoch {epoch} finished (train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f}, "
-                f"PSNR={val_psnr:.2f}, SSIM={val_ssim:.4f}) | Time: {elapsed:.2f}s"
-            )
+            if rank == 0:
+                elapsed = time.time() - epoch_start
+                print(
+                    f"DDP Epoch {epoch} finished (train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f}, "
+                    f"L1={val_l1:.4f}, CLIP={val_clip:.4f}, PSNR={val_psnr:.2f}, SSIM={val_ssim:.4f}) | Time: {elapsed:.2f}s"
+                )
 
-            metrics_logger.log(
-                {
-                    "epoch": epoch,
-                    "train_loss": avg_train_loss,
-                    "val_loss": val_loss,
-                    "val_psnr": val_psnr,
-                    "val_ssim": val_ssim,
-                }
-            )
+                metrics_logger.log(
+                    {
+                        "epoch": epoch,
+                        "train_loss": avg_train_loss,
+                        "val_loss": val_loss,
+                        "val_psnr": val_psnr,
+                        "val_ssim": val_ssim,
+                        "val_l1": val_l1,
+                        "val_clip": val_clip,
+                    }
+                )
 
-            if epoch % cfg.VAE_SAVE_EVERY == 0:
-                ckpt_path = os.path.join(save_dir, f"vae_ddp_epoch_{epoch}.pth")
-                save_checkpoint(ckpt_path, vae.module, optimizer, epoch)
-                print(f"Checkpoint saved to {ckpt_path}")
+                if val_loader and (epoch % cfg.VAL_EPOCH == 0):
+                    ckpt_path = os.path.join(save_dir, f"vae_ddp_epoch_{epoch}.pth")
+                    save_checkpoint(ckpt_path, vae.module, optimizer, epoch)
+                    print(f"Checkpoint saved to {ckpt_path}")
 
-    _cleanup_ddp()
+            # keep ranks in sync each epoch to avoid hanging collectives
+            dist.barrier()
+    finally:
+        _cleanup_ddp()
 
 
 def train_distributed(args: argparse.Namespace) -> None:
