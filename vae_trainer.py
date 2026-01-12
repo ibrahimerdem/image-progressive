@@ -46,14 +46,14 @@ def load_checkpoint(path: str, vae: nn.Module, optimizer: torch.optim.Optimizer 
     return checkpoint.get("epoch", 0)
 
 
-def _setup_ddp(rank: int, world_size: int) -> None:
+def _setup_ddp(rank: int, world_size: int):
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29512")
-    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("MASTER_PORT", "29500")
     os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    device_ids = getattr(cfg, "DEVICE_IDS", list(range(world_size)))
-    torch.cuda.set_device(device_ids[rank])
+    device_id = getattr(cfg, "DEVICE_IDS", list(range(torch.cuda.device_count())))[rank]
+    torch.cuda.set_device(device_id)
 
 
 def _cleanup_ddp() -> None:
@@ -166,6 +166,7 @@ def train_single(
             initial = initial.to(device)
             meta = meta.to(device)
             target = target.to(device)
+
             noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
             outputs = vae(initial, meta, noise)
             reconstruction = outputs["reconstruction"]
@@ -318,7 +319,7 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     clip_model, clip_preprocess = load_clip_model(device)
 
     vae = ConditionalVAE(
-        encoded_dim=cfg.ENCODER_FEATURE_DIM,
+        encoded_dim=cfg.VAE_ENCODER_DIM,
         meta_dim=feature_dim,
         noise_dim=cfg.VAE_NOISE_DIM,
         latent_dim=cfg.VAE_LATENT_DIM,
@@ -382,8 +383,10 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             summed_loss, summed_samples = loss_tensor.tolist()
             avg_train_loss = summed_loss / max(summed_samples, 1)
 
+            # Ensure both ranks execute validation or skip it together
             val_loss, val_psnr, val_ssim, val_l1, val_clip = (0.0, 0.0, 0.0, 0.0, 0.0)
-            if val_loader and (epoch % cfg.VAL_EPOCH == 0):
+            should_validate = val_loader is not None and (epoch % cfg.VAL_EPOCH == 0)
+            if should_validate:
                 val_loss, val_psnr, val_ssim, val_l1, val_clip = evaluate_ddp(
                     vae,
                     val_loader,
@@ -414,7 +417,7 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                     }
                 )
 
-                if val_loader and (epoch % cfg.VAL_EPOCH == 0):
+                if should_validate:
                     ckpt_path = os.path.join(save_dir, f"vae_ddp_epoch_{epoch}.pth")
                     save_checkpoint(ckpt_path, vae.module, optimizer, epoch)
                     print(f"Checkpoint saved to {ckpt_path}")
@@ -476,12 +479,12 @@ def main() -> None:
     feature_dim = train_loader.dataset.input_data.shape[1]
 
     vae = ConditionalVAE(
-        encoded_dim=cfg.ENCODER_FEATURE_DIM,
+        encoded_dim=cfg.VAE_ENCODER_DIM,
         meta_dim=feature_dim,
         noise_dim=cfg.VAE_NOISE_DIM,
         latent_dim=cfg.VAE_LATENT_DIM,
         hidden_dim=cfg.VAE_HIDDEN_DIM,
-        channels=cfg.CHANNELS,
+        channels=cfg.CHANNELS
     ).to(device)
 
     print("Starting VAE training")

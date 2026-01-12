@@ -38,7 +38,8 @@ VAE_LATENT_DIM = 256
 VAE_HIDDEN_DIM = 512
 VAE_LR = 0.0001
 VAE_RECON_FACTOR = 1.0
-VAE_KL_FACTOR = 0.001
+VAE_KL_FACTOR = 0.0001
+VAE_ENCODER_DIM = 512
 VAE_SAVE_EVERY = 1
 
 # Devices for training (indices as seen by the system)

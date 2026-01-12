@@ -33,7 +33,7 @@ class ConditionalVAE(nn.Module):
         noise_dim: int = 128,
         latent_dim: int = 256,
         hidden_dim: int = 512,
-        channels: int = 3,
+        channels: int = 3
     ):
         super().__init__()
         self.encoded_dim = encoded_dim
@@ -52,7 +52,8 @@ class ConditionalVAE(nn.Module):
         self.logvar_head = nn.Linear(hidden_dim * 2, latent_dim)
         self.noise_proj = nn.Linear(noise_dim, latent_dim)
 
-        decoder_condition_dim = encoded_dim + meta_dim
+        # Decoder now takes encoded_image (16384 = 1024*4*4) + meta_dim
+        decoder_condition_dim = 1024 * 4 * 4 + meta_dim
         self.decoder_condition_mlp = nn.Sequential(
             nn.Linear(decoder_condition_dim, hidden_dim),
             nn.LeakyReLU(0.2, inplace=True),
@@ -61,24 +62,52 @@ class ConditionalVAE(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
         )
 
-        decoder_input_dim = latent_dim + hidden_dim
-        self.decoder_fc = nn.Linear(decoder_input_dim, 1024 * 4 * 4)
+        self.decoder_input_dim = latent_dim + hidden_dim
+        self.decoder_fc = nn.Linear(self.decoder_input_dim, 1024 * 4 * 4)
 
-        self.deconv1 = nn.ConvTranspose2d(1024, 512, kernel_size=4, stride=2, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(512)
-        self.deconv2 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(256)
-        self.deconv3 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.deconv4 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False)
-        self.bn4 = nn.BatchNorm2d(64)
+        # Upsampling layers
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(1024, 512, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.ReLU(True)
+        )
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(512, 256, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(True)
+        )
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True)
+        )
+        self.up4 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True)
+        )
         self.attn = SelfAttention(64)
-        self.deconv5 = nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1, bias=False)
-        self.bn5 = nn.BatchNorm2d(32)
-        self.deconv6 = nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, bias=False)
-        self.bn6 = nn.BatchNorm2d(16)
-        self.deconv7 = nn.ConvTranspose2d(16, channels, kernel_size=4, stride=2, padding=1, bias=False)
-        self.output_activation = nn.Tanh()
+        self.up5 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True)
+        )
+        self.up6 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(32, 16, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(True)
+        )
+        self.up7 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(16, channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.Tanh()
+        )
 
         self.image_encoder = nn.Sequential(
             nn.Conv2d(channels, 64, kernel_size=4, stride=2, padding=1, bias=False),
@@ -97,11 +126,8 @@ class ConditionalVAE(nn.Module):
             nn.BatchNorm2d(1024),
             nn.LeakyReLU(0.2, inplace=True),
         )
-        self.image_embedding = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(1024 * 4 * 4, encoded_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
+        # Always pool to 4x4 so the flattened size stays 1024*4*4 regardless of input resolution
+        self.image_pool = nn.AdaptiveAvgPool2d((4, 4))
 
     def encode(self, meta_features: torch.Tensor):
         hidden = self.meta_latent(meta_features)
@@ -111,7 +137,9 @@ class ConditionalVAE(nn.Module):
 
     def encode_image(self, initial_image: torch.Tensor):
         encoded = self.image_encoder(initial_image)
-        return self.image_embedding(encoded)
+        encoded = self.image_pool(encoded)
+        # Flatten to (batch, 1024*4*4)
+        return encoded.view(encoded.size(0), -1)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor, noise: torch.Tensor):
         std = torch.exp(0.5 * logvar)
@@ -124,14 +152,14 @@ class ConditionalVAE(nn.Module):
         decoder_input = torch.cat([latent, condition], dim=1)
         x = self.decoder_fc(decoder_input)
         x = x.view(x.size(0), 1024, 4, 4)
-        x = F.relu(self.bn1(self.deconv1(x)))
-        x = F.relu(self.bn2(self.deconv2(x)))
-        x = F.relu(self.bn3(self.deconv3(x)))
-        x = F.relu(self.bn4(self.deconv4(x)))
+        x = self.up1(x)
+        x = self.up2(x)
+        x = self.up3(x)
+        x = self.up4(x)
         x = self.attn(x)
-        x = F.relu(self.bn5(self.deconv5(x)))
-        x = F.relu(self.bn6(self.deconv6(x)))
-        x = self.output_activation(self.deconv7(x))
+        x = self.up5(x)
+        x = self.up6(x)
+        x = self.up7(x)
         return x
 
     def kl_loss(self, mu: torch.Tensor, logvar: torch.Tensor):
@@ -152,6 +180,7 @@ class ConditionalVAE(nn.Module):
         mu, logvar = self.encode(meta_features)
         latent = self.reparameterize(mu, logvar, noise)
         reconstruction = self.decode(latent, encoded_image, meta_features)
+
         return {
             "reconstruction": reconstruction,
             "mu": mu,
