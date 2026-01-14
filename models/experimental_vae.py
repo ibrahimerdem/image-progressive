@@ -1,0 +1,186 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from models.attention import SelfAttention
+from models.clip import CLIPEmbedding, CLIPLayer
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, in_channels, n_head=1):
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels)
+        self.attn = SelfAttention(n_head=n_head, d_model=in_channels)
+
+    def forward(self, x):
+        batch, channel, height, width = x.shape
+        residual = x
+        x = x.view(batch, channel, height * width).transpose(-1, -2)
+        x = self.attn(x)
+        x = x.transpose_(-1, -2)
+        x = x.view(batch, channel, height, width)
+        x = x + residual
+        return x
+    
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.gn1 = nn.GroupNorm(num_groups=32, num_channels=in_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.gn2 = nn.GroupNorm(num_groups=32, num_channels=out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        if in_channels != out_channels:
+            self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.residual_conv = nn.Identity()
+
+    def forward(self, x):
+        residual = x
+        x = self.gn1(x)
+        x = F.silu(x)
+        x = self.conv1(x)
+        x = self.gn2(x)
+        x = F.silu(x)
+        x = self.conv2(x)
+        return x + self.residual_conv(residual)
+
+
+class CLIP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = CLIPEmbedding(49408, 768, 77)
+        self.layers = nn.ModuleList([
+            CLIPLayer(n_head=12, n_emb=768) for _ in range(12)
+        ])
+        self.norm = nn.LayerNorm(768)
+
+    def forward(self, tokens):
+        state = self.embedding(tokens)
+        for layer in self.layers:
+            state = layer(state)
+        state = self.norm(state)
+        return state
+
+
+class FeatureEncoder(nn.Module):
+    def __init__(self, feature_dim = 9, hidden_dim = 128, out_channels = 3):
+        super().__init__()
+        self.out_channels = out_channels
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim, bias=False),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim*2, bias=False),
+            nn.LayerNorm(hidden_dim*2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim*2, out_channels, bias=True),
+            nn.Tanh(),
+        )
+
+    def forward(self, features: torch.Tensor):
+        batch = features.size(0)
+        encoded = self.net(features)
+        encoded = encoded.view(batch, self.out_channels, 1, 1)
+        return encoded
+    
+
+class Encoder(nn.Sequential):
+    def __init__(self, in_channels):
+        super().__init__(
+            nn.Conv2d(in_channels, 128, kernel_size=3, padding=1),
+            ResidualBlock(128, 128),
+            ResidualBlock(128, 128),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2,padding=0),
+            ResidualBlock(128, 256),
+            ResidualBlock(256, 256),
+            nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=0),
+            ResidualBlock(256, 512),
+            ResidualBlock(512, 512),
+            nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=0),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            AttentionBlock(512),
+            ResidualBlock(512, 512),
+            nn.GroupNorm(num_groups=32, num_channels=512),
+            nn.SiLU(),
+            nn.Conv2d(512, 8, kernel_size=3, padding=1),
+            nn.Conv2d(8, 8, kernel_size=1, padding=0),
+        )
+    
+    def forward(self, x, noise):
+        # noise shape: (batch, outchannels, width/8, height/8)
+        for module in self:
+            if getattr(module, 'stride', None) == (2, 2):
+                x = F.pad(x, (0, 1, 0, 1), mode='constant', value=0)
+            x = module(x)
+
+        mu, logvar = torch.chunk(x, 2, dim=1)
+        logvar = torch.clamp(logvar, min=-30.0, max=20.0)
+        std = torch.exp(0.5 * logvar)
+        x = mu + std * noise
+        x = x * 0.18215
+        
+        return x
+
+class Decoder(nn.Sequential):
+    def __init__(self, out_channels):
+        super().__init__(
+            nn.Conv2d(4, 4, kernel_size=3, padding=0),
+            nn.Conv2d(4, 512, kernel_size=3, padding=1),
+            ResidualBlock(512, 512),
+            AttentionBlock(512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            ResidualBlock(512, 256),
+            ResidualBlock(256, 256),
+            ResidualBlock(256, 256),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            ResidualBlock(256, 128),
+            ResidualBlock(128, 128),
+            ResidualBlock(128, 128),
+            nn.GroupNorm(num_groups=32, num_channels=128),
+            nn.SiLU(),
+            nn.Conv2d(128, out_channels, kernel_size=3, padding=1),
+        )
+    
+    def forward(self, x):
+        x = x / 0.18215
+        for module in self:
+            x = module(x)
+        return x
+
+
+class FeatureVAE(nn.Module):
+    def __init__(
+        self,
+        feature_dim = 9,
+        hidden_dim = 128,
+        latent_channels = 4,
+        image_channels = 3,
+    ):
+        super().__init__()
+        self.feature_encoder = FeatureEncoder(feature_dim, hidden_dim, latent_channels)
+        self.encoder = Encoder(image_channels)
+        self.decoder = Decoder(image_channels)
+
+    def forward(self, features, target_image):
+        condition = self.feature_encoder(features).expand(-1, -1, 64, 64)
+        latent = self.encoder(target_image, condition)
+        reconstruction = self.decoder(latent + condition)
+        return {
+            "reconstruction": reconstruction,
+            "latent": latent,
+            "condition": condition,
+        }
+    
+    
