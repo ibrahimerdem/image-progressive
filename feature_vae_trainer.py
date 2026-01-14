@@ -275,7 +275,7 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     vae = FeatureVAE(feature_dim=feature_dim, image_channels=cfg.CHANNELS).to(device)
     vae = nn.SyncBatchNorm.convert_sync_batchnorm(vae)
     ddp_device_ids = [cfg.DEVICE_IDS[rank]] if hasattr(cfg, "DEVICE_IDS") else [rank]
-    vae = DDP(vae, device_ids=ddp_device_ids)
+    vae = DDP(vae, device_ids=ddp_device_ids, find_unused_parameters=True)
     optimizer = torch.optim.Adam(vae.parameters(), lr=cfg.VAE_LR, betas=(0.5, 0.999))
 
     start_epoch = 0
