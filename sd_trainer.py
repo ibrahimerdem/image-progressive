@@ -74,6 +74,7 @@ def _run_validation(
     clip_preprocess,
     sample_dir: str,
     epoch: int,
+    rank: int,
 ):
     if val_loader is None or clip_model is None or clip_preprocess is None:
         return None
@@ -94,15 +95,13 @@ def _run_validation(
 
     autocast_ctx = (lambda: autocast(device_type="cuda")) if device.type == "cuda" else (lambda: nullcontext())
 
-    for idx, (initial_images, features, target_images, _) in enumerate(val_loader):
+    for idx, (_, features, target_images, _) in enumerate(val_loader):
         features = features.to(device)
         targets = target_images.to(device)
-        initials = initial_images.to(device)
-        cond_initial = initials if cfg.INITIAL_IMAGE else None
 
         with torch.no_grad():
             with autocast_ctx():
-                samples = pipeline.sample(features, cond_initial, steps=cfg.SD_SAMPLE_STEPS)
+                samples = pipeline.sample(features, steps=cfg.SD_SAMPLE_STEPS)
         batch_size = targets.size(0)
 
         total_samples += batch_size
@@ -114,11 +113,12 @@ def _run_validation(
         total_clip += clip_sum
         clip_count += clip_bs
 
-        if idx == 0:
+        # Save sample generated images with target pairs (only on rank 0)
+        if idx == 0 and rank == 0:
             save_random_sample_pairs(
-                initials if cfg.INITIAL_IMAGE else targets,
-                samples,
-                targets,
+                targets,  # Show target as reference
+                samples,  # Show generated from features
+                targets,  # Show target again for comparison
                 sample_dir,
                 epoch,
                 prefix="sd_val",
@@ -152,9 +152,6 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 
     base_model = StableDiffusionConditioned(
         input_dim=feature_dim,
-        use_initial=cfg.INITIAL_IMAGE,
-        initial_encoder_ckpt=cfg.SD_INITIAL_ENCODER_CKPT or None,
-        freeze_initial_encoder=cfg.SD_FREEZE_INITIAL_ENCODER,
     )
     diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
 
@@ -206,11 +203,9 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         for batch_idx, (initial_images, features, target_images, _) in enumerate(train_loader):
             features = features.to(device)
             targets = target_images.to(device)
-            initials = initial_images.to(device)
-            cond_initial = initials if cfg.INITIAL_IMAGE else None
 
             with amp_ctx():
-                loss = diffusion.p_loss(model, targets, features, cond_initial)
+                loss = diffusion.p_loss(model, targets, features)
 
             optimizer.zero_grad()
             if scaler is not None:
@@ -258,6 +253,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 clip_preprocess,
                 sample_dir,
                 epoch,
+                rank,
             )
 
         # Keep all ranks in sync before the next epoch to avoid collective timeouts
