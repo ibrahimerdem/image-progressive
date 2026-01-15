@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from models.attention import SelfAttention
+from models.clip import CLIPEmbedding, CLIPLayer
 
 
 class AttentionBlock(nn.Module):
@@ -44,16 +45,33 @@ class ResidualBlock(nn.Module):
         return x + self.residual_conv(residual)
 
 
+class CLIP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = CLIPEmbedding(49408, 768, 77)
+        self.layers = nn.ModuleList([
+            CLIPLayer(n_head=12, n_emb=768) for _ in range(12)
+        ])
+        self.norm = nn.LayerNorm(768)
+
+    def forward(self, tokens):
+        state = self.embedding(tokens)
+        for layer in self.layers:
+            state = layer(state)
+        state = self.norm(state)
+        return state
+
+
 class FeatureEncoder(nn.Module):
-    def __init__(self, feature_dim = 9, hidden_dim = 64, out_channels = 3):
+    def __init__(self, feature_dim = 9, hidden_dim = 128, out_channels = 3):
         super().__init__()
         self.out_channels = out_channels
         self.net = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim, bias=False),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim * 2, bias=False),
-            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim, hidden_dim*2, bias=False),
+            nn.LayerNorm(hidden_dim*2),
             nn.SiLU(),
             nn.Linear(hidden_dim*2, out_channels, bias=True),
             nn.Tanh(),
@@ -67,20 +85,25 @@ class FeatureEncoder(nn.Module):
     
 
 class Encoder(nn.Sequential):
-    def __init__(self, in_channels, base_channels=64):
+    def __init__(self, in_channels):
         super().__init__(
-            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
-            ResidualBlock(base_channels, base_channels),
-            nn.Conv2d(base_channels, base_channels, kernel_size=3, stride=2, padding=1),
-            ResidualBlock(base_channels, base_channels * 2),
-            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, stride=2, padding=1),
-            ResidualBlock(base_channels * 2, base_channels * 4),
-            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, stride=2, padding=1),
-            ResidualBlock(base_channels * 4, base_channels * 4),
-            AttentionBlock(base_channels * 4),
-            nn.GroupNorm(num_groups=32, num_channels=base_channels * 4),
+            nn.Conv2d(in_channels, 128, kernel_size=3, padding=1),
+            ResidualBlock(128, 128),
+            ResidualBlock(128, 128),
+            nn.Conv2d(128, 128, kernel_size=3, stride=2,padding=0),
+            ResidualBlock(128, 256),
+            ResidualBlock(256, 256),
+            nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=0),
+            ResidualBlock(256, 512),
+            ResidualBlock(512, 512),
+            nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=0),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            AttentionBlock(512),
+            ResidualBlock(512, 512),
+            nn.GroupNorm(num_groups=32, num_channels=512),
             nn.SiLU(),
-            nn.Conv2d(base_channels * 4, 8, kernel_size=3, padding=1),
+            nn.Conv2d(512, 8, kernel_size=3, padding=1),
             nn.Conv2d(8, 8, kernel_size=1, padding=0),
         )
     
@@ -97,25 +120,37 @@ class Encoder(nn.Sequential):
         x = mu + std * noise
         x = x * 0.18215
         
-        return x, mu, logvar
+        return x
 
 class Decoder(nn.Sequential):
-    def __init__(self, out_channels, base_channels=64):
+    def __init__(self, out_channels):
         super().__init__(
-            nn.Conv2d(4, base_channels * 4, kernel_size=3, padding=1),
-            ResidualBlock(base_channels * 4, base_channels * 4),
-            AttentionBlock(base_channels * 4),
-            ResidualBlock(base_channels * 4, base_channels * 4),
+            nn.Conv2d(4, 4, kernel_size=1, padding=0),
+            nn.Conv2d(4, 512, kernel_size=3, padding=1),
+            ResidualBlock(512, 512),
+            AttentionBlock(512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
             nn.Upsample(scale_factor=2),
-            nn.Conv2d(base_channels * 4, base_channels * 2, kernel_size=3, padding=1),
-            ResidualBlock(base_channels * 2, base_channels * 2),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
+            ResidualBlock(512, 512),
             nn.Upsample(scale_factor=2),
-            nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1),
-            ResidualBlock(base_channels, base_channels),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            ResidualBlock(512, 256),
+            ResidualBlock(256, 256),
+            ResidualBlock(256, 256),
             nn.Upsample(scale_factor=2),
-            nn.GroupNorm(num_groups=32, num_channels=base_channels),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            ResidualBlock(256, 128),
+            ResidualBlock(128, 128),
+            ResidualBlock(128, 128),
+            nn.GroupNorm(num_groups=32, num_channels=128),
             nn.SiLU(),
-            nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(128, out_channels, kernel_size=3, padding=1),
         )
     
     def forward(self, x):
@@ -140,23 +175,12 @@ class FeatureVAE(nn.Module):
 
     def forward(self, features, target_image):
         condition = self.feature_encoder(features).expand(-1, -1, 64, 64)
-        latent, mu, logvar = self.encoder(target_image, condition)
+        latent = self.encoder(target_image, condition)
         reconstruction = self.decoder(latent + condition)
         return {
             "reconstruction": reconstruction,
             "latent": latent,
             "condition": condition,
-            "mu": mu,
-            "logvar": logvar,
         }
-    
-    def generate(self, features):
-        """Generate images directly from features without target image."""
-        batch_size = features.shape[0]
-        condition = self.feature_encoder(features).expand(-1, -1, 64, 64)
-        # Sample from standard normal for latent
-        latent = torch.randn(batch_size, 4, 64, 64, device=features.device) * 0.18215
-        generated = self.decoder(latent + condition)
-        return generated
     
     

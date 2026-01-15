@@ -26,6 +26,55 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def generate_images_from_features(
+    vae: nn.Module,
+    val_loader,
+    device: torch.device,
+    output_dir: str,
+    num_samples: int = 16,
+):
+    """Generate images from features and save them."""
+    vae.eval()
+    os.makedirs(output_dir, exist_ok=True)
+    
+    generated_images = []
+    initial_images = []
+    target_images = []
+    
+    with torch.no_grad():
+        for batch_idx, (initial, features, target, _) in enumerate(val_loader):
+            if len(generated_images) >= num_samples:
+                break
+                
+            initial = initial.to(device)
+            features = features.to(device)
+            target = target.to(device)
+            
+            generated = vae.generate(features)
+            
+            batch_size = min(generated.shape[0], num_samples - len(generated_images))
+            generated_images.append(generated[:batch_size].cpu())
+            initial_images.append(initial[:batch_size].cpu())
+            target_images.append(target[:batch_size].cpu())
+    
+    if generated_images:
+        generated_images = torch.cat(generated_images, dim=0)
+        initial_images = torch.cat(initial_images, dim=0)
+        target_images = torch.cat(target_images, dim=0)
+        
+        save_random_sample_pairs(
+            initial_images,
+            generated_images,
+            target_images,
+            output_dir,
+            epoch=0,
+            prefix="final_generation",
+            num_samples=num_samples,
+        )
+        
+        print(f"Generated {len(generated_images)} images saved to {output_dir}")
+
+
 def save_checkpoint(path: str, vae: nn.Module, optimizer: torch.optim.Optimizer, epoch: int) -> None:
     payload = {
         "epoch": epoch,
@@ -67,9 +116,12 @@ def evaluate(
     prefix: str,
 ):
     vae.eval()
-    total_loss = 0.0
-    total_psnr = 0.0
-    total_ssim = 0.0
+    rec_loss_total = 0.0
+    rec_psnr_total = 0.0
+    rec_ssim_total = 0.0
+    gen_loss_total = 0.0
+    gen_psnr_total = 0.0
+    gen_ssim_total = 0.0
     total_samples = 0
     l1_loss = nn.L1Loss()
 
@@ -79,14 +131,23 @@ def evaluate(
             features = features.to(device)
             target = target.to(device)
 
+            # Reconstruction metrics
             outputs = vae(features, target)
             reconstruction = outputs["reconstruction"]
             rec_loss = l1_loss(reconstruction, target).item()
             batch_size = target.shape[0]
-            total_loss += rec_loss * batch_size
+            rec_loss_total += rec_loss * batch_size
+            rec_psnr_total += calculate_psnr(reconstruction, target) * batch_size
+            rec_ssim_total += calculate_ssim(reconstruction, target) * batch_size
+            
+            # Generation metrics
+            generated = vae.generate(features)
+            gen_loss = l1_loss(generated, target).item()
+            gen_loss_total += gen_loss * batch_size
+            gen_psnr_total += calculate_psnr(generated, target) * batch_size
+            gen_ssim_total += calculate_ssim(generated, target) * batch_size
+            
             total_samples += batch_size
-            total_psnr += calculate_psnr(reconstruction, target) * batch_size
-            total_ssim += calculate_ssim(reconstruction, target) * batch_size
 
             if batch_idx == 0:
                 save_random_sample_pairs(
@@ -95,17 +156,30 @@ def evaluate(
                     target.detach().cpu(),
                     sample_dir,
                     epoch,
-                    prefix=prefix,
+                    prefix=f"{prefix}_rec",
+                    num_samples=4,
+                )
+                save_random_sample_pairs(
+                    initial.cpu(),
+                    generated.detach().cpu(),
+                    target.detach().cpu(),
+                    sample_dir,
+                    epoch,
+                    prefix=f"{prefix}_gen",
                     num_samples=4,
                 )
 
     if total_samples == 0:
-        return 0.0, 0.0, 0.0
+        return {}
 
-    avg_loss = total_loss / total_samples
-    avg_psnr = total_psnr / total_samples
-    avg_ssim = total_ssim / total_samples
-    return avg_loss, avg_psnr, avg_ssim
+    return {
+        "rec_loss": rec_loss_total / total_samples,
+        "rec_psnr": rec_psnr_total / total_samples,
+        "rec_ssim": rec_ssim_total / total_samples,
+        "gen_loss": gen_loss_total / total_samples,
+        "gen_psnr": gen_psnr_total / total_samples,
+        "gen_ssim": gen_ssim_total / total_samples,
+    }
 
 
 def evaluate_ddp(
@@ -116,11 +190,14 @@ def evaluate_ddp(
     sample_dir: str,
     rank: int,
     prefix: str,
-) -> tuple[float, float, float]:
+):
     vae.eval()
-    total_loss = torch.tensor(0.0, device=device)
-    total_psnr = torch.tensor(0.0, device=device)
-    total_ssim = torch.tensor(0.0, device=device)
+    rec_loss_total = torch.tensor(0.0, device=device)
+    rec_psnr_total = torch.tensor(0.0, device=device)
+    rec_ssim_total = torch.tensor(0.0, device=device)
+    gen_loss_total = torch.tensor(0.0, device=device)
+    gen_psnr_total = torch.tensor(0.0, device=device)
+    gen_ssim_total = torch.tensor(0.0, device=device)
     total_samples = torch.tensor(0, device=device)
     l1_loss = nn.L1Loss()
     first_saved = False
@@ -131,15 +208,23 @@ def evaluate_ddp(
             features = features.to(device)
             target = target.to(device)
 
+            # Reconstruction metrics
             outputs = vae(features, target)
             reconstruction = outputs["reconstruction"]
             rec_loss = l1_loss(reconstruction, target).item()
             batch_size = target.shape[0]
-
-            total_loss += rec_loss * batch_size
+            rec_loss_total += rec_loss * batch_size
+            rec_psnr_total += calculate_psnr(reconstruction, target) * batch_size
+            rec_ssim_total += calculate_ssim(reconstruction, target) * batch_size
+            
+            # Generation metrics
+            generated = vae.generate(features)
+            gen_loss = l1_loss(generated, target).item()
+            gen_loss_total += gen_loss * batch_size
+            gen_psnr_total += calculate_psnr(generated, target) * batch_size
+            gen_ssim_total += calculate_ssim(generated, target) * batch_size
+            
             total_samples += batch_size
-            total_psnr += calculate_psnr(reconstruction, target) * batch_size
-            total_ssim += calculate_ssim(reconstruction, target) * batch_size
 
             if rank == 0 and not first_saved:
                 save_random_sample_pairs(
@@ -148,24 +233,43 @@ def evaluate_ddp(
                     target.detach().cpu(),
                     sample_dir,
                     epoch,
-                    prefix=prefix,
+                    prefix=f"{prefix}_rec",
+                    num_samples=4,
+                )
+                save_random_sample_pairs(
+                    initial.cpu(),
+                    generated.detach().cpu(),
+                    target.detach().cpu(),
+                    sample_dir,
+                    epoch,
+                    prefix=f"{prefix}_gen",
                     num_samples=4,
                 )
                 first_saved = True
 
     _tensor = torch.stack([
-        total_loss,
-        total_psnr,
-        total_ssim,
+        rec_loss_total,
+        rec_psnr_total,
+        rec_ssim_total,
+        gen_loss_total,
+        gen_psnr_total,
+        gen_ssim_total,
         total_samples.to(torch.float32),
     ])
     dist.all_reduce(_tensor, op=dist.ReduceOp.SUM)
-    total_loss, total_psnr, total_ssim, total_samples = _tensor.tolist()
+    rec_loss, rec_psnr, rec_ssim, gen_loss, gen_psnr, gen_ssim, total_samples = _tensor.tolist()
 
     if total_samples == 0:
-        return 0.0, 0.0, 0.0
+        return {}
 
-    return total_loss / total_samples, total_psnr / total_samples, total_ssim / total_samples
+    return {
+        "rec_loss": rec_loss / total_samples,
+        "rec_psnr": rec_psnr / total_samples,
+        "rec_ssim": rec_ssim / total_samples,
+        "gen_loss": gen_loss / total_samples,
+        "gen_psnr": gen_psnr / total_samples,
+        "gen_ssim": gen_ssim / total_samples,
+    }
 
 
 def train_single(
@@ -200,6 +304,8 @@ def train_single(
         epoch_loss = 0.0
         epoch_start = time.time()
 
+        kl_epoch_total = 0.0
+        total_samples = 0
         for batch_idx, (initial, features, target, _) in enumerate(train_loader):
             initial = initial.to(device)
             features = features.to(device)
@@ -207,15 +313,22 @@ def train_single(
 
             outputs = vae(features, target)
             reconstruction = outputs["reconstruction"]
+            mu = outputs["mu"]
+            logvar = outputs["logvar"]
 
             rec_loss = l1_loss(reconstruction, target)
-            loss = rec_loss
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+            kl_loss = kl_loss / max(mu.shape[0], 1)
+            loss = rec_loss + cfg.VAE_KL_FACTOR * kl_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            batch_size = target.shape[0]
             epoch_loss += loss.item()
+            kl_epoch_total += kl_loss.item() * batch_size
+            total_samples += batch_size
 
             if (batch_idx + 1) % 10 == 0:
                 print(
@@ -223,33 +336,43 @@ def train_single(
                 )
 
         avg_train_loss = epoch_loss / max(len(train_loader), 1)
-        val_metrics = (0.0, 0.0, 0.0)
+        avg_kl_loss = kl_epoch_total / max(total_samples, 1)
+        val_metrics = {}
 
         if val_loader and (epoch % cfg.VAL_EPOCH == 0):
             val_metrics = evaluate(vae, val_loader, device, epoch, sample_dir, prefix="feature_vae_val")
 
-        avg_val_loss, avg_psnr, avg_ssim = val_metrics
         elapsed = time.time() - epoch_start
 
         print(
-            f"Epoch {epoch} finished (train_loss={avg_train_loss:.4f}, val_loss={avg_val_loss:.4f}, "
-            f"PSNR={avg_psnr:.2f}, SSIM={avg_ssim:.4f}) | Time: {elapsed:.2f}s"
+            f"Epoch {epoch} finished (train_loss={avg_train_loss:.4f}, kl_loss={avg_kl_loss:.6f}) | "
+            f"Rec(loss={val_metrics.get('rec_loss', 0.0):.4f}, PSNR={val_metrics.get('rec_psnr', 0.0):.2f}, SSIM={val_metrics.get('rec_ssim', 0.0):.4f}) | "
+            f"Gen(loss={val_metrics.get('gen_loss', 0.0):.4f}, PSNR={val_metrics.get('gen_psnr', 0.0):.2f}, SSIM={val_metrics.get('gen_ssim', 0.0):.4f}) | "
+            f"Time: {elapsed:.2f}s"
         )
 
-        metrics_logger.log(
-            {
-                "epoch": epoch,
-                "train_loss": avg_train_loss,
-                "val_loss": avg_val_loss,
-                "val_psnr": avg_psnr,
-                "val_ssim": avg_ssim,
-            }
-        )
+        log_dict = {
+            "epoch": epoch,
+            "train_loss": avg_train_loss,
+            "kl_loss": avg_kl_loss,
+        }
+        log_dict.update(val_metrics)
+        metrics_logger.log(log_dict)
 
         if val_loader and (epoch % cfg.VAL_EPOCH == 0):
             ckpt_path = os.path.join(save_dir, f"feature_vae_{version}_epoch_{epoch}.pth")
             save_checkpoint(ckpt_path, vae, optimizer, epoch)
             print(f"Checkpoint saved to {ckpt_path}")
+    
+    # Generate images after training
+    print("\nGenerating final images from features...")
+    generate_images_from_features(
+        vae,
+        val_loader,
+        device,
+        output_dir=os.path.join(sample_dir, "final_generations"),
+        num_samples=16,
+    )
 
 
 def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
@@ -275,7 +398,7 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     vae = FeatureVAE(feature_dim=feature_dim, image_channels=cfg.CHANNELS).to(device)
     vae = nn.SyncBatchNorm.convert_sync_batchnorm(vae)
     ddp_device_ids = [cfg.DEVICE_IDS[rank]] if hasattr(cfg, "DEVICE_IDS") else [rank]
-    vae = DDP(vae, device_ids=ddp_device_ids, find_unused_parameters=True)
+    vae = DDP(vae, device_ids=ddp_device_ids)
     optimizer = torch.optim.Adam(vae.parameters(), lr=cfg.VAE_LR, betas=(0.5, 0.999))
 
     start_epoch = 0
@@ -295,17 +418,23 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             vae.train()
             total_loss = 0.0
             total_samples = 0
+            kl_batch_total = 0.0
             epoch_start = time.time()
 
-            for batch_idx, (_, features, target, _) in enumerate(train_loader):
+            for batch_idx, (initial, features, target, _) in enumerate(train_loader):
+                initial = initial.to(device)
                 features = features.to(device)
                 target = target.to(device)
 
                 outputs = vae(features, target)
                 reconstruction = outputs["reconstruction"]
+                mu = outputs["mu"]
+                logvar = outputs["logvar"]
 
                 rec_loss = nn.L1Loss()(reconstruction, target)
-                loss = rec_loss
+                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+                kl_loss = kl_loss / max(mu.shape[0], 1)
+                loss = rec_loss + cfg.VAE_KL_FACTOR * kl_loss
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -313,16 +442,21 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
                 batch_size = target.shape[0]
                 total_loss += loss.item() * batch_size
+                kl_batch_total += kl_loss.item() * batch_size
                 total_samples += batch_size
 
-            loss_tensor = torch.tensor([total_loss, total_samples], device=device)
+            loss_tensor = torch.tensor(
+                [total_loss, total_samples, kl_batch_total],
+                device=device,
+            )
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-            summed_loss, summed_samples = loss_tensor.tolist()
+            summed_loss, summed_samples, summed_kl = loss_tensor.tolist()
             avg_train_loss = summed_loss / max(summed_samples, 1)
+            avg_kl_loss = summed_kl / max(summed_samples, 1)
 
-            val_loss, val_psnr, val_ssim = (0.0, 0.0, 0.0)
+            val_metrics = {}
             if val_loader and (epoch % cfg.VAL_EPOCH == 0):
-                val_loss, val_psnr, val_ssim = evaluate_ddp(
+                val_metrics = evaluate_ddp(
                     vae,
                     val_loader,
                     device,
@@ -335,19 +469,19 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             if rank == 0:
                 elapsed = time.time() - epoch_start
                 print(
-                    f"DDP Epoch {epoch} finished (train_loss={avg_train_loss:.4f}, val_loss={val_loss:.4f}, "
-                    f"PSNR={val_psnr:.2f}, SSIM={val_ssim:.4f}) | Time: {elapsed:.2f}s"
+                    f"DDP Epoch {epoch} finished (train_loss={avg_train_loss:.4f}, kl_loss={avg_kl_loss:.6f}) | "
+                    f"Rec(loss={val_metrics.get('rec_loss', 0.0):.4f}, PSNR={val_metrics.get('rec_psnr', 0.0):.2f}, SSIM={val_metrics.get('rec_ssim', 0.0):.4f}) | "
+                    f"Gen(loss={val_metrics.get('gen_loss', 0.0):.4f}, PSNR={val_metrics.get('gen_psnr', 0.0):.2f}, SSIM={val_metrics.get('gen_ssim', 0.0):.4f}) | "
+                    f"Time: {elapsed:.2f}s"
                 )
 
-                metrics_logger.log(
-                    {
-                        "epoch": epoch,
-                        "train_loss": avg_train_loss,
-                        "val_loss": val_loss,
-                        "val_psnr": val_psnr,
-                        "val_ssim": val_ssim,
-                    }
-                )
+                log_dict = {
+                    "epoch": epoch,
+                    "train_loss": avg_train_loss,
+                    "kl_loss": avg_kl_loss,
+                }
+                log_dict.update(val_metrics)
+                metrics_logger.log(log_dict)
 
                 if val_loader and (epoch % cfg.VAL_EPOCH == 0):
                     ckpt_path = os.path.join("checkpoints", f"feature_vae_ddp_epoch_{epoch}.pth")
