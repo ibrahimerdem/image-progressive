@@ -29,4 +29,4 @@ if [ -n "${CHECKPOINT}" ]; then
   EXTRA_ARGS+=("--checkpoint" "${CHECKPOINT}")
 fi
 
-python feature_vae_trainer.py --epochs "${EPOCHS}" --retrain "${RETRAIN}" "${EXTRA_ARGS[@]}"
+python vae_trainer.py --epochs "${EPOCHS}" --retrain "${RETRAIN}" "${EXTRA_ARGS[@]}"

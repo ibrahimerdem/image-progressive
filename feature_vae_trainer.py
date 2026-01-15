@@ -201,6 +201,9 @@ def evaluate_ddp(
     total_samples = torch.tensor(0, device=device)
     l1_loss = nn.L1Loss()
     first_saved = False
+    
+    # Access the underlying model for custom methods
+    model = vae.module if isinstance(vae, DDP) else vae
 
     with torch.no_grad():
         for batch_idx, (initial, features, target, _) in enumerate(val_loader):
@@ -218,7 +221,7 @@ def evaluate_ddp(
             rec_ssim_total += calculate_ssim(reconstruction, target) * batch_size
             
             # Generation metrics
-            generated = vae.generate(features)
+            generated = model.generate(features)
             gen_loss = l1_loss(generated, target).item()
             gen_loss_total += gen_loss * batch_size
             gen_psnr_total += calculate_psnr(generated, target) * batch_size
@@ -398,7 +401,7 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     vae = FeatureVAE(feature_dim=feature_dim, image_channels=cfg.CHANNELS).to(device)
     vae = nn.SyncBatchNorm.convert_sync_batchnorm(vae)
     ddp_device_ids = [cfg.DEVICE_IDS[rank]] if hasattr(cfg, "DEVICE_IDS") else [rank]
-    vae = DDP(vae, device_ids=ddp_device_ids)
+    vae = DDP(vae, device_ids=ddp_device_ids, find_unused_parameters=True)
     optimizer = torch.optim.Adam(vae.parameters(), lr=cfg.VAE_LR, betas=(0.5, 0.999))
 
     start_epoch = 0

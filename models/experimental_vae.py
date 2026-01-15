@@ -87,8 +87,6 @@ class Encoder(nn.Sequential):
     def forward(self, x, noise):
         # noise shape: (batch, outchannels, width/8, height/8)
         for module in self:
-            if getattr(module, 'stride', None) == (2, 2):
-                x = F.pad(x, (0, 1, 0, 1), mode='constant', value=0)
             x = module(x)
 
         mu, logvar = torch.chunk(x, 2, dim=1)

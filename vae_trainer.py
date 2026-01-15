@@ -7,6 +7,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.amp import autocast, GradScaler
 
 from models.conditional_vae import ConditionalVAE
 from utils.dataset import create_dataloaders
@@ -85,12 +86,13 @@ def evaluate(
             meta = meta.to(device)
             target = target.to(device)
 
-            noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
-            outputs = vae(initial, meta, noise)
+            outputs = vae(initial, meta)
             reconstruction = outputs["reconstruction"]
-            vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
+            mu = outputs["mu"]
+            logvar = outputs["logvar"]
+            
             rec_loss = l1_loss(reconstruction, target).item()
-            kl = vae_module.kl_loss(outputs["mu"], outputs["logvar"]).item()
+            kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()).item() / max(mu.shape[0], 1)
             batch_size = target.shape[0]
             total_loss += (cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl) * batch_size
             total_l1 += rec_loss * batch_size
@@ -156,6 +158,7 @@ def train_single(
         start_epoch = load_checkpoint(checkpoint_path, vae, optimizer)
 
     clip_model, clip_preprocess = load_clip_model(device)
+    scaler = GradScaler()
 
     for epoch in range(start_epoch + 1, start_epoch + epochs + 1):
         vae.train()
@@ -167,18 +170,20 @@ def train_single(
             meta = meta.to(device)
             target = target.to(device)
 
-            noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
-            outputs = vae(initial, meta, noise)
-            reconstruction = outputs["reconstruction"]
+            with autocast('cuda'):
+                outputs = vae(initial, meta)
+                reconstruction = outputs["reconstruction"]
+                mu = outputs["mu"]
+                logvar = outputs["logvar"]
 
-            rec_loss = l1_loss(reconstruction, target)
-            vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
-            kl = vae_module.kl_loss(outputs["mu"], outputs["logvar"])
-            loss = cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl
+                rec_loss = l1_loss(reconstruction, target)
+                kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / max(mu.shape[0], 1)
+                loss = cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             epoch_loss += loss.item()
 
@@ -245,12 +250,13 @@ def evaluate_ddp(
             meta = meta.to(device)
             target = target.to(device)
 
-            noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
-            outputs = vae(initial, meta, noise)
+            outputs = vae(initial, meta)
             reconstruction = outputs["reconstruction"]
-            vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
+            mu = outputs["mu"]
+            logvar = outputs["logvar"]
+            
             rec_loss = l1_loss(reconstruction, target).item()
-            kl = vae_module.kl_loss(outputs["mu"], outputs["logvar"]).item()
+            kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()).item() / max(mu.shape[0], 1)
             batch_size = target.shape[0]
 
             local_loss = (cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl) * batch_size
@@ -274,7 +280,7 @@ def evaluate_ddp(
                     target.detach().cpu(),
                     sample_dir,
                     epoch,
-                    prefix="vae_val",
+                    prefix="vae2_val",
                     num_samples=4,
                 )
                 first_saved = True
@@ -319,12 +325,12 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     clip_model, clip_preprocess = load_clip_model(device)
 
     vae = ConditionalVAE(
-        encoded_dim=cfg.VAE_ENCODER_DIM,
         meta_dim=feature_dim,
-        noise_dim=cfg.VAE_NOISE_DIM,
         latent_dim=cfg.VAE_LATENT_DIM,
         hidden_dim=cfg.VAE_HIDDEN_DIM,
         channels=cfg.CHANNELS,
+        base_channels=cfg.VAE_BASE_CHANNELS,
+        image_size=cfg.TARGET_HEIGHT,
     ).to(device)
     vae = nn.SyncBatchNorm.convert_sync_batchnorm(vae)
     ddp_device_ids = [cfg.DEVICE_IDS[rank]] if hasattr(cfg, "DEVICE_IDS") else [rank]
@@ -345,6 +351,7 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         os.makedirs(sample_dir, exist_ok=True)
 
     metrics_logger = MetricsLogger(log_dir, f"vae_ddp_training_log.csv") if rank == 0 else None
+    scaler = GradScaler()
 
     try:
         for epoch in range(start_epoch + 1, start_epoch + args.epochs + 1):
@@ -361,18 +368,20 @@ def _ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 meta = meta.to(device)
                 target = target.to(device)
 
-                noise = torch.randn(target.shape[0], cfg.VAE_NOISE_DIM, device=device)
-                outputs = vae(initial, meta, noise)
-                reconstruction = outputs["reconstruction"]
+                with autocast('cuda'):
+                    outputs = vae(initial, meta)
+                    reconstruction = outputs["reconstruction"]
+                    mu = outputs["mu"]
+                    logvar = outputs["logvar"]
 
-                vae_module = vae.module if isinstance(vae, nn.parallel.DistributedDataParallel) else vae
-                rec_loss = nn.L1Loss()(reconstruction, target)
-                kl = vae_module.kl_loss(outputs["mu"], outputs["logvar"])
-                loss = cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl
+                    rec_loss = nn.L1Loss()(reconstruction, target)
+                    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / max(mu.shape[0], 1)
+                    loss = cfg.VAE_RECON_FACTOR * rec_loss + cfg.VAE_KL_FACTOR * kl
 
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
                 batch_size = target.shape[0]
                 total_loss += loss.item() * batch_size
@@ -479,12 +488,12 @@ def main() -> None:
     feature_dim = train_loader.dataset.input_data.shape[1]
 
     vae = ConditionalVAE(
-        encoded_dim=cfg.VAE_ENCODER_DIM,
         meta_dim=feature_dim,
-        noise_dim=cfg.VAE_NOISE_DIM,
         latent_dim=cfg.VAE_LATENT_DIM,
         hidden_dim=cfg.VAE_HIDDEN_DIM,
-        channels=cfg.CHANNELS
+        channels=cfg.CHANNELS,
+        base_channels=cfg.VAE_BASE_CHANNELS,
+        image_size=cfg.TARGET_HEIGHT,
     ).to(device)
 
     print("Starting VAE training")

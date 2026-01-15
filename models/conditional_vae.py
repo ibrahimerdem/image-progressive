@@ -1,189 +1,242 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.attention import SelfAttention
 
 
-class SelfAttention(nn.Module):
-    def __init__(self, in_channels):
+class AttentionBlock(nn.Module):
+    """Attention block with GroupNorm and residual connection."""
+    def __init__(self, in_channels, n_head=1):
         super().__init__()
-        self.query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.gamma = nn.Parameter(torch.zeros(1))
+        # Adjust num_groups to be compatible with channel count
+        num_groups = min(32, in_channels)
+        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=in_channels)
+        self.attn = SelfAttention(n_head=n_head, d_model=in_channels)
 
     def forward(self, x):
         batch, channel, height, width = x.shape
-        proj_query = self.query(x).view(batch, -1, height * width).permute(0, 2, 1)
-        proj_key = self.key(x).view(batch, -1, height * width)
-        attention = torch.bmm(proj_query, proj_key)
-        attention = F.softmax(attention, dim=-1)
-        proj_value = self.value(x).view(batch, -1, height * width)
-        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
-        out = out.view(batch, channel, height, width)
-        return self.gamma * out + x
+        residual = x
+        x = self.norm(x)
+        x = x.view(batch, channel, height * width).transpose(-1, -2)
+        x = self.attn(x)
+        x = x.transpose(-1, -2)
+        x = x.view(batch, channel, height, width)
+        x = x + residual
+        return x
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with GroupNorm and SiLU activation."""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # Adjust num_groups to be compatible with channel counts
+        num_groups = min(32, in_channels)
+        self.gn1 = nn.GroupNorm(num_groups=num_groups, num_channels=in_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        num_groups_out = min(32, out_channels)
+        self.gn2 = nn.GroupNorm(num_groups=num_groups_out, num_channels=out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        if in_channels != out_channels:
+            self.residual_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.residual_conv = nn.Identity()
+
+    def forward(self, x):
+        residual = x
+        x = self.gn1(x)
+        x = F.silu(x)
+        x = self.conv1(x)
+        x = self.gn2(x)
+        x = F.silu(x)
+        x = self.conv2(x)
+        return x + self.residual_conv(residual)
 
 
 class ConditionalVAE(nn.Module):
-    """Condition a VAE on raw initial images and structured recipe features."""
+    """Condition a VAE on raw initial images and structured recipe features.
+    
+    Upgraded architecture with:
+    - ResidualBlocks with GroupNorm
+    - AttentionBlocks with proper self-attention
+    - Larger base channels (128)
+    - Better feature encoding with LayerNorm
+    - SiLU activations
+    """
 
     def __init__(
         self,
-        encoded_dim: int = 512,
         meta_dim: int = 9,
-        noise_dim: int = 128,
-        latent_dim: int = 256,
-        hidden_dim: int = 512,
-        channels: int = 3
+        latent_dim: int = 512,
+        hidden_dim: int = 1024,
+        channels: int = 3,
+        base_channels: int = 128,
+        image_size: int = 512
     ):
         super().__init__()
-        self.encoded_dim = encoded_dim
         self.meta_dim = meta_dim
-        self.noise_dim = noise_dim
         self.latent_dim = latent_dim
-        self.meta_latent = nn.Sequential(
-            nn.Linear(meta_dim, hidden_dim),
-            nn.LeakyReLU(0.2, inplace=True),
+        self.base_channels = base_channels
+        self.image_size = image_size
+        
+        # Feature encoder with LayerNorm for better training
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(meta_dim, hidden_dim, bias=False),
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-
-        self.mu_head = nn.Linear(hidden_dim * 2, latent_dim)
-        self.logvar_head = nn.Linear(hidden_dim * 2, latent_dim)
-        self.noise_proj = nn.Linear(noise_dim, latent_dim)
-
-        # Decoder now takes encoded_image (16384 = 1024*4*4) + meta_dim
-        decoder_condition_dim = 1024 * 4 * 4 + meta_dim
-        self.decoder_condition_mlp = nn.Sequential(
-            nn.Linear(decoder_condition_dim, hidden_dim),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, latent_dim, bias=True),
         )
+        
+        # Mu and logvar heads for VAE
+        self.mu_head = nn.Linear(latent_dim, latent_dim)
+        self.logvar_head = nn.Linear(latent_dim, latent_dim)
 
-        self.decoder_input_dim = latent_dim + hidden_dim
-        self.decoder_fc = nn.Linear(self.decoder_input_dim, 1024 * 4 * 4)
-
-        # Upsampling layers
-        self.up1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(1024, 512, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.ReLU(True)
-        )
-        self.up2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(512, 256, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(True)
-        )
-        self.up3 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True)
-        )
-        self.up4 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True)
-        )
-        self.attn = SelfAttention(64)
-        self.up5 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(True)
-        )
-        self.up6 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(32, 16, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(True)
-        )
-        self.up7 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(16, channels, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.Tanh()
-        )
-
+        # Image encoder with residual blocks (removed attention for memory)
+        # 512 -> 256 -> 128 -> 64 -> 32 -> 16 (5 downsamples to 16x16)
+        # Then pool to 4x4 for memory efficiency
         self.image_encoder = nn.Sequential(
-            nn.Conv2d(channels, 64, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 1024, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(1024),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(channels, base_channels, kernel_size=3, padding=1),
+            ResidualBlock(base_channels, base_channels),
+            # 512 -> 256
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, stride=2, padding=1),
+            ResidualBlock(base_channels, base_channels * 2),
+            # 256 -> 128
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, stride=2, padding=1),
+            ResidualBlock(base_channels * 2, base_channels * 2),
+            # 128 -> 64
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, stride=2, padding=1),
+            ResidualBlock(base_channels * 2, base_channels * 4),
+            # 64 -> 32
+            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, stride=2, padding=1),
+            ResidualBlock(base_channels * 4, base_channels * 4),
+            # 32 -> 16
+            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(num_groups=min(32, base_channels * 4), num_channels=base_channels * 4),
+            nn.SiLU(),
         )
-        # Always pool to 4x4 so the flattened size stays 1024*4*4 regardless of input resolution
+        # Pool to consistent 4x4 size for memory efficiency
         self.image_pool = nn.AdaptiveAvgPool2d((4, 4))
+        
+        # Image embedding dimension: base_channels * 4 * 4 * 4 = 256 * 16 = 4096
+        image_embed_dim = base_channels * 4 * 4 * 4
+
+        # Decoder input: latent_dim + image_embed_dim + meta_dim
+        decoder_input_dim = latent_dim + image_embed_dim + meta_dim
+        
+        # Decoder projection
+        self.decoder_fc = nn.Sequential(
+            nn.Linear(decoder_input_dim, hidden_dim, bias=False),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, base_channels * 4 * 4 * 4),
+        )
+
+        # Decoder with residual blocks (removed attention for memory)
+        # 4 -> 8 -> 16 -> 32 -> 64 -> 128 -> 256 -> 512 (7 upsamples)
+        self.decoder = nn.Sequential(
+            ResidualBlock(base_channels * 4, base_channels * 4),
+            # 4 -> 8
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, padding=1),
+            # 8 -> 16
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, padding=1),
+            ResidualBlock(base_channels * 4, base_channels * 4),
+            AttentionBlock(base_channels * 4),
+            # 16 -> 32
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(base_channels * 4, base_channels * 2, kernel_size=3, padding=1),
+            # 32 -> 64
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1),
+            ResidualBlock(base_channels * 2, base_channels * 2),
+            # 64 -> 128
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1),
+            # 128 -> 256
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            ResidualBlock(base_channels, base_channels),
+            # 256 -> 512
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            # Final output
+            nn.GroupNorm(num_groups=min(32, base_channels), num_channels=base_channels),
+            nn.SiLU(),
+            nn.Conv2d(base_channels, channels, kernel_size=3, padding=1),
+            nn.Tanh(),
+        )
+
 
     def encode(self, meta_features: torch.Tensor):
-        hidden = self.meta_latent(meta_features)
-        mu = self.mu_head(hidden)
-        logvar = self.logvar_head(hidden)
+        """Encode meta features to latent distribution parameters."""
+        features = self.feature_encoder(meta_features)
+        mu = self.mu_head(features)
+        logvar = self.logvar_head(features)
         return mu, logvar
 
     def encode_image(self, initial_image: torch.Tensor):
+        """Encode initial image to feature representation."""
         encoded = self.image_encoder(initial_image)
         encoded = self.image_pool(encoded)
-        # Flatten to (batch, 1024*4*4)
+        # Flatten to (batch, base_channels * 4 * 4 * 4)
         return encoded.view(encoded.size(0), -1)
 
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor, noise: torch.Tensor):
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor):
+        """Reparameterization trick for VAE."""
         std = torch.exp(0.5 * logvar)
-        proj_noise = self.noise_proj(noise)
-        return mu + proj_noise * std
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
     def decode(self, latent: torch.Tensor, encoded_image: torch.Tensor, meta_features: torch.Tensor):
-        condition = torch.cat([encoded_image, meta_features], dim=1)
-        condition = self.decoder_condition_mlp(condition)
-        decoder_input = torch.cat([latent, condition], dim=1)
+        """Decode latent + image + features to output image."""
+        # Concatenate all conditions
+        decoder_input = torch.cat([latent, encoded_image, meta_features], dim=1)
         x = self.decoder_fc(decoder_input)
-        x = x.view(x.size(0), 1024, 4, 4)
-        x = self.up1(x)
-        x = self.up2(x)
-        x = self.up3(x)
-        x = self.up4(x)
-        x = self.attn(x)
-        x = self.up5(x)
-        x = self.up6(x)
-        x = self.up7(x)
+        x = x.view(x.size(0), self.base_channels * 4, 4, 4)
+        x = self.decoder(x)
         return x
-
-    def kl_loss(self, mu: torch.Tensor, logvar: torch.Tensor):
-        return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
 
     def forward(
         self,
         initial_image: torch.Tensor,
         meta_features: torch.Tensor,
-        noise: torch.Tensor | None = None,
-    ):  # noqa: D401
-        if noise is None:
-            noise = torch.randn(initial_image.size(0), self.noise_dim, device=initial_image.device)
-        elif noise.size(1) != self.noise_dim:
-            raise ValueError(f"Expected noise dim {self.noise_dim}, got {noise.size(1)}")
-
+    ):
+        """Forward pass: encode, reparameterize, decode."""
+        # Encode image and features
         encoded_image = self.encode_image(initial_image)
         mu, logvar = self.encode(meta_features)
-        latent = self.reparameterize(mu, logvar, noise)
+        
+        # Reparameterize
+        latent = self.reparameterize(mu, logvar)
+        
+        # Decode
         reconstruction = self.decode(latent, encoded_image, meta_features)
 
         return {
             "reconstruction": reconstruction,
             "mu": mu,
             "logvar": logvar,
-            "noise": noise,
         }
+    
+    def generate(self, initial_image: torch.Tensor, meta_features: torch.Tensor, num_samples: int = 1):
+        """Generate multiple samples from the same input."""
+        encoded_image = self.encode_image(initial_image)
+        mu, logvar = self.encode(meta_features)
+        
+        # Expand for multiple samples
+        if num_samples > 1:
+            encoded_image = encoded_image.repeat(num_samples, 1)
+            mu = mu.repeat(num_samples, 1)
+            logvar = logvar.repeat(num_samples, 1)
+            meta_features = meta_features.repeat(num_samples, 1)
+        
+        # Sample from latent distribution
+        latent = self.reparameterize(mu, logvar)
+        
+        # Decode
+        generated = self.decode(latent, encoded_image, meta_features)
+        return generated
+
