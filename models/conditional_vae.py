@@ -99,17 +99,23 @@ class ConditionalVAE(nn.Module):
         self.image_encoder = nn.Sequential(
             nn.Conv2d(channels, base_channels, kernel_size=3, padding=1),
             ResidualBlock(base_channels, base_channels),
+            AttentionBlock(base_channels),
+            ResidualBlock(base_channels, base_channels),
             # 512 -> 256
             nn.Conv2d(base_channels, base_channels, kernel_size=3, stride=2, padding=1),
             ResidualBlock(base_channels, base_channels * 2),
+            ResidualBlock(base_channels * 2, base_channels * 2),
             # 256 -> 128
             nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, stride=2, padding=1),
+            ResidualBlock(base_channels * 2, base_channels * 2),
             ResidualBlock(base_channels * 2, base_channels * 2),
             # 128 -> 64
             nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, stride=2, padding=1),
             ResidualBlock(base_channels * 2, base_channels * 4),
+            ResidualBlock(base_channels * 4, base_channels * 4),
             # 64 -> 32
             nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, stride=2, padding=1),
+            ResidualBlock(base_channels * 4, base_channels * 4),
             ResidualBlock(base_channels * 4, base_channels * 4),
             # 32 -> 16
             nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, stride=2, padding=1),
@@ -145,6 +151,7 @@ class ConditionalVAE(nn.Module):
             nn.Conv2d(base_channels * 4, base_channels * 4, kernel_size=3, padding=1),
             ResidualBlock(base_channels * 4, base_channels * 4),
             AttentionBlock(base_channels * 4),
+            ResidualBlock(base_channels * 4, base_channels * 4),
             # 16 -> 32
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(base_channels * 4, base_channels * 2, kernel_size=3, padding=1),
@@ -152,12 +159,14 @@ class ConditionalVAE(nn.Module):
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1),
             ResidualBlock(base_channels * 2, base_channels * 2),
+            ResidualBlock(base_channels * 2, base_channels * 2),
             # 64 -> 128
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(base_channels * 2, base_channels, kernel_size=3, padding=1),
             # 128 -> 256
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            ResidualBlock(base_channels, base_channels),
             ResidualBlock(base_channels, base_channels),
             # 256 -> 512
             nn.Upsample(scale_factor=2, mode='nearest'),

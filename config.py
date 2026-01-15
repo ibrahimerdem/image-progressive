@@ -47,6 +47,6 @@ DEVICE_IDS = [0, 1]
 WORLD_SIZE = len(DEVICE_IDS)
 
 # Per-GPU batch size and dataloader workers
-BATCH_SIZE_PER_GPU = 2
+BATCH_SIZE_PER_GPU = 4
 NUM_WORKERS = 4
 
