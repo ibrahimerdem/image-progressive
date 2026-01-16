@@ -97,6 +97,75 @@ class SimpleUNet(nn.Module):
         return self.out_conv(u1)
 
 
+class AttentionBlock(nn.Module):
+    def __init__(self, channels: int, num_heads: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, channels)
+        self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        normed = self.norm(x)
+        flat = normed.view(b, c, -1).permute(2, 0, 1)
+        attn_out, _ = self.attn(flat, flat, flat)
+        attn_out = attn_out.permute(1, 2, 0).view(b, c, h, w)
+        return x + attn_out
+
+
+class DownBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, cond_dim: int, attn: bool):
+        super().__init__()
+        self.res = ResidualBlock(in_channels, out_channels, cond_dim)
+        self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
+        self.downsample = nn.AvgPool2d(2)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor):
+        h = self.res(x, cond)
+        if self.attn is not None:
+            h = self.attn(h)
+        return self.downsample(h), h
+
+
+class UpBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, cond_dim: int, attn: bool):
+        super().__init__()
+        self.res = ResidualBlock(in_channels, out_channels, cond_dim)
+        self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, cond: torch.Tensor):
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = self.upsample(x)
+        h = torch.cat([x, skip], dim=1)
+        h = self.res(h, cond)
+        if self.attn is not None:
+            h = self.attn(h)
+        return h
+
+
+class ImprovedUNet(nn.Module):
+    def __init__(self, in_channels: int, base_channels: int, cond_dim: int):
+        super().__init__()
+        self.inc = ResidualBlock(in_channels, base_channels, cond_dim)
+        self.down1 = DownBlock(base_channels, base_channels * 2, cond_dim, attn=False)
+        self.down2 = DownBlock(base_channels * 2, base_channels * 4, cond_dim, attn=True)
+        self.mid = ResidualBlock(base_channels * 4, base_channels * 4, cond_dim)
+        self.up3 = UpBlock(base_channels * 8, base_channels * 2, cond_dim, attn=True)
+        self.up2 = UpBlock(base_channels * 4, base_channels, cond_dim, attn=False)
+        self.up1 = UpBlock(base_channels * 2, base_channels, cond_dim, attn=False)
+        self.out_conv = nn.Conv2d(base_channels, in_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h1 = self.inc(x, cond)
+        d2, skip1 = self.down1(h1, cond)
+        d3, skip2 = self.down2(d2, cond)
+        middle = self.mid(d3, cond)
+        u3 = self.up3(middle, skip2, cond)
+        u2 = self.up2(u3, skip1, cond)
+        u1 = self.up1(u2, h1, cond)
+        return self.out_conv(u1)
+
+
 class GaussianDiffusion(nn.Module):
     def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02):
         super().__init__()
@@ -144,40 +213,60 @@ class GaussianDiffusion(nn.Module):
         self,
         model: nn.Module,
         features: torch.Tensor,
-        initial_image: Optional[torch.Tensor] = None,
         steps: Optional[int] = None,
-    ) -> torch.Tensor:
+        save_intermediates: bool = False,
+        eta: float = 0.0,  # 0 = deterministic DDIM, 1 = full DDPM
+    ):
+        """
+        DDIM sampling with proper timestep subsampling.
+        eta=0: deterministic DDIM
+        eta=1: stochastic DDPM
+        """
         steps = steps or self.timesteps
         shape = (features.size(0), cfg.CHANNELS, cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH)
         img = torch.randn(shape, device=features.device)
-        for i in reversed(range(steps)):
-            t = torch.full((shape[0],), i, dtype=torch.long, device=img.device)
-            epsilon = model(img, t, features, initial_image)
-            beta_t = self._extract(self.betas, t, img.shape)
+        intermediates = []
+        
+        # Create timestep schedule - evenly subsample if steps < timesteps
+        if steps < self.timesteps:
+            c = self.timesteps // steps
+            timestep_schedule = torch.arange(0, self.timesteps, c, dtype=torch.long)
+            timestep_schedule = torch.flip(timestep_schedule, [0])
+        else:
+            timestep_schedule = torch.arange(self.timesteps - 1, -1, -1, dtype=torch.long)
+        
+        for step_idx, timestep in enumerate(timestep_schedule):
+            t = torch.full((shape[0],), timestep, dtype=torch.long, device=img.device)
+            
+            # Predict noise
+            epsilon = model(img, t, features)
+            
+            # Get alpha values
             alpha_bar_t = self._extract(self.alphas_cumprod, t, img.shape)
             
             # Get next timestep's alpha
             if step_idx < len(timestep_schedule) - 1:
-                t_prev = timestep_schedule[step_idx + 1].item()
+                t_prev = timestep_schedule[step_idx + 1]
                 alpha_bar_prev = self._extract(self.alphas_cumprod, 
-                                               torch.tensor([t_prev], device=img.device), img.shape)
+                                               torch.full_like(t, t_prev), img.shape)
             else:
                 alpha_bar_prev = torch.ones_like(alpha_bar_t)
             
-            # Predict x0 (the clean image)
+            # Predict x0 (the clean image) using DDIM formula
             pred_x0 = (img - torch.sqrt(1 - alpha_bar_t) * epsilon) / torch.sqrt(alpha_bar_t)
             pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
             
-            # Direction pointing to x_t
-            dir_xt = torch.sqrt(1.0 - alpha_bar_prev - eta**2 * (1 - alpha_bar_t / alpha_bar_prev) * (1 - alpha_bar_prev)) * epsilon
+            # DDIM direction term
+            variance = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)
+            dir_xt = torch.sqrt(1.0 - alpha_bar_prev - eta**2 * variance) * epsilon
             
             # Compute x_{t-1}
             x_prev = torch.sqrt(alpha_bar_prev) * pred_x0 + dir_xt
             
-            # Add noise (DDPM stochastic term)
+            # Add stochastic noise (controlled by eta)
             if eta > 0 and step_idx < len(timestep_schedule) - 1:
                 noise = torch.randn_like(img)
-                sigma_t = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev))
+                sigma_t = eta * torch.sqrt(variance)
                 x_prev = x_prev + sigma_t * noise
             
             img = x_prev
@@ -196,51 +285,35 @@ class StableDiffusionConditioned(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        use_initial: bool = True,
         cond_dim: Optional[int] = None,
-        initial_encoder_ckpt: Optional[str] = None,
-        freeze_initial_encoder: bool = False,
     ):
         super().__init__()
         if cond_dim is None:
             cond_dim = cfg.SD_EMB_DIM * 2
-        self.use_initial = use_initial
+        
         self.feature_projection = FeatureProjector(input_dim, cond_dim)
         self.time_embedding = TimeEmbedding(cond_dim)
-        self.initial_encoder = InitialImageEncoder(cfg.CHANNELS, cond_dim)
         self.unet = ImprovedUNet(cfg.CHANNELS, base_channels=cfg.SD_BASE_CHANNELS, cond_dim=cond_dim)
-        self.time_scale = nn.Parameter(torch.tensor(0.8))
-        self.feature_scale = nn.Parameter(torch.tensor(1.0))
-        self.initial_scale = nn.Parameter(torch.tensor(1.0))
-
-        if initial_encoder_ckpt:
-            self._load_initial_encoder(initial_encoder_ckpt)
-        if freeze_initial_encoder:
-            for p in self.initial_encoder.parameters():
-                p.requires_grad = False
 
     def forward(
         self,
         noisy_image: torch.Tensor,
         timesteps: torch.Tensor,
         features: torch.Tensor,
-        initial_image: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        time_emb = self.time_embedding(timesteps) * self.time_scale
-        feature_emb = self.feature_projection(features) * self.feature_scale
+        time_emb = self.time_embedding(timesteps)
+        feature_emb = self.feature_projection(features)
         cond = time_emb + feature_emb
-        if self.use_initial and initial_image is not None:
-            cond = cond + self.initial_encoder(initial_image) * self.initial_scale
         return self.unet(noisy_image, cond)
 
 
 class StableDiffusionPipeline:
-    def __init__(self, model, schedule):
+    def __init__(self, model: StableDiffusionConditioned, schedule: GaussianDiffusion):
         self.model = model
         self.schedule = schedule
 
-    def sample(self, features: torch.Tensor, initial_image: Optional[torch.Tensor] = None, steps: Optional[int] = None) -> torch.Tensor:
-        return self.schedule.sample(self.model, features, initial_image, steps)
+    def sample(self, features: torch.Tensor, steps: Optional[int] = None, save_intermediates: bool = False):
+        return self.schedule.sample(self.model, features, steps, save_intermediates=save_intermediates)
 
 
 class ModelEMA:

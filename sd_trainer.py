@@ -42,15 +42,20 @@ def _measure_denoising_quality(
 ):
     """
     Measure model's denoising ability at different noise levels.
-    Returns MSE loss for each tested timestep.
+    Returns MSE loss for each tested timestep + prediction statistics.
     
     Lower loss = better denoising at that noise level
     < 0.05: Model denoises well at this timestep
     0.05-0.1: Model is learning
     > 0.1: Model struggles at this noise level
+    
+    Also returns prediction variance to detect mode collapse.
+    Healthy model: variance > 0.5
+    Collapsed model: variance < 0.1 (predicting near-constant values)
     """
     model.eval()
     losses_by_timestep = {}
+    prediction_stats = {}
     
     with torch.no_grad():
         for t_val in timesteps_to_test:
@@ -66,8 +71,16 @@ def _measure_denoising_quality(
             # Calculate MSE
             mse = F.mse_loss(pred_noise, noise).item()
             losses_by_timestep[t_val] = mse
+            
+            # Calculate prediction statistics to detect collapse
+            pred_std = pred_noise.std().item()
+            pred_mean = pred_noise.mean().item()
+            prediction_stats[t_val] = {
+                'std': pred_std,
+                'mean': pred_mean
+            }
     
-    return losses_by_timestep
+    return losses_by_timestep, prediction_stats
 
 
 
@@ -115,6 +128,7 @@ def _run_validation(
     clip_preprocess,
     sample_dir: str,
     epoch: int,
+    rank: int = 0,
     max_batches: int = 10,  # Limit validation to first 10 batches
 ):
     if val_loader is None or clip_model is None or clip_preprocess is None:
@@ -196,7 +210,7 @@ def _run_validation(
             )
             
             # Measure denoising quality at different timesteps (first batch only)
-            timestep_losses = _measure_denoising_quality(
+            timestep_losses, pred_stats = _measure_denoising_quality(
                 model, diffusion, features, targets, device,
                 timesteps_to_test=[50, 100, 200, 300, 400]
             )
@@ -211,10 +225,13 @@ def _run_validation(
         "val_clip": total_clip / max(clip_count, 1),
     }
     
-    # Add per-timestep losses
+    # Add per-timestep losses and prediction stats
     if timestep_losses:
         for t, loss in timestep_losses.items():
             metrics[f"val_loss_t{t}"] = loss
+        # Add prediction variance for collapse detection
+        avg_pred_std = sum(pred_stats[t]['std'] for t in pred_stats) / len(pred_stats)
+        metrics["pred_variance"] = avg_pred_std
     
     return metrics
 
@@ -410,6 +427,16 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                     print(f"PSNR:          {val_metrics['val_psnr']:.2f} dB  (target: >25 dB)")
                     print(f"SSIM:          {val_metrics['val_ssim']:.4f}  (target: >0.75)")
                     print(f"CLIP Sim:      {val_metrics['val_clip']:.4f}  (target: >0.70)")
+                    
+                    # Prediction variance (collapse detection)
+                    pred_var = val_metrics.get('pred_variance', 0)
+                    if pred_var < 0.1:
+                        var_status = "⚠️  MODE COLLAPSE"
+                    elif pred_var < 0.3:
+                        var_status = "⚠ Low (risk)"
+                    else:
+                        var_status = "✓ Healthy"
+                    print(f"Pred Variance: {pred_var:.4f}  {var_status}")
                     
                     # Count how many timesteps are learned well
                     good_timesteps = sum(1 for k in timestep_keys if val_metrics[k] < 0.05)
