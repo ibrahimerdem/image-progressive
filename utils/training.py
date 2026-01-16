@@ -297,5 +297,33 @@ def save_random_sample_pairs(
     visualize_results(initials_subset, generated_subset, target_subset, num_samples=num, save_path=save_path)
 
 
+def save_diffusion_intermediates(intermediates, sample_dir, epoch, sample_idx=0):
+    """Save intermediate diffusion steps as a grid."""
+    os.makedirs(sample_dir, exist_ok=True)
+    
+    num_steps = len(intermediates)
+    if num_steps == 0:
+        return
+    
+    # Create a grid showing denoising progress
+    fig, axes = plt.subplots(1, num_steps, figsize=(3 * num_steps, 3))
+    if num_steps == 1:
+        axes = [axes]
+    
+    for idx, (step, img_tensor) in enumerate(intermediates):
+        # Take first image from batch
+        img = denormalize_image(img_tensor[sample_idx].detach()).cpu().permute(1, 2, 0).numpy()
+        img = np.clip(img, 0, 1)
+        
+        axes[idx].imshow(img)
+        axes[idx].set_title(f'Step {step}')
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    save_path = os.path.join(sample_dir, f"intermediates_epoch_{epoch:04d}.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
 if __name__ == "__main__": 
     print("Utils module loaded successfully!")

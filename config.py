@@ -24,7 +24,7 @@ INITIAL_IMAGE = False
 ENCODER_PATH = "checkpoints/encoder_epoch_50.pth"
 FREEZE_ENCODER = True
 # Stable diffusion initial image encoder options
-SD_INITIAL_ENCODER_CKPT = "checkpoints/encoder_epoch_50.pth"
+SD_INITIAL_ENCODER_CKPT = None #"checkpoints/encoder_epoch_50.pth"
 SD_FREEZE_INITIAL_ENCODER = False
 
 # Model / training defaults
@@ -34,16 +34,23 @@ FIXED_D_LR = 0.0001
 BCE_FACTOR = 1.0
 L1_FACTOR = 50.0
 L2_FACTOR = 150.0
-VAL_EPOCH = 5
+VAL_EPOCH = 5  # Validate every 5 epochs for long training runs
+
+# VAE defaults (balanced for memory and capacity)
+VAE_BASE_CHANNELS = 64  # Compromise: not too small (32) or large (128)
+VAE_LATENT_DIM = 256     # Sufficient for learning
+VAE_HIDDEN_DIM = 512     # Better feature encoding
+VAE_LR = 0.0001          # Conservative learning rate
+VAE_KL_WEIGHT = 0.00001  # Small KL weight to avoid posterior collapse
 
 # Stable diffusion defaults
-SD_LR = 0.0002
+SD_LR = 0.0002           # Increased back for better learning
 SD_TIMESTEPS = 500
-SD_SAMPLE_STEPS = 500
+SD_SAMPLE_STEPS = 50     # Reduced for faster validation (was 500)
 SD_EMB_DIM = 256
 SD_VAL_STEPS = 1
 SD_SAMPLE_BATCH = 2
-SD_LOG_INTERVAL = 10
+SD_LOG_INTERVAL = 100    # Report every 100 batches (was 50)
 SD_BASE_CHANNELS = 64
 SD_ATTENTION_HEADS = 2
 SD_ATTENTION_RESOLUTION = [32, 16]
