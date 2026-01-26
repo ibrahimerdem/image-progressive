@@ -38,7 +38,7 @@ def _measure_denoising_quality(
     features: torch.Tensor,
     targets: torch.Tensor,
     device: torch.device,
-    timesteps_to_test: list = [50, 100, 200, 300, 400],
+    timesteps_to_test: list = [100, 200, 400, 600, 800],
 ):
     """
     Measure model's denoising ability at different noise levels.
@@ -87,7 +87,12 @@ def _measure_denoising_quality(
 def _setup_ddp(rank: int, world_size: int) -> torch.device:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    
+    # Set DDP timeout for slow validation
+    timeout_minutes = getattr(cfg, "SD_DDP_TIMEOUT_MINUTES", 10)
+    timeout = torch.distributed.timedelta(minutes=timeout_minutes)
+    
+    dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timeout)
     device_id = cfg.DEVICE_IDS[rank]
     torch.cuda.set_device(device_id)
     return torch.device(f"cuda:{device_id}")
@@ -98,12 +103,17 @@ def _cleanup_ddp() -> None:
         dist.destroy_process_group()
 
 
-def _save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, save_dir: str, version: str) -> str:
+def _save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, save_dir: str, version: str, ema_model=None) -> str:
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
     }
+    
+    # Save EMA model if provided
+    if ema_model is not None:
+        checkpoint["ema_state_dict"] = ema_model.state_dict()
+    
     filename = os.path.join(save_dir, f"sd_{version}_epoch_{epoch:04d}.pth")
     torch.save(checkpoint, filename)
     return filename
@@ -123,6 +133,7 @@ def _run_validation(
     pipeline: StableDiffusionPipeline,
     diffusion: GaussianDiffusion,
     val_loader,
+    train_loader,  # Added: to sample from training set
     device: torch.device,
     clip_model,
     clip_preprocess,
@@ -154,11 +165,46 @@ def _run_validation(
     save_intermediates = epoch in [5, 10, 20, 50, 100]
     
     if epoch in [5, 10, 20, 50, 100]:
-        print(f"[SD] Epoch {epoch}: Saving intermediate diffusion steps")
+        print(f"[SD] Epoch {epoch}: Saving intermediate diffusion steps + train sample")
     
     if epoch == 5:
-        print(f"[SD] Validation using {cfg.SD_SAMPLE_STEPS} sampling steps from {cfg.SD_TIMESTEPS} trained timesteps")
+        print(f"[SD] Validation: FULL GENERATION from pure noise using {cfg.SD_SAMPLE_STEPS} sampling steps")
 
+    # FIRST: Generate from one training sample to verify reconstruction ability
+    if rank == 0 and train_loader is not None:
+        with torch.no_grad():
+            with autocast_ctx():
+                # Get one batch from training set
+                train_iter = iter(train_loader)
+                _, train_features, train_targets, _ = next(train_iter)
+                train_features = train_features.to(device)
+                train_targets = train_targets.to(device)
+                
+                # Generate from pure noise (full generation like inference)
+                train_samples = pipeline.sample(train_features, steps=cfg.SD_SAMPLE_STEPS, save_intermediates=False)
+                
+                # Save training set generation
+                save_random_sample_pairs(
+                    train_targets,
+                    train_samples,
+                    train_targets,
+                    sample_dir,
+                    epoch,
+                    prefix="sd_train",
+                    num_samples=min(train_targets.size(0), 4),  # Save first 4
+                )
+                
+                # Compute metrics for training sample
+                train_psnr = calculate_psnr(train_samples, train_targets)
+                train_ssim = calculate_ssim(train_samples, train_targets)
+                train_clip_sum, train_clip_bs = compute_clip_metrics_batch(
+                    train_samples, train_targets, clip_model, clip_preprocess, device
+                )
+                train_clip = train_clip_sum / train_clip_bs if train_clip_bs > 0 else 0.0
+                
+                print(f"[SD] Train Sample Gen: PSNR={train_psnr:.2f} dB, SSIM={train_ssim:.4f}, CLIP={train_clip:.4f}")
+
+    # VALIDATION SET: Generate from pure noise (exactly like generation script)
     for idx, (_, features, target_images, _) in enumerate(val_loader):
         if idx >= max_batches: 
             break
@@ -170,7 +216,7 @@ def _run_validation(
             with autocast_ctx():
                 val_steps = cfg.SD_SAMPLE_STEPS
                 
-                # Save intermediates at key epochs
+                # Always generate from pure noise (full generation)
                 if idx == 0 and save_intermediates:
                     result = pipeline.sample(features, steps=val_steps, save_intermediates=True)
                     if isinstance(result, tuple):
@@ -180,7 +226,7 @@ def _run_validation(
                         # Print timestep schedule for debugging (epoch 5 only)
                         if epoch == 5:
                             timesteps = [t for t, _ in intermediates]
-                            print(f"[SD] Saved intermediates at timesteps: {timesteps}")
+                            print(f"[SD] Full generation saved intermediates at timesteps: {timesteps}")
                     else:
                         samples = result
                 else:
@@ -212,7 +258,7 @@ def _run_validation(
             # Measure denoising quality at different timesteps (first batch only)
             timestep_losses, pred_stats = _measure_denoising_quality(
                 model, diffusion, features, targets, device,
-                timesteps_to_test=[50, 100, 200, 300, 400]
+                timesteps_to_test=[100, 200, 400, 600, 800]
             )
 
     if total_samples == 0:
@@ -248,11 +294,28 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         world_size=world_size,
     )
 
+    # Feature dimension calculation
     feature_dim = train_loader.dataset.input_data.shape[1]
+    seq_len = getattr(cfg, 'FEATURE_SEQUENCE_LENGTH', 0)
+    
+    # If using sequences, adjust input_dim to account for positional encoding
+    if seq_len > 0 and seq_len != feature_dim:
+        # Strategy 2: [N, D+1] where +1 is position
+        feature_input_dim = feature_dim + 1
+    else:
+        # Strategy 1: [D, D] or no sequence [D]
+        feature_input_dim = feature_dim
 
+    use_cross_attn = getattr(cfg, "SD_USE_CROSS_ATTN", False)
     base_model = StableDiffusionConditioned(
-        input_dim=feature_dim,
+        input_dim=feature_input_dim,
+        use_cross_attn=use_cross_attn,
     )
+    if rank == 0:
+        mode_str = "Cross-Attention" if use_cross_attn else "FiLM"
+        seq_info = f" with {seq_len} tokens" if seq_len > 0 else ""
+        print(f"[SD] Using {mode_str} conditioning for features{seq_info}")
+        print(f"[SD] Feature input dimension: {feature_input_dim} (original: {feature_dim})")
     diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
 
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
@@ -271,10 +334,37 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     if retrain and checkpoint_path:
         if os.path.exists(checkpoint_path):
             start_epoch = _load_checkpoint(model, optimizer, checkpoint_path)
+            # Load EMA weights if available
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            if "ema_state_dict" in checkpoint:
+                ema_helper.ema.load_state_dict(checkpoint["ema_state_dict"])
+                if rank == 0:
+                    print(f"[SD] Loaded EMA weights from checkpoint")
             if rank == 0:
-                print(f"[SD] Resumed from checkpoint {checkpoint_path} starting at epoch {start_epoch}")
+                print(f"[SD] Resumed from checkpoint {checkpoint_path} starting at epoch {start_epoch + 1}")
         elif rank == 0:
             print(f"[SD] Checkpoint {checkpoint_path} not found, starting from scratch")
+    elif retrain and not checkpoint_path:
+        # Auto-detect latest checkpoint
+        if os.path.exists(save_dir):
+            checkpoints = [f for f in os.listdir(save_dir) if f.startswith("sd_") and f.endswith(".pth")]
+            if checkpoints:
+                # Sort by epoch number
+                checkpoints.sort(key=lambda x: int(x.split("_")[-1].replace(".pth", "")))
+                latest_ckpt = os.path.join(save_dir, checkpoints[-1])
+                start_epoch = _load_checkpoint(model, optimizer, latest_ckpt)
+                # Load EMA weights if available
+                checkpoint = torch.load(latest_ckpt, map_location="cpu")
+                if "ema_state_dict" in checkpoint:
+                    ema_helper.ema.load_state_dict(checkpoint["ema_state_dict"])
+                    if rank == 0:
+                        print(f"[SD] Loaded EMA weights from checkpoint")
+                if rank == 0:
+                    print(f"[SD] Auto-resumed from {latest_ckpt} starting at epoch {start_epoch + 1}")
+            elif rank == 0:
+                print(f"[SD] No checkpoints found in {save_dir}, starting from scratch")
+        elif rank == 0:
+            print(f"[SD] No checkpoint directory found, starting from scratch")
 
     save_dir = os.path.join("checkpoints", "sd")
     log_dir = os.path.join(save_dir, "logs")
@@ -305,7 +395,19 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             targets = target_images.to(device)
 
             with amp_ctx():
-                loss = diffusion.p_loss(model, targets, features)
+                cfg_dropout = getattr(cfg, "SD_CFG_DROPOUT", 0.1)
+                x0_loss_weight = getattr(cfg, "SD_X0_LOSS_WEIGHT", 0.0)
+                perceptual_weight = getattr(cfg, "SD_PERCEPTUAL_WEIGHT", 0.0)
+                
+                loss_dict = diffusion.p_loss(
+                    model, targets, features, 
+                    cfg_dropout=cfg_dropout,
+                    use_x0_loss=(x0_loss_weight > 0),
+                    x0_loss_weight=x0_loss_weight,
+                    feature_consistency_weight=perceptual_weight
+                )
+                loss = loss_dict['loss']
+                loss_metrics = loss_dict.get('metrics', {})
 
             optimizer.zero_grad()
             if scaler is not None:
@@ -360,11 +462,16 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         )
         if should_validate:
             print(f"[SD] Rank {rank} starting validation")
+            # Use EMA model for validation on rank 0, raw model on other ranks
+            val_model = ema_helper.ema if rank == 0 else model
+            val_pipeline = ema_pipeline if rank == 0 else pipeline
+            
             val_metrics = _run_validation(
-                model,
-                pipeline,
+                val_model,
+                val_pipeline,
                 diffusion,
                 val_loader,
+                train_loader,  # Pass train_loader for training sample generation
                 device,
                 clip_model,
                 clip_preprocess,
@@ -402,6 +509,16 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                         loss = val_metrics[key]
                         quality = "✓ Good" if loss < 0.05 else "⚠ Learning" if loss < 0.1 else "✗ Poor"
                         print(f"     t={t:3d}: loss={loss:.4f} {quality}")
+                    
+                    # Always print prediction variance for collapse detection
+                    pred_var = val_metrics.get('pred_variance', 0)
+                    if pred_var < 0.1:
+                        var_status = "⚠️ MODE COLLAPSE!"
+                    elif pred_var < 0.3:
+                        var_status = "⚠ Low (risky)"
+                    else:
+                        var_status = "✓ Healthy"
+                    print(f"[SD] Pred Variance: {pred_var:.4f} {var_status}")
                 
                 # Log all metrics including per-timestep losses
                 log_dict = {
@@ -448,7 +565,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 metrics_logger.log({"epoch": epoch, "train_loss": avg_loss})
 
             if should_validate:
-                checkpoint_path = _save_checkpoint(model, optimizer, epoch, save_dir, version)
+                checkpoint_path = _save_checkpoint(model, optimizer, epoch, save_dir, version, ema_model=ema_helper.ema if rank == 0 else None)
                 print(f"[SD] Checkpoint saved: {checkpoint_path}")
 
     _cleanup_ddp()
@@ -476,8 +593,8 @@ def main() -> None:
 
     retrain_flag = bool(args.retrain)
     checkpoint_path = args.checkpoint or None
-    if retrain_flag and not checkpoint_path:
-        parser.error("--checkpoint is required when --retrain=1")
+    # Note: retrain=1 means RESUME training, retrain=0 means start fresh
+    # Checkpoint path is optional - if not provided, auto-detects latest
 
     print(f"Launching stable diffusion DDP training on devices {cfg.DEVICE_IDS}")
     train_distributed(

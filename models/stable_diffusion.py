@@ -46,29 +46,117 @@ class FeatureProjector(nn.Module):
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features: [B, input_dim] or [B, N, input_dim]
+        Returns:
+            [B, output_dim] or [B, N, output_dim]
+        """
         return self.net(features)
 
 
+class CrossAttention(nn.Module):
+    """Cross-attention layer for conditioning on sequence features."""
+    def __init__(self, query_dim: int, context_dim: int, heads: int = 8):
+        super().__init__()
+        self.heads = heads
+        self.scale = (query_dim // heads) ** -0.5
+        
+        self.to_q = nn.Linear(query_dim, query_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, query_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, query_dim, bias=False)
+        self.to_out = nn.Linear(query_dim, query_dim)
+        
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, H, W] - image features (queries)
+            context: [B, N, D] - conditioning features (keys, values)
+        Returns:
+            [B, C, H, W] - attended features
+        """
+        B, C, H, W = x.shape
+        # Flatten spatial dimensions
+        x_flat = x.view(B, C, H * W).permute(0, 2, 1)  # [B, H*W, C]
+        
+        # Multi-head attention
+        q = self.to_q(x_flat)  # [B, H*W, C]
+        k = self.to_k(context)  # [B, N, C]
+        v = self.to_v(context)  # [B, N, C]
+        
+        # Reshape for multi-head
+        head_dim = C // self.heads
+        q = q.view(B, H * W, self.heads, head_dim).permute(0, 2, 1, 3)  # [B, heads, H*W, head_dim]
+        k = k.view(B, -1, self.heads, head_dim).permute(0, 2, 1, 3)  # [B, heads, N, head_dim]
+        v = v.view(B, -1, self.heads, head_dim).permute(0, 2, 1, 3)  # [B, heads, N, head_dim]
+        
+        # Attention scores
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, heads, H*W, N]
+        attn = F.softmax(attn, dim=-1)
+        
+        # Apply attention to values
+        out = torch.matmul(attn, v)  # [B, heads, H*W, head_dim]
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, H * W, C)  # [B, H*W, C]
+        out = self.to_out(out)
+        
+        # Reshape back to image
+        out = out.permute(0, 2, 1).view(B, C, H, W)
+        return out
+
+
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, cond_dim: int):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, use_cross_attn: bool = False):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.norm1 = nn.GroupNorm(8, out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act = nn.SiLU()
-        self.film = nn.Linear(cond_dim, out_channels * 2)
+        
+        # Time conditioning via FiLM
+        self.time_film = nn.Linear(time_dim, out_channels * 2)
+        
+        # Feature conditioning: FiLM or Cross-Attention
+        self.use_cross_attn = use_cross_attn
+        if use_cross_attn:
+            self.cross_attn = CrossAttention(out_channels, feature_dim, heads=8)
+            self.attn_norm = nn.GroupNorm(8, out_channels)
+        else:
+            # FiLM for single-vector features
+            self.feature_film = nn.Linear(feature_dim, out_channels * 2)
+        
         if in_channels != out_channels:
             self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
             self.residual = nn.Identity()
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, H, W]
+            time_emb: [B, time_dim]
+            feature_emb: [B, feature_dim] or [B, N, feature_dim]
+        """
         h = self.act(self.norm1(self.conv1(x)))
         h = self.norm2(self.conv2(h))
-        film = self.film(cond).unsqueeze(-1).unsqueeze(-1)
-        scale, shift = film.chunk(2, dim=1)
-        h = h * (1 + scale) + shift
+        
+        # Apply time conditioning via FiLM
+        time_film = self.time_film(time_emb).unsqueeze(-1).unsqueeze(-1)
+        time_scale, time_shift = time_film.chunk(2, dim=1)
+        time_scale = torch.clamp(time_scale, -3.0, 3.0)
+        h = h * (1 + time_scale) + time_shift
+        
+        # Apply feature conditioning
+        if self.use_cross_attn:
+            # Cross-attention for sequence features [B, N, D]
+            h = h + self.cross_attn(self.attn_norm(h), feature_emb)
+        else:
+            # FiLM for single-vector features [B, D]
+            feature_film = self.feature_film(feature_emb).unsqueeze(-1).unsqueeze(-1)
+            feature_scale, feature_shift = feature_film.chunk(2, dim=1)
+            feature_scale = torch.clamp(feature_scale, -5.0, 5.0)
+            h = h * (1 + feature_scale) + feature_shift
+        
         return self.act(h + self.residual(x))
 
 
@@ -113,56 +201,74 @@ class AttentionBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, cond_dim: int, attn: bool):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool, use_cross_attn: bool = False):
         super().__init__()
-        self.res = ResidualBlock(in_channels, out_channels, cond_dim)
+        self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim, use_cross_attn=use_cross_attn)
         self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
         self.downsample = nn.AvgPool2d(2)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor):
-        h = self.res(x, cond)
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor):
+        h = self.res(x, time_emb, feature_emb)
         if self.attn is not None:
             h = self.attn(h)
         return self.downsample(h), h
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, cond_dim: int, attn: bool):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool, use_cross_attn: bool = False):
         super().__init__()
-        self.res = ResidualBlock(in_channels, out_channels, cond_dim)
+        self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim, use_cross_attn=use_cross_attn)
         self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor, cond: torch.Tensor):
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor):
         if x.shape[-2:] != skip.shape[-2:]:
             x = self.upsample(x)
         h = torch.cat([x, skip], dim=1)
-        h = self.res(h, cond)
+        h = self.res(h, time_emb, feature_emb)
         if self.attn is not None:
             h = self.attn(h)
         return h
 
 
 class ImprovedUNet(nn.Module):
-    def __init__(self, in_channels: int, base_channels: int, cond_dim: int):
+    def __init__(self, in_channels: int, base_channels: int, time_dim: int, feature_dim: int, use_cross_attn: bool = False):
         super().__init__()
-        self.inc = ResidualBlock(in_channels, base_channels, cond_dim)
-        self.down1 = DownBlock(base_channels, base_channels * 2, cond_dim, attn=False)
-        self.down2 = DownBlock(base_channels * 2, base_channels * 4, cond_dim, attn=True)
-        self.mid = ResidualBlock(base_channels * 4, base_channels * 4, cond_dim)
-        self.up3 = UpBlock(base_channels * 8, base_channels * 2, cond_dim, attn=True)
-        self.up2 = UpBlock(base_channels * 4, base_channels, cond_dim, attn=False)
-        self.up1 = UpBlock(base_channels * 2, base_channels, cond_dim, attn=False)
+        self.time_dim = time_dim
+        self.feature_dim = feature_dim
+        self.use_cross_attn = use_cross_attn
+        
+        # Initial conv
+        self.inc = ResidualBlock(in_channels, base_channels, time_dim, feature_dim, use_cross_attn=use_cross_attn)
+        
+        # Downsampling with cross-attention in deeper layers
+        self.down1 = DownBlock(base_channels, base_channels * 2, time_dim, feature_dim, attn=False, use_cross_attn=use_cross_attn)
+        self.down2 = DownBlock(base_channels * 2, base_channels * 4, time_dim, feature_dim, attn=True, use_cross_attn=use_cross_attn)
+        
+        # Middle with cross-attention
+        self.mid = ResidualBlock(base_channels * 4, base_channels * 4, time_dim, feature_dim, use_cross_attn=use_cross_attn)
+        
+        # Upsampling with cross-attention in deeper layers
+        self.up3 = UpBlock(base_channels * 8, base_channels * 2, time_dim, feature_dim, attn=True, use_cross_attn=use_cross_attn)
+        self.up2 = UpBlock(base_channels * 4, base_channels, time_dim, feature_dim, attn=False, use_cross_attn=use_cross_attn)
+        self.up1 = UpBlock(base_channels * 2, base_channels, time_dim, feature_dim, attn=False, use_cross_attn=use_cross_attn)
+        
         self.out_conv = nn.Conv2d(base_channels, in_channels, kernel_size=1)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        h1 = self.inc(x, cond)
-        d2, skip1 = self.down1(h1, cond)
-        d3, skip2 = self.down2(d2, cond)
-        middle = self.mid(d3, cond)
-        u3 = self.up3(middle, skip2, cond)
-        u2 = self.up2(u3, skip1, cond)
-        u1 = self.up1(u2, h1, cond)
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, H, W]
+            time_emb: [B, time_dim]
+            feature_emb: [B, feature_dim] or [B, N, feature_dim]
+        """
+        h1 = self.inc(x, time_emb, feature_emb)
+        d2, skip1 = self.down1(h1, time_emb, feature_emb)
+        d3, skip2 = self.down2(d2, time_emb, feature_emb)
+        middle = self.mid(d3, time_emb, feature_emb)
+        u3 = self.up3(middle, skip2, time_emb, feature_emb)
+        u2 = self.up2(u3, skip1, time_emb, feature_emb)
+        u1 = self.up1(u2, h1, time_emb, feature_emb)
         return self.out_conv(u1)
 
 
@@ -201,13 +307,63 @@ class GaussianDiffusion(nn.Module):
         x_start: torch.Tensor,
         features: torch.Tensor,
         initial_image: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        cfg_dropout: float = 0.1,  # Classifier-free guidance dropout
+        use_x0_loss: bool = True,  # Add direct x0 prediction loss
+        x0_loss_weight: float = 0.1,  # Weight for x0 loss
+        feature_consistency_weight: float = 0.0,  # Feature consistency loss
+    ) -> dict:
+        """
+        Returns dict with 'loss' and optional 'metrics' for logging
+        """
         batch_size = x_start.size(0)
         t = torch.randint(0, self.timesteps, (batch_size,), device=x_start.device)
         noise = torch.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise)
+        
+        # Classifier-free guidance: randomly drop conditioning
+        # This forces the model to learn both conditional and unconditional denoising
+        if cfg_dropout > 0 and self.training:
+            mask = torch.rand(batch_size, device=features.device) > cfg_dropout
+            # Expand mask to match feature dimensions: [B] -> [B, 1, ...] 
+            while len(mask.shape) < len(features.shape):
+                mask = mask.unsqueeze(-1)
+            mask = mask.float()
+            features = features * mask  # Zero out features for some samples
+        
         pred_noise = model(x_t, t, features)
-        return F.mse_loss(pred_noise, noise)
+        
+        # Primary loss: noise prediction
+        noise_loss = F.mse_loss(pred_noise, noise)
+        total_loss = noise_loss
+        metrics = {'noise_loss': noise_loss.item()}
+        
+        # Auxiliary loss: predict x0 directly and compare to target
+        if use_x0_loss:
+            # Predict x0 from noisy image and predicted noise
+            alpha_bar_t = self._extract(self.alphas_cumprod, t, x_t.shape)
+            sqrt_alpha_bar_t = torch.sqrt(torch.clamp(alpha_bar_t, min=1e-8))
+            sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
+            
+            pred_x0 = (x_t - sqrt_one_minus_alpha_bar_t * pred_noise) / sqrt_alpha_bar_t
+            
+            # Direct comparison to target - this guides content generation!
+            x0_loss = F.mse_loss(pred_x0, x_start)
+            metrics['x0_loss'] = x0_loss.item()
+            total_loss = total_loss + x0_loss_weight * x0_loss
+            
+            # Feature consistency: predicted x0 should have similar visual characteristics
+            # Use simple perceptual consistency via normalized L1 in pixel space
+            if feature_consistency_weight > 0:
+                # Normalize to [0, 1] range for perceptual comparison
+                pred_x0_norm = torch.clamp((pred_x0 + 1) / 2, 0, 1)
+                x_start_norm = torch.clamp((x_start + 1) / 2, 0, 1)
+                
+                # Perceptual loss: L1 distance is more aligned with human perception than L2
+                perceptual_loss = F.l1_loss(pred_x0_norm, x_start_norm)
+                metrics['perceptual_loss'] = perceptual_loss.item()
+                total_loss = total_loss + feature_consistency_weight * perceptual_loss
+        
+        return {'loss': total_loss, 'metrics': metrics}
 
     def sample(
         self,
@@ -241,6 +397,15 @@ class GaussianDiffusion(nn.Module):
             # Predict noise
             epsilon = model(img, t, features)
             
+            # Check for NaNs/Infs immediately after prediction
+            if torch.isnan(epsilon).any() or torch.isinf(epsilon).any():
+                print(f"[WARNING] NaN/Inf detected in epsilon at timestep {timestep}")
+                epsilon = torch.nan_to_num(epsilon, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            if torch.isnan(img).any() or torch.isinf(img).any():
+                print(f"[WARNING] NaN/Inf detected in img at timestep {timestep}")
+                img = torch.nan_to_num(img, nan=0.0, posinf=1.0, neginf=-1.0)
+            
             # Get alpha values
             alpha_bar_t = self._extract(self.alphas_cumprod, t, img.shape)
             
@@ -253,15 +418,23 @@ class GaussianDiffusion(nn.Module):
                 alpha_bar_prev = torch.ones_like(alpha_bar_t)
             
             # Predict x0 (the clean image) using DDIM formula
-            pred_x0 = (img - torch.sqrt(1 - alpha_bar_t) * epsilon) / torch.sqrt(alpha_bar_t)
-            pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
+            sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+            sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
+            
+            # Clamp to prevent numerical instability
+            sqrt_alpha_bar_t = torch.clamp(sqrt_alpha_bar_t, min=1e-8)
+            
+            pred_x0 = (img - sqrt_one_minus_alpha_bar_t * epsilon) / sqrt_alpha_bar_t
+            # Don't clamp pred_x0 here - it destroys information during iterative denoising!
             
             # DDIM direction term
             variance = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)
-            dir_xt = torch.sqrt(1.0 - alpha_bar_prev - eta**2 * variance) * epsilon
+            sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
+            sqrt_one_minus_alpha_bar_prev_minus_var = torch.sqrt(torch.clamp(1.0 - alpha_bar_prev - eta**2 * variance, min=0))
+            dir_xt = sqrt_one_minus_alpha_bar_prev_minus_var * epsilon
             
             # Compute x_{t-1}
-            x_prev = torch.sqrt(alpha_bar_prev) * pred_x0 + dir_xt
+            x_prev = sqrt_alpha_bar_prev * pred_x0 + dir_xt
             
             # Add stochastic noise (controlled by eta)
             if eta > 0 and step_idx < len(timestep_schedule) - 1:
@@ -286,14 +459,30 @@ class StableDiffusionConditioned(nn.Module):
         self,
         input_dim: int,
         cond_dim: Optional[int] = None,
+        use_cross_attn: bool = False,  # Enable cross-attention for sequence features
     ):
         super().__init__()
         if cond_dim is None:
             cond_dim = cfg.SD_EMB_DIM * 2
         
-        self.feature_projection = FeatureProjector(input_dim, cond_dim)
-        self.time_embedding = TimeEmbedding(cond_dim)
-        self.unet = ImprovedUNet(cfg.CHANNELS, base_channels=cfg.SD_BASE_CHANNELS, cond_dim=cond_dim)
+        time_dim = cond_dim
+        feature_dim = cond_dim
+        self.use_cross_attn = use_cross_attn
+        
+        self.feature_projection = FeatureProjector(input_dim, feature_dim)
+        self.time_embedding = TimeEmbedding(time_dim)
+        self.unet = ImprovedUNet(
+            cfg.CHANNELS, 
+            base_channels=cfg.SD_BASE_CHANNELS, 
+            time_dim=time_dim, 
+            feature_dim=feature_dim,
+            use_cross_attn=use_cross_attn
+        )
+        
+        # Learnable scales for conditioning
+        # Feature scale MUST be stronger - features determine content!
+        self.time_scale = nn.Parameter(torch.tensor(1.0))
+        self.feature_scale = nn.Parameter(torch.tensor(3.0))  # Dominant over time
 
     def forward(
         self,
@@ -301,10 +490,21 @@ class StableDiffusionConditioned(nn.Module):
         timesteps: torch.Tensor,
         features: torch.Tensor,
     ) -> torch.Tensor:
-        time_emb = self.time_embedding(timesteps)
-        feature_emb = self.feature_projection(features)
-        cond = time_emb + feature_emb
-        return self.unet(noisy_image, cond)
+        """
+        Args:
+            noisy_image: [B, C, H, W]
+            timesteps: [B]
+            features: [B, input_dim] or [B, N, input_dim] for sequence features
+        Returns:
+            predicted noise: [B, C, H, W]
+        """
+        time_emb = self.time_embedding(timesteps) * self.time_scale
+        
+        # Project features: handles both [B, D] and [B, N, D]
+        feature_emb = self.feature_projection(features) * self.feature_scale
+        
+        # Pass to UNet - it will handle both single-vector and sequence features
+        return self.unet(noisy_image, time_emb, feature_emb)
 
 
 class StableDiffusionPipeline:

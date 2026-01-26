@@ -94,7 +94,29 @@ class CustomDataset(Dataset):
         return len(self.input_data)
 
     def __getitem__(self, idx):
-        input_feat = torch.tensor(self.input_data[idx])
+        input_feat = torch.tensor(self.input_data[idx])  # [D]
+        
+        # Optionally expand to sequence [N, D] for cross-attention
+        seq_len = getattr(cfg, 'FEATURE_SEQUENCE_LENGTH', 0)
+        if seq_len > 0:
+            # Strategy 1: Repeat each feature as a token
+            # Creates [N, D] where each feature dimension becomes a separate token
+            D = input_feat.shape[0]
+            if seq_len == D:
+                # Each feature becomes a token: [D] -> [D, 1] -> [D, D] (one-hot-like)
+                input_feat_seq = torch.zeros(D, D)
+                for i in range(D):
+                    input_feat_seq[i, i] = input_feat[i]
+                    # Add global context to each token
+                    input_feat_seq[i] = input_feat_seq[i] + input_feat * 0.1
+                input_feat = input_feat_seq
+            else:
+                # Strategy 2: Create N tokens, each containing all D features with positional info
+                # [D] -> [N, D+1] where +1 is position encoding
+                input_feat_seq = input_feat.unsqueeze(0).repeat(seq_len, 1)  # [N, D]
+                # Add positional encoding
+                positions = torch.linspace(0, 1, seq_len).unsqueeze(1)  # [N, 1]
+                input_feat = torch.cat([input_feat_seq, positions], dim=1)  # [N, D+1]
 
         initial_path = os.path.join(self.initial_dir, self.initial_paths[idx])
         target_path = os.path.join(self.target_dir, self.target_paths[idx])

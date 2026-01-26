@@ -20,6 +20,7 @@ FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_ra
 FEATURE_NORMALIZATION = True
 FEATURE_MINS = [5.6,15,0,16.87,-1.91,-16.75,1,1,1000]
 FEATURE_MAXS = [30,42,95,40,1.62,-0.5,4,7,7000]
+FEATURE_SEQUENCE_LENGTH = 16  # 0 = single vector [D], >0 = sequence [N, D] for cross-attention
 INITIAL_IMAGE = False
 ENCODER_PATH = "checkpoints/encoder_epoch_50.pth"
 FREEZE_ENCODER = True
@@ -44,21 +45,24 @@ VAE_LR = 0.0001          # Conservative learning rate
 VAE_KL_WEIGHT = 0.00001  # Small KL weight to avoid posterior collapse
 
 # Stable diffusion defaults
-SD_LR = 0.0002           # Increased back for better learning
-SD_TIMESTEPS = 500
-SD_SAMPLE_STEPS = 50     # Reduced for faster validation (was 500)
+SD_LR = 0.0001          # Much lower to prevent mode collapse
+SD_TIMESTEPS = 1000      # Full diffusion schedule  
+SD_SAMPLE_STEPS = 200    # Use 200 steps for faster generation
 SD_EMB_DIM = 256
-SD_VAL_STEPS = 1
+SD_VAL_STEPS = 50
 SD_SAMPLE_BATCH = 2
-SD_LOG_INTERVAL = 100    # Report every 100 batches (was 50)
+SD_LOG_INTERVAL = 100   
 SD_BASE_CHANNELS = 128
 SD_ATTENTION_HEADS = 2
 SD_ATTENTION_RESOLUTION = [32, 16]
 SD_EMA_DECAY = 0.9995
 SD_GRAD_CLIP = 1.0
+SD_DDP_TIMEOUT_MINUTES = 30  # Increase DDP timeout for slow validation
+SD_CFG_DROPOUT = 0.0  # DISABLED: Was teaching model to ignore features!
+SD_X0_LOSS_WEIGHT = 1.0  # Auxiliary loss: direct x0→target comparison (CRITICAL!)
+SD_PERCEPTUAL_WEIGHT = 0.5  # Perceptual L1 loss for better visual alignment
+SD_USE_CROSS_ATTN = True  # Enable cross-attention for sequence features [B, N, D]
 
-# Devices for training (indices as seen by the system)
-# Used by run_train.sh and DDP world size.
 DEVICE_IDS = [0, 1]
 WORLD_SIZE = len(DEVICE_IDS)
 
