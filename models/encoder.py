@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from decoder import VAE_ResidualBlock, VAE_AttentionBlock
+from models.decoder import VAE_ResidualBlock, VAE_AttentionBlock
 
 
 class VAE_Encoder(nn.Sequential):

@@ -10,10 +10,16 @@ RETRAIN=${2:-0}
 CHECKPOINT=${3:-""}
 
 echo "Training VAE for $EPOCHS epochs..."
+
+if [ -d ".venv" ]; then
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+fi
+
 if [ $RETRAIN -eq 1 ]; then
     echo "Resuming from checkpoint: $CHECKPOINT"
-    python vae_trainer.py --epochs $EPOCHS --retrain $RETRAIN --checkpoint $CHECKPOINT
+    python3 vae_trainer.py --epochs $EPOCHS --retrain $RETRAIN --checkpoint $CHECKPOINT
 else
     echo "Starting fresh training"
-    python vae_trainer.py --epochs $EPOCHS --retrain $RETRAIN
+    python3 vae_trainer.py --epochs $EPOCHS --retrain $RETRAIN
 fi

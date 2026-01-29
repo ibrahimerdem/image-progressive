@@ -10,17 +10,18 @@ import torch.nn.functional as F
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torchvision.utils import save_image
 
 import config as cfg
 from torch.amp import autocast, GradScaler
 
 from utils.dataset import create_dataloaders
+from utils.training import calculate_psnr, calculate_ssim, load_clip_model, compute_clip_metrics_batch
 from models.feature_encoder import FeatureProjector
 from models.diffusion import Diffusion
 from models.encoder import VAE_Encoder
 from models.decoder import VAE_Decoder
 from models.ddpm import DDPMSampler
-
 
 def setup_ddp(rank: int, world_size: int) -> None:
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -58,20 +59,27 @@ def train_worker(rank: int, world_size: int, args) -> None:
     # Create VAE encoder for encoding target images to latent space (frozen)
     vae_encoder = VAE_Encoder().to(device)
     
-    # Load pretrained VAE encoder
+    # Create VAE decoder for generating images from latents (frozen)
+    vae_decoder = VAE_Decoder().to(device)
+    
+    # Load pretrained VAE encoder and decoder
     if cfg.SD_INITIAL_ENCODER_CKPT and os.path.exists(cfg.SD_INITIAL_ENCODER_CKPT):
         if rank == 0:
             print(f"Loading pretrained VAE encoder from {cfg.SD_INITIAL_ENCODER_CKPT}...")
         vae_checkpoint = torch.load(cfg.SD_INITIAL_ENCODER_CKPT, map_location=device)
         vae_encoder.load_state_dict(vae_checkpoint['encoder'])
+        vae_decoder.load_state_dict(vae_checkpoint['decoder'])
     else:
         if rank == 0:
             print("WARNING: No pretrained VAE encoder found. Train VAE first using vae_trainer.py")
     
-    # Freeze VAE encoder
+    # Freeze VAE encoder and decoder
     for param in vae_encoder.parameters():
         param.requires_grad = False
+    for param in vae_decoder.parameters():
+        param.requires_grad = False
     vae_encoder.eval()
+    vae_decoder.eval()
     
     # Create diffusion model (UNet)
     diffusion = Diffusion().to(device)
@@ -140,7 +148,12 @@ def train_worker(rank: int, world_size: int, args) -> None:
                 encoded_features = feature_encoder(input_feat)
                 
                 # 2. Reshape to sequence format for cross-attention [B, 1, D]
-                context = encoded_features.unsqueeze(1)  # [B, 1, SD_EMB_DIM]
+                if len(encoded_features.shape) == 2:
+                    context = encoded_features.unsqueeze(1)
+                elif len(encoded_features.shape) == 3:
+                    context = encoded_features[:, :1, :]
+                else:
+                    context = encoded_features.reshape(batch_size, 1, -1)
                 
                 # 3. Encode target image to latent space using VAE encoder (frozen)
                 # target_img: [B, 3, H, W] -> latents: [B, 4, H/8, W/8]
@@ -159,7 +172,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
                 
                 # 6. Predict the noise using diffusion model
                 # Get time embeddings
-                time_embeddings = torch.stack([get_time_embedding(t.item()) for t in timesteps]).to(device)
+                time_embeddings = torch.stack([get_time_embedding(t.item())[0] for t in timesteps]).to(device)
                 
                 # Forward through diffusion model
                 predicted_noise = diffusion(noisy_latents, context, time_embeddings)
@@ -170,7 +183,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
                 # 8. Optional: Add x0 prediction loss for better quality
                 if cfg.SD_X0_LOSS_WEIGHT > 0:
                     # Predict x0 from noise prediction
-                    alpha_t = noise_scheduler.alphas_cumprod[timesteps].to(device)
+                    alpha_t = noise_scheduler.alphas_cumprod[timesteps.cpu()].to(device)
                     alpha_t = alpha_t.view(-1, 1, 1, 1)
                     sqrt_alpha_t = torch.sqrt(alpha_t)
                     sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
@@ -178,15 +191,30 @@ def train_worker(rank: int, world_size: int, args) -> None:
                     pred_x0 = (noisy_latents - sqrt_one_minus_alpha_t * predicted_noise) / sqrt_alpha_t
                     x0_loss = F.mse_loss(pred_x0, latents)
                     loss = loss + cfg.SD_X0_LOSS_WEIGHT * x0_loss
+                
+                # Check for NaN/Inf
+                if torch.isnan(loss) or torch.isinf(loss):
+                    if rank == 0:
+                        print(f"Warning: NaN/Inf loss detected at batch {batch_idx}, skipping...")
+                    optimizer.zero_grad()
+                    continue
             
             scaler.scale(loss).backward()
             
             # Gradient clipping
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 list(feature_encoder.parameters()) + list(diffusion.parameters()),
-                cfg.SD_GRAD_CLIPvae_encoder.parameters()) + list(
+                cfg.SD_GRAD_CLIP
             )
+            
+            # Check for NaN gradients
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                if rank == 0:
+                    print(f"Warning: NaN/Inf gradients detected at batch {batch_idx}, skipping...")
+                optimizer.zero_grad()
+                scaler.update()
+                continue
             
             scaler.step(optimizer)
             scaler.update()
@@ -202,15 +230,27 @@ def train_worker(rank: int, world_size: int, args) -> None:
             avg_loss = epoch_loss / num_batches
             print(f"Epoch [{epoch+1}/{args.epochs}] completed. Average Loss: {avg_loss:.4f}")
         
-        # Validation
+        # Validation and metrics calculation
         if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
             print(f"Running validation at epoch {epoch+1}...")
             feature_encoder.eval()
             diffusion.eval()
-            # vae_encoder already in eval mode (frozen)
             
             val_loss = 0.0
             val_batches = 0
+            sample_batch = None
+            
+            # Load CLIP model for similarity metrics
+            clip_model, clip_preprocess = load_clip_model(device)
+            
+            # Metrics accumulators
+            all_psnr = []
+            all_ssim = []
+            clip_sum = 0.0
+            clip_count = 0
+            
+            # Clear GPU cache before generation
+            torch.cuda.empty_cache()
             
             with torch.no_grad():
                 for batch_idx, (initial_img, input_feat, target_img, _) in enumerate(val_loader):
@@ -224,29 +264,93 @@ def train_worker(rank: int, world_size: int, args) -> None:
                     encoded_features = feature_encoder(input_feat)
                     context = encoded_features.unsqueeze(1)
                     
-                    # Encode target to latents
+                    # Encode target to latents for loss calculation
                     noise = torch.randn(batch_size, 4, cfg.TARGET_HEIGHT // 8, cfg.TARGET_WIDTH // 8, device=device)
                     latents = vae_encoder(target_img, noise) * 0.18215
                     
                     # Sample timesteps and add noise
                     timesteps = torch.randint(0, cfg.SD_TIMESTEPS, (batch_size,), device=device).long()
-                    noise = torch.randn_like(latents, device=device)
+                    noise_sample = torch.randn_like(latents, device=device)
                     noisy_latents = noise_scheduler.add_noise(latents, timesteps)
                     
-                    # Predict noise
-                    time_embeddings = torch.stack([get_time_embedding(t.item()) for t in timesteps]).to(device)
+                    # Predict noise for validation loss
+                    time_embeddings = torch.stack([get_time_embedding(t.item())[0] for t in timesteps]).to(device)
                     predicted_noise = diffusion(noisy_latents, context, time_embeddings)
                     
                     # Compute loss
-                    loss = F.mse_loss(predicted_noise, noise)
+                    loss = F.mse_loss(predicted_noise, noise_sample)
                     val_loss += loss.item()
                     val_batches += 1
                     
+                    # Generate images for metrics (full denoising)
+                    gen_latents = torch.randn(batch_size, 4, cfg.TARGET_HEIGHT // 8, cfg.TARGET_WIDTH // 8, device=device)
+                    sampler = DDPMSampler(generator=torch.Generator(device=device))
+                    sampler.set_inference_timesteps(cfg.SD_SAMPLE_STEPS)
+                    
+                    for i, timestep in enumerate(sampler.timesteps):
+                        timestep_tensor = torch.tensor([timestep], device=device).long().repeat(batch_size)
+                        time_emb = torch.stack([get_time_embedding(t.item())[0] for t in timestep_tensor]).to(device)
+                        model_output = diffusion.module(gen_latents, context, time_emb)
+                        gen_latents = sampler.step(timestep, gen_latents, model_output)
+                    
+                    # Decode latents to images
+                    gen_latents = gen_latents / 0.18215
+                    generated_img = vae_decoder(gen_latents)
+                    
+                    # Calculate metrics (images in [-1, 1] range)
+                    psnr_val = calculate_psnr(generated_img, target_img)
+                    ssim_val = calculate_ssim(generated_img, target_img)
+                    clip_sim, clip_batch = compute_clip_metrics_batch(generated_img, target_img, clip_model, clip_preprocess, device)
+                    
+                    all_psnr.append(psnr_val)
+                    all_ssim.append(ssim_val)
+                    clip_sum += clip_sim
+                    clip_count += clip_batch
+                    
+                    # Save first batch for visualization
+                    if batch_idx == 0:
+                        sample_batch = (initial_img, generated_img, target_img)
+                    
                     if batch_idx >= cfg.SD_VAL_STEPS:
                         break
+                    
+                    # Clear cache periodically
+                    if batch_idx % 5 == 0:
+                        torch.cuda.empty_cache()
             
+            # Calculate average metrics
             avg_val_loss = val_loss / val_batches
-            print(f"Validation Loss at epoch {epoch+1}: {avg_val_loss:.4f}")
+            avg_psnr = sum(all_psnr) / len(all_psnr)
+            avg_ssim = sum(all_ssim) / len(all_ssim)
+            avg_clip = clip_sum / clip_count if clip_count > 0 else 0.0
+            
+            print(f"Validation at epoch {epoch+1}:")
+            print(f"  Loss: {avg_val_loss:.4f}")
+            print(f"  PSNR: {avg_psnr:.2f}")
+            print(f"  SSIM: {avg_ssim:.4f}")
+            print(f"  CLIP Score: {avg_clip:.4f}")
+            
+            # Save sample images as triplets: initial-generated-target
+            if sample_batch is not None:
+                initial_img, generated_img, target_img = sample_batch
+                
+                # Normalize to [0, 1] for saving
+                initial_img = (initial_img + 1) / 2
+                generated_img = (generated_img + 1) / 2
+                target_img = (target_img + 1) / 2
+                
+                # Resize initial image to match target resolution for visualization
+                initial_img = F.interpolate(initial_img, size=(cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH), mode='bilinear', align_corners=False)
+                
+                # Create output directory
+                sample_dir = os.path.join("checkpoints", "sd", "samples", f"epoch_{epoch+1}")
+                os.makedirs(sample_dir, exist_ok=True)
+                
+                # Save as triplet grid: [initial, generated, target] for each sample
+                triplet = torch.cat([initial_img, generated_img, target_img], dim=0)
+                save_image(triplet, os.path.join(sample_dir, "triplets.png"), nrow=batch_size, padding=2)
+                
+                print(f"Sample triplets saved to {sample_dir}")
         
         # Save checkpoint
         if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:

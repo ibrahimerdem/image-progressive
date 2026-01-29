@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from attention import SelfAttention, CrossAttention
+from models.attention import SelfAttention, CrossAttention
 import config as cfg
 
 
