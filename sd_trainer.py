@@ -14,277 +14,74 @@ from torch.utils.data.distributed import DistributedSampler
 import config as cfg
 from torch.amp import autocast, GradScaler
 
-from models.stable_diffusion import (
-    GaussianDiffusion,
-    ModelEMA,
-    StableDiffusionConditioned,
-    StableDiffusionPipeline,
-)
 from utils.dataset import create_dataloaders
-from utils.training import (
-    MetricsLogger,
-    calculate_psnr,
-    calculate_ssim,
-    compute_clip_metrics_batch,
-    load_clip_model,
-    save_random_sample_pairs,
-    save_diffusion_intermediates,
-)
+from models.feature_encoder import FeatureProjector
+from models.diffusion import Diffusion
+from models.encoder import VAE_Encoder
+from models.decoder import VAE_Decoder
+from models.ddpm import DDPMSampler
 
 
-def _measure_denoising_quality(
-    model: nn.Module,
-    diffusion: GaussianDiffusion,
-    features: torch.Tensor,
-    targets: torch.Tensor,
-    device: torch.device,
-    timesteps_to_test: list = [100, 200, 400, 600, 800],
-):
-    """
-    Measure model's denoising ability at different noise levels.
-    Returns MSE loss for each tested timestep + prediction statistics.
+def setup_ddp(rank: int, world_size: int) -> None:
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=torch.distributed.timedelta(minutes=cfg.SD_DDP_TIMEOUT_MINUTES))
+    torch.cuda.set_device(rank)
+
+
+def cleanup_ddp() -> None:
+    dist.destroy_process_group()
+
+
+def get_time_embedding(timestep):
+    # Shape: (320,)
+    freqs = torch.pow(10000, -torch.arange(start=0, end=160, dtype=torch.float32) / 160) 
+    # Shape: (1, 160)
+    x = torch.tensor([timestep], dtype=torch.float32)[:, None] * freqs[None]
+    # Shape: (1, 160 * 2)
+    return torch.cat([torch.cos(x), torch.sin(x)], dim=-1)
+
+
+def train_worker(rank: int, world_size: int, args) -> None:
+    setup_ddp(rank, world_size)
+    device = torch.device(f"cuda:{rank}")
     
-    Lower loss = better denoising at that noise level
-    < 0.05: Model denoises well at this timestep
-    0.05-0.1: Model is learning
-    > 0.1: Model struggles at this noise level
+    if rank == 0:
+        print(f"Initializing models on rank {rank}...")
     
-    Also returns prediction variance to detect mode collapse.
-    Healthy model: variance > 0.5
-    Collapsed model: variance < 0.1 (predicting near-constant values)
-    """
-    model.eval()
-    losses_by_timestep = {}
-    prediction_stats = {}
+    # Create feature encoder - projects input features to embedding space
+    input_dim = len(cfg.FEATURE_COLUMNS)
+    output_dim = cfg.SD_EMB_DIM
+    feature_encoder = FeatureProjector(input_dim, output_dim).to(device)
+    feature_encoder = DDP(feature_encoder, device_ids=[rank])
     
-    with torch.no_grad():
-        for t_val in timesteps_to_test:
-            t = torch.full((targets.size(0),), t_val, dtype=torch.long, device=device)
-            noise = torch.randn_like(targets)
-            
-            # Add noise at this timestep
-            noisy = diffusion.q_sample(targets, t, noise)
-            
-            # Predict noise
-            pred_noise = model(noisy, t, features)
-            
-            # Calculate MSE
-            mse = F.mse_loss(pred_noise, noise).item()
-            losses_by_timestep[t_val] = mse
-            
-            # Calculate prediction statistics to detect collapse
-            pred_std = pred_noise.std().item()
-            pred_mean = pred_noise.mean().item()
-            prediction_stats[t_val] = {
-                'std': pred_std,
-                'mean': pred_mean
-            }
+    # Create VAE encoder for encoding target images to latent space (frozen)
+    vae_encoder = VAE_Encoder().to(device)
     
-    return losses_by_timestep, prediction_stats
-
-
-
-def _setup_ddp(rank: int, world_size: int) -> torch.device:
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29500")
+    # Load pretrained VAE encoder
+    if cfg.SD_INITIAL_ENCODER_CKPT and os.path.exists(cfg.SD_INITIAL_ENCODER_CKPT):
+        if rank == 0:
+            print(f"Loading pretrained VAE encoder from {cfg.SD_INITIAL_ENCODER_CKPT}...")
+        vae_checkpoint = torch.load(cfg.SD_INITIAL_ENCODER_CKPT, map_location=device)
+        vae_encoder.load_state_dict(vae_checkpoint['encoder'])
+    else:
+        if rank == 0:
+            print("WARNING: No pretrained VAE encoder found. Train VAE first using vae_trainer.py")
     
-    # Set DDP timeout for slow validation
-    timeout_minutes = getattr(cfg, "SD_DDP_TIMEOUT_MINUTES", 10)
-    timeout = torch.distributed.timedelta(minutes=timeout_minutes)
+    # Freeze VAE encoder
+    for param in vae_encoder.parameters():
+        param.requires_grad = False
+    vae_encoder.eval()
     
-    dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timeout)
-    device_id = cfg.DEVICE_IDS[rank]
-    torch.cuda.set_device(device_id)
-    return torch.device(f"cuda:{device_id}")
-
-
-def _cleanup_ddp() -> None:
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, save_dir: str, version: str, ema_model=None) -> str:
-    checkpoint = {
-        "epoch": epoch,
-        "model_state_dict": model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-    }
+    # Create diffusion model (UNet)
+    diffusion = Diffusion().to(device)
+    diffusion = DDP(diffusion, device_ids=[rank])
     
-    # Save EMA model if provided
-    if ema_model is not None:
-        checkpoint["ema_state_dict"] = ema_model.state_dict()
+    # Create DDPM noise scheduler
+    generator = torch.Generator(device=device)
+    noise_scheduler = DDPMSampler(generator, num_training_steps=cfg.SD_TIMESTEPS)
     
-    filename = os.path.join(save_dir, f"sd_{version}_epoch_{epoch:04d}.pth")
-    torch.save(checkpoint, filename)
-    return filename
-
-
-def _load_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, checkpoint_path: str) -> int:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    target = model.module if isinstance(model, DDP) else model
-    target.load_state_dict(checkpoint["model_state_dict"])
-    if optimizer is not None and "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return checkpoint.get("epoch", 0)
-
-
-def _run_validation(
-    model: nn.Module,
-    pipeline: StableDiffusionPipeline,
-    diffusion: GaussianDiffusion,
-    val_loader,
-    train_loader,  # Added: to sample from training set
-    device: torch.device,
-    clip_model,
-    clip_preprocess,
-    sample_dir: str,
-    epoch: int,
-    rank: int = 0,
-    max_batches: int = 10,  # Limit validation to first 10 batches
-):
-    if val_loader is None or clip_model is None or clip_preprocess is None:
-        return None
-
-    if hasattr(val_loader, "sampler") and isinstance(val_loader.sampler, DistributedSampler):
-        val_loader.sampler.set_epoch(epoch)
-
-    model.eval()
-    diffusion.eval()
-    l1_loss_fn = nn.L1Loss(reduction="mean")
-
-    total_l1 = 0.0
-    total_psnr = 0.0
-    total_ssim = 0.0
-    total_clip = 0.0
-    clip_count = 0
-    total_samples = 0
-
-    autocast_ctx = (lambda: autocast(device_type="cuda")) if device.type == "cuda" else (lambda: nullcontext())
-    
-    # Save intermediates at key epochs: 5, 10, 20, 50, 100
-    save_intermediates = epoch in [5, 10, 20, 50, 100]
-    
-    if epoch in [5, 10, 20, 50, 100]:
-        print(f"[SD] Epoch {epoch}: Saving intermediate diffusion steps + train sample")
-    
-    if epoch == 5:
-        print(f"[SD] Validation: FULL GENERATION from pure noise using {cfg.SD_SAMPLE_STEPS} sampling steps")
-
-    # FIRST: Generate from one training sample to verify reconstruction ability
-    if rank == 0 and train_loader is not None:
-        with torch.no_grad():
-            with autocast_ctx():
-                # Get one batch from training set
-                train_iter = iter(train_loader)
-                _, train_features, train_targets, _ = next(train_iter)
-                train_features = train_features.to(device)
-                train_targets = train_targets.to(device)
-                
-                # Generate from pure noise (full generation like inference)
-                train_samples = pipeline.sample(train_features, steps=cfg.SD_SAMPLE_STEPS, save_intermediates=False)
-                
-                # Save training set generation
-                save_random_sample_pairs(
-                    train_targets,
-                    train_samples,
-                    train_targets,
-                    sample_dir,
-                    epoch,
-                    prefix="sd_train",
-                    num_samples=min(train_targets.size(0), 4),  # Save first 4
-                )
-                
-                # Compute metrics for training sample
-                train_psnr = calculate_psnr(train_samples, train_targets)
-                train_ssim = calculate_ssim(train_samples, train_targets)
-                train_clip_sum, train_clip_bs = compute_clip_metrics_batch(
-                    train_samples, train_targets, clip_model, clip_preprocess, device
-                )
-                train_clip = train_clip_sum / train_clip_bs if train_clip_bs > 0 else 0.0
-                
-                print(f"[SD] Train Sample Gen: PSNR={train_psnr:.2f} dB, SSIM={train_ssim:.4f}, CLIP={train_clip:.4f}")
-
-    # VALIDATION SET: Generate from pure noise (exactly like generation script)
-    for idx, (_, features, target_images, _) in enumerate(val_loader):
-        if idx >= max_batches: 
-            break
-            
-        features = features.to(device)
-        targets = target_images.to(device)
-
-        with torch.no_grad():
-            with autocast_ctx():
-                val_steps = cfg.SD_SAMPLE_STEPS
-                
-                # Always generate from pure noise (full generation)
-                if idx == 0 and save_intermediates:
-                    result = pipeline.sample(features, steps=val_steps, save_intermediates=True)
-                    if isinstance(result, tuple):
-                        samples, intermediates = result
-                        save_diffusion_intermediates(intermediates, sample_dir, epoch, sample_idx=0)
-                        
-                        # Print timestep schedule for debugging (epoch 5 only)
-                        if epoch == 5:
-                            timesteps = [t for t, _ in intermediates]
-                            print(f"[SD] Full generation saved intermediates at timesteps: {timesteps}")
-                    else:
-                        samples = result
-                else:
-                    samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
-                
-        batch_size = targets.size(0)
-
-        total_samples += batch_size
-        total_l1 += l1_loss_fn(samples, targets).item() * batch_size
-        total_psnr += calculate_psnr(samples, targets) * batch_size
-        total_ssim += calculate_ssim(samples, targets) * batch_size
-
-        clip_sum, clip_bs = compute_clip_metrics_batch(samples, targets, clip_model, clip_preprocess, device)
-        total_clip += clip_sum
-        clip_count += clip_bs
-
-        # Save sample generated images with target pairs (only on rank 0)
-        if idx == 0 and rank == 0:
-            save_random_sample_pairs(
-                targets,
-                samples,
-                targets,
-                sample_dir,
-                epoch,
-                prefix="sd_val",
-                num_samples=batch_size,
-            )
-            
-            # Measure denoising quality at different timesteps (first batch only)
-            timestep_losses, pred_stats = _measure_denoising_quality(
-                model, diffusion, features, targets, device,
-                timesteps_to_test=[100, 200, 400, 600, 800]
-            )
-
-    if total_samples == 0:
-        return None
-
-    metrics = {
-        "val_l1": total_l1 / total_samples,
-        "val_psnr": total_psnr / total_samples,
-        "val_ssim": total_ssim / total_samples,
-        "val_clip": total_clip / max(clip_count, 1),
-    }
-    
-    # Add per-timestep losses and prediction stats
-    if timestep_losses:
-        for t, loss in timestep_losses.items():
-            metrics[f"val_loss_t{t}"] = loss
-        # Add prediction variance for collapse detection
-        avg_pred_std = sum(pred_stats[t]['std'] for t in pred_stats) / len(pred_stats)
-        metrics["pred_variance"] = avg_pred_std
-    
-    return metrics
-
-
-def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
-    device = _setup_ddp(rank, world_size)
-
+    # Create dataloaders
     train_loader, val_loader, _ = create_dataloaders(
         batch_size=cfg.BATCH_SIZE_PER_GPU,
         num_workers=cfg.NUM_WORKERS,
@@ -293,295 +90,180 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         rank=rank,
         world_size=world_size,
     )
-
-    # Feature dimension calculation
-    feature_dim = train_loader.dataset.input_data.shape[1]
-    seq_len = getattr(cfg, 'FEATURE_SEQUENCE_LENGTH', 0)
     
-    # If using sequences, adjust input_dim to account for positional encoding
-    if seq_len > 0 and seq_len != feature_dim:
-        # Strategy 2: [N, D+1] where +1 is position
-        feature_input_dim = feature_dim + 1
-    else:
-        # Strategy 1: [D, D] or no sequence [D]
-        feature_input_dim = feature_dim
-
-    use_cross_attn = getattr(cfg, "SD_USE_CROSS_ATTN", False)
-    base_model = StableDiffusionConditioned(
-        input_dim=feature_input_dim,
-        use_cross_attn=use_cross_attn,
+    # Optimizer - only feature_encoder and diffusion (VAE is frozen)
+    optimizer = torch.optim.AdamW(
+        list(feature_encoder.parameters()) + list(diffusion.parameters()),
+        lr=cfg.SD_LR
     )
-    if rank == 0:
-        mode_str = "Cross-Attention" if use_cross_attn else "FiLM"
-        seq_info = f" with {seq_len} tokens" if seq_len > 0 else ""
-        print(f"[SD] Using {mode_str} conditioning for features{seq_info}")
-        print(f"[SD] Feature input dimension: {feature_input_dim} (original: {feature_dim})")
-    diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
-
-    model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
-    pipeline = StableDiffusionPipeline(model.module, diffusion)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.SD_LR)
-    use_amp = device.type == "cuda"
-    scaler = GradScaler("cuda") if use_amp else None
-    amp_ctx = lambda: autocast(device_type="cuda") if use_amp else nullcontext()
-
-    ema_helper = ModelEMA(base_model, cfg.SD_EMA_DECAY)
-    ema_helper.to(device)
-    ema_pipeline = StableDiffusionPipeline(ema_helper.ema, diffusion) if rank == 0 else None
-
+    scaler = GradScaler('cuda')
+    
+    # Load checkpoint if resuming training
     start_epoch = 0
-    if retrain and checkpoint_path:
-        if os.path.exists(checkpoint_path):
-            start_epoch = _load_checkpoint(model, optimizer, checkpoint_path)
-            # Load EMA weights if available
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            if "ema_state_dict" in checkpoint:
-                ema_helper.ema.load_state_dict(checkpoint["ema_state_dict"])
-                if rank == 0:
-                    print(f"[SD] Loaded EMA weights from checkpoint")
-            if rank == 0:
-                print(f"[SD] Resumed from checkpoint {checkpoint_path} starting at epoch {start_epoch + 1}")
-        elif rank == 0:
-            print(f"[SD] Checkpoint {checkpoint_path} not found, starting from scratch")
-    elif retrain and not checkpoint_path:
-        # Auto-detect latest checkpoint
-        if os.path.exists(save_dir):
-            checkpoints = [f for f in os.listdir(save_dir) if f.startswith("sd_") and f.endswith(".pth")]
-            if checkpoints:
-                # Sort by epoch number
-                checkpoints.sort(key=lambda x: int(x.split("_")[-1].replace(".pth", "")))
-                latest_ckpt = os.path.join(save_dir, checkpoints[-1])
-                start_epoch = _load_checkpoint(model, optimizer, latest_ckpt)
-                # Load EMA weights if available
-                checkpoint = torch.load(latest_ckpt, map_location="cpu")
-                if "ema_state_dict" in checkpoint:
-                    ema_helper.ema.load_state_dict(checkpoint["ema_state_dict"])
-                    if rank == 0:
-                        print(f"[SD] Loaded EMA weights from checkpoint")
-                if rank == 0:
-                    print(f"[SD] Auto-resumed from {latest_ckpt} starting at epoch {start_epoch + 1}")
-            elif rank == 0:
-                print(f"[SD] No checkpoints found in {save_dir}, starting from scratch")
-        elif rank == 0:
-            print(f"[SD] No checkpoint directory found, starting from scratch")
-
-    save_dir = os.path.join("checkpoints", "sd")
-    log_dir = os.path.join(save_dir, "logs")
-    sample_dir = os.path.join(save_dir, "samples")
-
+    if args.retrain and args.checkpoint and os.path.exists(args.checkpoint):
+        if rank == 0:
+            print(f"Loading checkpoint from {args.checkpoint}...")
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        feature_encoder.module.load_state_dict(checkpoint['feature_encoder'])
+        diffusion.module.load_state_dict(checkpoint['diffusion'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = checkpoint['epoch'] + 1
+        if rank == 0:
+            print(f"Resumed from epoch {start_epoch}")
+    
     if rank == 0:
-        os.makedirs(save_dir, exist_ok=True)
-        os.makedirs(log_dir, exist_ok=True)
-        os.makedirs(sample_dir, exist_ok=True)
-
-    metrics_logger = MetricsLogger(log_dir, f"stable_diffusion_{version}_log.csv") if rank == 0 else None
-    clip_model = clip_preprocess = None
-    if rank == 0:
-        clip_model, clip_preprocess = load_clip_model(device)
-
-    for epoch in range(start_epoch + 1, start_epoch + epochs + 1):
-        if hasattr(train_loader, "sampler") and isinstance(train_loader.sampler, DistributedSampler):
-            train_loader.sampler.set_epoch(epoch)
-
-        epoch_loss = 0.0
-        steps = 0
-        model.train()
+        print("Starting training...")
+    
+    # Training loop
+    for epoch in range(start_epoch, args.epochs):
+        feature_encoder.train()
         diffusion.train()
-
-        start_time = time.time()
-        for batch_idx, (initial_images, features, target_images, _) in enumerate(train_loader):
-            features = features.to(device)
-            targets = target_images.to(device)
-
-            with amp_ctx():
-                cfg_dropout = getattr(cfg, "SD_CFG_DROPOUT", 0.1)
-                x0_loss_weight = getattr(cfg, "SD_X0_LOSS_WEIGHT", 0.0)
-                perceptual_weight = getattr(cfg, "SD_PERCEPTUAL_WEIGHT", 0.0)
-                
-                loss_dict = diffusion.p_loss(
-                    model, targets, features, 
-                    cfg_dropout=cfg_dropout,
-                    use_x0_loss=(x0_loss_weight > 0),
-                    x0_loss_weight=x0_loss_weight,
-                    feature_consistency_weight=perceptual_weight
-                )
-                loss = loss_dict['loss']
-                loss_metrics = loss_dict.get('metrics', {})
-
-            optimizer.zero_grad()
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                if cfg.SD_GRAD_CLIP and cfg.SD_GRAD_CLIP > 0:
-                    scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SD_GRAD_CLIP)
-                else:
-                    scaler.unscale_(optimizer)
-                    grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                if cfg.SD_GRAD_CLIP and cfg.SD_GRAD_CLIP > 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SD_GRAD_CLIP)
-                else:
-                    grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
-                optimizer.step()
-
-            ema_helper.update(model)
-            epoch_loss += loss.item()
-            steps += 1
-
-            if (batch_idx + 1) % cfg.SD_LOG_INTERVAL == 0 and rank == 0:
-                print(
-                    f"[SD] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
-                    f"Loss: {epoch_loss / steps:.4f} | Grad Norm: {grad_norm:.4f}"
-                )
-
-        loss_tensor = torch.tensor([epoch_loss, steps], device=device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        total_steps = max(int(loss_tensor[1].item()), 1)
-        avg_loss = (loss_tensor[0] / total_steps).item()
-
-        if rank == 0:
-            print(f"[SD] Rank {rank} finished all_reduce for epoch {epoch}")
+        vae_encoder.eval()  # VAE encoder is frozen
         
-        # Keep all ranks in sync before validation to avoid collective timeouts
-        if dist.is_initialized():
-            if rank == 0:
-                print(f"[SD] Rank {rank} entering first barrier before validation")
-            dist.barrier()
-            if rank == 0:
-                print(f"[SD] Rank {rank} passed first barrier")
-
-        val_metrics = None
-        should_validate = (
-            rank == 0
-            and val_loader is not None
-            and (cfg.VAL_EPOCH <= 1 or epoch % cfg.VAL_EPOCH == 0)
-        )
-        if should_validate:
-            print(f"[SD] Rank {rank} starting validation")
-            # Use EMA model for validation on rank 0, raw model on other ranks
-            val_model = ema_helper.ema if rank == 0 else model
-            val_pipeline = ema_pipeline if rank == 0 else pipeline
+        train_loader.sampler.set_epoch(epoch)
+        
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        for batch_idx, (initial_img, input_feat, target_img, _) in enumerate(train_loader):
+            initial_img = initial_img.to(device)
+            input_feat = input_feat.to(device)
+            target_img = target_img.to(device)
             
-            val_metrics = _run_validation(
-                val_model,
-                val_pipeline,
-                diffusion,
-                val_loader,
-                train_loader,  # Pass train_loader for training sample generation
-                device,
-                clip_model,
-                clip_preprocess,
-                sample_dir,
-                epoch,
-                rank,
+            batch_size = target_img.shape[0]
+            
+            optimizer.zero_grad()
+            
+            with autocast('cuda'):
+                # 1. Encode input features to conditioning embedding
+                # input_feat: [B, feature_dim] -> encoded_features: [B, SD_EMB_DIM]
+                encoded_features = feature_encoder(input_feat)
+                
+                # 2. Reshape to sequence format for cross-attention [B, 1, D]
+                context = encoded_features.unsqueeze(1)  # [B, 1, SD_EMB_DIM]
+                
+                # 3. Encode target image to latent space using VAE encoder (frozen)
+                # target_img: [B, 3, H, W] -> latents: [B, 4, H/8, W/8]
+                with torch.no_grad():
+                    noise = torch.randn(batch_size, 4, cfg.TARGET_HEIGHT // 8, cfg.TARGET_WIDTH // 8, device=device)
+                    latents = vae_encoder(target_img, noise)
+                    # Scale latents (standard SD practice)
+                    latents = latents * 0.18215
+                
+                # 4. Sample random timesteps for each image
+                timesteps = torch.randint(0, cfg.SD_TIMESTEPS, (batch_size,), device=device).long()
+                
+                # 5. Add noise to latents according to timesteps
+                noise = torch.randn_like(latents, device=device)
+                noisy_latents = noise_scheduler.add_noise(latents, timesteps)
+                
+                # 6. Predict the noise using diffusion model
+                # Get time embeddings
+                time_embeddings = torch.stack([get_time_embedding(t.item()) for t in timesteps]).to(device)
+                
+                # Forward through diffusion model
+                predicted_noise = diffusion(noisy_latents, context, time_embeddings)
+                
+                # 7. Compute loss (simple MSE between predicted and actual noise)
+                loss = F.mse_loss(predicted_noise, noise)
+                
+                # 8. Optional: Add x0 prediction loss for better quality
+                if cfg.SD_X0_LOSS_WEIGHT > 0:
+                    # Predict x0 from noise prediction
+                    alpha_t = noise_scheduler.alphas_cumprod[timesteps].to(device)
+                    alpha_t = alpha_t.view(-1, 1, 1, 1)
+                    sqrt_alpha_t = torch.sqrt(alpha_t)
+                    sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+                    
+                    pred_x0 = (noisy_latents - sqrt_one_minus_alpha_t * predicted_noise) / sqrt_alpha_t
+                    x0_loss = F.mse_loss(pred_x0, latents)
+                    loss = loss + cfg.SD_X0_LOSS_WEIGHT * x0_loss
+            
+            scaler.scale(loss).backward()
+            
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                list(feature_encoder.parameters()) + list(diffusion.parameters()),
+                cfg.SD_GRAD_CLIPvae_encoder.parameters()) + list(
             )
-            print(f"[SD] Rank {rank} finished validation")
-
-        # Keep all ranks in sync after validation before next epoch
-        if dist.is_initialized():
-            if rank == 0:
-                print(f"[SD] Rank {rank} entering second barrier after validation")
-            dist.barrier()
-            if rank == 0:
-                print(f"[SD] Rank {rank} passed second barrier")
-
+            
+            scaler.step(optimizer)
+            scaler.update()
+            
+            epoch_loss += loss.item()
+            num_batches += 1
+            
+            if rank == 0 and batch_idx % cfg.SD_LOG_INTERVAL == 0:
+                print(f"Epoch [{epoch+1}/{args.epochs}], Batch [{batch_idx}/{len(train_loader)}], Loss: {loss.item():.4f}")
+        
+        # Log epoch average
         if rank == 0:
-            elapsed = time.time() - start_time
-            if val_metrics:
-                # Print main metrics
-                print(
-                    f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | "
-                    f"Val L1: {val_metrics['val_l1']:.4f}, PSNR: {val_metrics['val_psnr']:.2f}, "
-                    f"SSIM: {val_metrics['val_ssim']:.4f}, CLIP: {val_metrics['val_clip']:.4f} | "
-                    f"Time: {elapsed:.2f}s"
-                )
-                
-                # Print per-timestep denoising losses
-                timestep_keys = [k for k in val_metrics.keys() if k.startswith('val_loss_t')]
-                if timestep_keys:
-                    print(f"[SD] Denoising quality by timestep:")
-                    for key in sorted(timestep_keys, key=lambda x: int(x.split('t')[1])):
-                        t = int(key.split('t')[1])
-                        loss = val_metrics[key]
-                        quality = "✓ Good" if loss < 0.05 else "⚠ Learning" if loss < 0.1 else "✗ Poor"
-                        print(f"     t={t:3d}: loss={loss:.4f} {quality}")
+            avg_loss = epoch_loss / num_batches
+            print(f"Epoch [{epoch+1}/{args.epochs}] completed. Average Loss: {avg_loss:.4f}")
+        
+        # Validation
+        if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
+            print(f"Running validation at epoch {epoch+1}...")
+            feature_encoder.eval()
+            diffusion.eval()
+            # vae_encoder already in eval mode (frozen)
+            
+            val_loss = 0.0
+            val_batches = 0
+            
+            with torch.no_grad():
+                for batch_idx, (initial_img, input_feat, target_img, _) in enumerate(val_loader):
+                    initial_img = initial_img.to(device)
+                    input_feat = input_feat.to(device)
+                    target_img = target_img.to(device)
                     
-                    # Always print prediction variance for collapse detection
-                    pred_var = val_metrics.get('pred_variance', 0)
-                    if pred_var < 0.1:
-                        var_status = "⚠️ MODE COLLAPSE!"
-                    elif pred_var < 0.3:
-                        var_status = "⚠ Low (risky)"
-                    else:
-                        var_status = "✓ Healthy"
-                    print(f"[SD] Pred Variance: {pred_var:.4f} {var_status}")
-                
-                # Log all metrics including per-timestep losses
-                log_dict = {
-                    "epoch": epoch,
-                    "train_loss": avg_loss,
-                    "val_l1": val_metrics["val_l1"],
-                    "val_psnr": val_metrics["val_psnr"],
-                    "val_ssim": val_metrics["val_ssim"],
-                    "val_clip": val_metrics["val_clip"],
-                }
-                # Add timestep losses
-                for key in timestep_keys:
-                    log_dict[key] = val_metrics[key]
-                
-                metrics_logger.log(log_dict)
-                
-                # Print progress summary at key milestones
-                if epoch in [10, 20, 30, 50, 75, 100]:
-                    print(f"\n{'='*60}")
-                    print(f"PROGRESS SUMMARY - Epoch {epoch}/100")
-                    print(f"{'='*60}")
-                    print(f"Training Loss:  {avg_loss:.4f}")
-                    print(f"PSNR:          {val_metrics['val_psnr']:.2f} dB  (target: >25 dB)")
-                    print(f"SSIM:          {val_metrics['val_ssim']:.4f}  (target: >0.75)")
-                    print(f"CLIP Sim:      {val_metrics['val_clip']:.4f}  (target: >0.70)")
+                    batch_size = target_img.shape[0]
                     
-                    # Prediction variance (collapse detection)
-                    pred_var = val_metrics.get('pred_variance', 0)
-                    if pred_var < 0.1:
-                        var_status = "⚠️  MODE COLLAPSE"
-                    elif pred_var < 0.3:
-                        var_status = "⚠ Low (risk)"
-                    else:
-                        var_status = "✓ Healthy"
-                    print(f"Pred Variance: {pred_var:.4f}  {var_status}")
+                    # Encode features
+                    encoded_features = feature_encoder(input_feat)
+                    context = encoded_features.unsqueeze(1)
                     
-                    # Count how many timesteps are learned well
-                    good_timesteps = sum(1 for k in timestep_keys if val_metrics[k] < 0.05)
-                    total_timesteps = len(timestep_keys)
-                    print(f"Learned steps: {good_timesteps}/{total_timesteps} timesteps < 0.05 loss")
-                    print(f"{'='*60}\n")
-            else:
-                print(f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | Time: {elapsed:.2f}s")
-                metrics_logger.log({"epoch": epoch, "train_loss": avg_loss})
-
-            if should_validate:
-                checkpoint_path = _save_checkpoint(model, optimizer, epoch, save_dir, version, ema_model=ema_helper.ema if rank == 0 else None)
-                print(f"[SD] Checkpoint saved: {checkpoint_path}")
-
-    _cleanup_ddp()
-
-
-def train_distributed(epochs, retrain, checkpoint_path, version):
-    device_ids = getattr(cfg, "DEVICE_IDS", None)
-    if not device_ids or len(device_ids) < 2:
-        raise RuntimeError("Stable diffusion training requires at least two devices listed in DEVICE_IDS")
-
-    mp.spawn(
-        _ddp_worker,
-        args=(len(device_ids), epochs, retrain, checkpoint_path, version),
-        nprocs=len(device_ids),
-        join=True,
-    )
+                    # Encode target to latents
+                    noise = torch.randn(batch_size, 4, cfg.TARGET_HEIGHT // 8, cfg.TARGET_WIDTH // 8, device=device)
+                    latents = vae_encoder(target_img, noise) * 0.18215
+                    
+                    # Sample timesteps and add noise
+                    timesteps = torch.randint(0, cfg.SD_TIMESTEPS, (batch_size,), device=device).long()
+                    noise = torch.randn_like(latents, device=device)
+                    noisy_latents = noise_scheduler.add_noise(latents, timesteps)
+                    
+                    # Predict noise
+                    time_embeddings = torch.stack([get_time_embedding(t.item()) for t in timesteps]).to(device)
+                    predicted_noise = diffusion(noisy_latents, context, time_embeddings)
+                    
+                    # Compute loss
+                    loss = F.mse_loss(predicted_noise, noise)
+                    val_loss += loss.item()
+                    val_batches += 1
+                    
+                    if batch_idx >= cfg.SD_VAL_STEPS:
+                        break
+            
+            avg_val_loss = val_loss / val_batches
+            print(f"Validation Loss at epoch {epoch+1}: {avg_val_loss:.4f}")
+        
+        # Save checkpoint
+        if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
+            checkpoint_dir = "checkpoints"
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            checkpoint_path = os.path.join(checkpoint_dir, f"sd_epoch_{epoch+1}.pth")
+            
+            torch.save({
+                'epoch': epoch,
+                'feature_encoder': feature_encoder.module.state_dict(),
+                'diffusion': diffusion.module.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'loss': avg_loss,
+            }, checkpoint_path)
+            print(f"Checkpoint saved to {checkpoint_path}")
+    
+    cleanup_ddp()
 
 
 def main() -> None:
@@ -597,12 +279,9 @@ def main() -> None:
     # Checkpoint path is optional - if not provided, auto-detects latest
 
     print(f"Launching stable diffusion DDP training on devices {cfg.DEVICE_IDS}")
-    train_distributed(
-        epochs=args.epochs,
-        retrain=retrain_flag,
-        checkpoint_path=checkpoint_path,
-        version="ddp",
-    )
+    
+    world_size = cfg.WORLD_SIZE
+    mp.spawn(train_worker, args=(world_size, args), nprocs=world_size, join=True)
 
 
 if __name__ == "__main__":

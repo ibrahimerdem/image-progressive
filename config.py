@@ -11,8 +11,8 @@ TEST_CSV = os.path.join(DATA_DIR, "test_features.csv")
 # Dataset
 IMG_WIDTH = 128
 IMG_HEIGHT = 128
-TARGET_WIDTH = 256
-TARGET_HEIGHT = 256
+TARGET_WIDTH = 512
+TARGET_HEIGHT = 512
 CHANNELS = 3
 EMBEDDING_DIM = 128
 EMBEDDING_OUT_DIM = 256
@@ -25,7 +25,7 @@ INITIAL_IMAGE = False
 ENCODER_PATH = "checkpoints/encoder_epoch_50.pth"
 FREEZE_ENCODER = True
 # Stable diffusion initial image encoder options
-SD_INITIAL_ENCODER_CKPT = None #"checkpoints/encoder_epoch_50.pth"
+SD_INITIAL_ENCODER_CKPT = "checkpoints/vae_epoch_50.pth"  # Path to pretrained VAE encoder
 SD_FREEZE_INITIAL_ENCODER = False
 
 # Model / training defaults
