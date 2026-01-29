@@ -83,7 +83,6 @@ def _measure_denoising_quality(
     return losses_by_timestep, prediction_stats
 
 
-
 def _setup_ddp(rank: int, world_size: int) -> torch.device:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
@@ -133,14 +132,14 @@ def _run_validation(
     pipeline: StableDiffusionPipeline,
     diffusion: GaussianDiffusion,
     val_loader,
-    train_loader,  # Added: to sample from training set
+    train_loader,
     device: torch.device,
     clip_model,
     clip_preprocess,
     sample_dir: str,
     epoch: int,
     rank: int = 0,
-    max_batches: int = 10,  # Limit validation to first 10 batches
+    max_batches: int = 10,
 ):
     if val_loader is None or clip_model is None or clip_preprocess is None:
         return None
@@ -177,6 +176,8 @@ def _run_validation(
                 # Get one batch from training set
                 train_iter = iter(train_loader)
                 _, train_features, train_targets, _ = next(train_iter)
+                
+                # Features are [B, H, W] matrix or [B, D] vector - model handles both
                 train_features = train_features.to(device)
                 train_targets = train_targets.to(device)
                 
@@ -204,11 +205,12 @@ def _run_validation(
                 
                 print(f"[SD] Train Sample Gen: PSNR={train_psnr:.2f} dB, SSIM={train_ssim:.4f}, CLIP={train_clip:.4f}")
 
-    # VALIDATION SET: Generate from pure noise (exactly like generation script)
+    # VALIDATION SET: Simulate real inference scenario
+    # Features are [B, 9, 3] tensor (9 features × 3 replications)
     for idx, (_, features, target_images, _) in enumerate(val_loader):
         if idx >= max_batches: 
             break
-            
+        
         features = features.to(device)
         targets = target_images.to(device)
 
@@ -294,30 +296,25 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         world_size=world_size,
     )
 
-    # Feature dimension calculation
-    feature_dim = train_loader.dataset.input_data.shape[1]
-    seq_len = getattr(cfg, 'FEATURE_SEQUENCE_LENGTH', 0)
+    # Safety check: ensure dataloaders are not empty
+    if len(train_loader) == 0:
+        raise ValueError(f"[SD] ERROR: Training dataloader is empty! Check dataset configuration.")
+    if val_loader and len(val_loader) == 0:
+        print(f"[SD] WARNING: Validation dataloader is empty!")
     
-    # If using sequences, adjust input_dim to account for positional encoding
-    if seq_len > 0 and seq_len != feature_dim:
-        # Strategy 2: [N, D+1] where +1 is position
-        feature_input_dim = feature_dim + 1
-    else:
-        # Strategy 1: [D, D] or no sequence [D]
-        feature_input_dim = feature_dim
-
-    use_cross_attn = getattr(cfg, "SD_USE_CROSS_ATTN", False)
-    base_model = StableDiffusionConditioned(
-        input_dim=feature_input_dim,
-        use_cross_attn=use_cross_attn,
-    )
     if rank == 0:
-        mode_str = "Cross-Attention" if use_cross_attn else "FiLM"
-        seq_info = f" with {seq_len} tokens" if seq_len > 0 else ""
-        print(f"[SD] Using {mode_str} conditioning for features{seq_info}")
-        print(f"[SD] Feature input dimension: {feature_input_dim} (original: {feature_dim})")
-    diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
+        print(f"[SD] Training batches per epoch: {len(train_loader)}")
+        print(f"[SD] Validation batches per epoch: {len(val_loader) if val_loader else 0}")
 
+    sample_train_features = train_loader.dataset.input_data[0]
+    sample_val_features = val_loader.dataset.input_data[0]
+    
+    print(f"[SD] Training features: {sample_train_features.shape}")
+    print(f"[SD] Validation features: {sample_val_features.shape}")
+    
+    base_model = StableDiffusionConditioned()
+
+    diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
     pipeline = StableDiffusionPipeline(model.module, diffusion)
 
@@ -391,21 +388,16 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 
         start_time = time.time()
         for batch_idx, (initial_images, features, target_images, _) in enumerate(train_loader):
+            # Features are [B, H, W] matrix or [B, D] vector - model handles both
             features = features.to(device)
             targets = target_images.to(device)
+            
+            # Debug: Print first batch info
+            if batch_idx == 0 and rank == 0:
+                print(f"[SD] Epoch {epoch} - Processing batch {batch_idx}/{len(train_loader)}, features shape: {features.shape}")
 
             with amp_ctx():
-                cfg_dropout = getattr(cfg, "SD_CFG_DROPOUT", 0.1)
-                x0_loss_weight = getattr(cfg, "SD_X0_LOSS_WEIGHT", 0.0)
-                perceptual_weight = getattr(cfg, "SD_PERCEPTUAL_WEIGHT", 0.0)
-                
-                loss_dict = diffusion.p_loss(
-                    model, targets, features, 
-                    cfg_dropout=cfg_dropout,
-                    use_x0_loss=(x0_loss_weight > 0),
-                    x0_loss_weight=x0_loss_weight,
-                    feature_consistency_weight=perceptual_weight
-                )
+                loss_dict = diffusion.p_loss(model, targets, features)
                 loss = loss_dict['loss']
                 loss_metrics = loss_dict.get('metrics', {})
 
@@ -437,6 +429,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                     f"[SD] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
                     f"Loss: {epoch_loss / steps:.4f} | Grad Norm: {grad_norm:.4f}"
                 )
+        
+        # End of batch loop - log completion
+        if rank == 0:
+            print(f"[SD] Epoch {epoch} - Completed all {len(train_loader)} batches in {time.time() - start_time:.2f}s")
 
         loss_tensor = torch.tensor([epoch_loss, steps], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -471,7 +467,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 val_pipeline,
                 diffusion,
                 val_loader,
-                train_loader,  # Pass train_loader for training sample generation
+                train_loader,
                 device,
                 clip_model,
                 clip_preprocess,
@@ -479,15 +475,9 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 epoch,
                 rank,
             )
-            print(f"[SD] Rank {rank} finished validation")
 
-        # Keep all ranks in sync after validation before next epoch
         if dist.is_initialized():
-            if rank == 0:
-                print(f"[SD] Rank {rank} entering second barrier after validation")
             dist.barrier()
-            if rank == 0:
-                print(f"[SD] Rank {rank} passed second barrier")
 
         if rank == 0:
             elapsed = time.time() - start_time
