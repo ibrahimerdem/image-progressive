@@ -224,7 +224,6 @@ class GaussianDiffusion(nn.Module):
         model: nn.Module,
         x_start: torch.Tensor,
         features: torch.Tensor,
-        initial_image: Optional[torch.Tensor] = None,
         vae_encoder=None,
     ) -> dict:
         # If VAE encoder provided, encode images to latent space
@@ -313,9 +312,9 @@ class GaussianDiffusion(nn.Module):
 
 
 class StableDiffusionConditioned(nn.Module):
-    def __init__(self, latent_channels: int = 4):
+    def __init__(self, latent_channels=4, emb_dim=512, base_channels=64):
         super().__init__()
-        cond_dim = cfg.SD_EMB_DIM * 2
+        cond_dim = emb_dim * 2
         time_dim = cond_dim
         feature_dim = 9 * 512
         self.feature_projection = FeatureEmbedding(num_features=9, num_bins=101, embed_dim=512)
@@ -323,7 +322,7 @@ class StableDiffusionConditioned(nn.Module):
         # UNet works in latent space (4 channels) not RGB space (3 channels)
         self.unet = ImprovedUNet(
             latent_channels,  # 4 channels for latent space
-            base_channels=cfg.SD_BASE_CHANNELS, 
+            base_channels=base_channels, 
             time_dim=time_dim, 
             feature_dim=feature_dim,
         )

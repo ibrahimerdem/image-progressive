@@ -457,10 +457,12 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     print(f"[SD] Validation features: {sample_val_features.shape}")
     
     # Load pretrained VAE encoder and decoder (frozen)
-    vae_encoder, vae_decoder = _load_vae(cfg.SD_INITIAL_ENCODER_CKPT, device)
+    vae_encoder, vae_decoder = _load_vae(cfg.SD_VAE_CKPT, device)
     
     # Model works in latent space (4 channels) not RGB space
-    base_model = StableDiffusionConditioned(latent_channels=4)
+    base_model = StableDiffusionConditioned(latent_channels=4,
+                                            emb_dim=cfg.SD_EMB_DIM,
+                                            base_channels=cfg.SD_BASE_CHANNELS)
 
     diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
@@ -537,7 +539,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         diffusion.train()
 
         start_time = time.time()
-        for batch_idx, (initial_images, features, target_images, _) in enumerate(train_loader):
+        for batch_idx, (_, features, target_images, _) in enumerate(train_loader):
             # Features are [B, H, W] matrix or [B, D] vector - model handles both
             features = features.to(device)
             targets = target_images.to(device)

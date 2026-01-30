@@ -24,9 +24,7 @@ FEATURE_SEQUENCE_LENGTH = 16  # 0 = single vector [D], >0 = sequence [N, D] for 
 INITIAL_IMAGE = False
 ENCODER_PATH = "checkpoints/encoder_epoch_50.pth"
 FREEZE_ENCODER = True
-# Stable diffusion initial image encoder options
-SD_INITIAL_ENCODER_CKPT = "checkpoints/vae_epoch_10.pth"  # Path to pretrained VAE encoder
-SD_FREEZE_INITIAL_ENCODER = False
+
 
 # Model / training defaults
 NOISE_DIM = 128
@@ -45,14 +43,14 @@ VAE_LR = 0.0001          # Conservative learning rate
 VAE_KL_WEIGHT = 0.00001  # Small KL weight to avoid posterior collapse
 
 # Stable diffusion defaults
-SD_LR = 0.00005         # Lower learning rate to prevent NaN
-SD_TIMESTEPS = 1000      # Full diffusion schedule  
-SD_SAMPLE_STEPS = 100     
+SD_LR = 0.00005
+SD_TIMESTEPS = 1000      
+SD_SAMPLE_STEPS = 200     
 SD_EMB_DIM = 768
+SD_BASE_CHANNELS = 128
 SD_VAL_STEPS = 50
 SD_SAMPLE_BATCH = 2
 SD_LOG_INTERVAL = 100   
-SD_BASE_CHANNELS = 128
 SD_ATTENTION_HEADS = 2
 SD_ATTENTION_RESOLUTION = [32, 16]
 SD_EMA_DECAY = 0.9995
@@ -62,6 +60,8 @@ SD_CFG_DROPOUT = 0.0  # DISABLED: Was teaching model to ignore features!
 SD_X0_LOSS_WEIGHT = 0.0  # DISABLED: Causing NaN - use noise prediction only
 SD_PERCEPTUAL_WEIGHT = 0.5  # Perceptual L1 loss for better visual alignment
 SD_USE_CROSS_ATTN = True  # Enable cross-attention for sequence features [B, N, D]
+SD_VAE_CKPT = "checkpoints/vae_epoch_10.pth"
+SD_FREEZE_VAE = False
 
 DEVICE_IDS = [0, 1]
 WORLD_SIZE = len(DEVICE_IDS)
