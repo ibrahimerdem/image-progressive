@@ -192,10 +192,23 @@ def train_worker(rank: int, world_size: int, args) -> None:
                     x0_loss = F.mse_loss(pred_x0, latents)
                     loss = loss + cfg.SD_X0_LOSS_WEIGHT * x0_loss
                 
-                # Check for NaN/Inf
+                # Check for NaN/Inf in inputs and outputs
+                if torch.isnan(input_feat).any() or torch.isinf(input_feat).any():
+                    if rank == 0:
+                        print(f"Warning: NaN/Inf in input_feat at batch {batch_idx}, skipping...")
+                    optimizer.zero_grad()
+                    continue
+                
+                if torch.isnan(predicted_noise).any() or torch.isinf(predicted_noise).any():
+                    if rank == 0:
+                        print(f"Warning: NaN/Inf in predicted_noise at batch {batch_idx}, skipping...")
+                    optimizer.zero_grad()
+                    continue
+                
+                # Check for NaN/Inf loss
                 if torch.isnan(loss) or torch.isinf(loss):
                     if rank == 0:
-                        print(f"Warning: NaN/Inf loss detected at batch {batch_idx}, skipping...")
+                        print(f"Warning: NaN/Inf loss detected at batch {batch_idx}, loss={loss.item()}")
                     optimizer.zero_grad()
                     continue
             
@@ -208,10 +221,12 @@ def train_worker(rank: int, world_size: int, args) -> None:
                 cfg.SD_GRAD_CLIP
             )
             
-            # Check for NaN gradients
+            # Check for NaN gradients with more info
             if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                 if rank == 0:
-                    print(f"Warning: NaN/Inf gradients detected at batch {batch_idx}, skipping...")
+                    print(f"Warning: NaN/Inf gradients at batch {batch_idx}, grad_norm={grad_norm.item() if not torch.isnan(grad_norm) else 'nan'}")
+                    print(f"  Loss was: {loss.item()}")
+                    print(f"  Input range: [{input_feat.min().item():.4f}, {input_feat.max().item():.4f}]")
                 optimizer.zero_grad()
                 scaler.update()
                 continue
