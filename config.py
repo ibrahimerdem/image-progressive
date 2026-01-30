@@ -35,7 +35,7 @@ FIXED_D_LR = 0.0001
 BCE_FACTOR = 1.0
 L1_FACTOR = 50.0
 L2_FACTOR = 150.0
-VAL_EPOCH = 10 
+VAL_EPOCH = 5 
 
 # VAE defaults (balanced for memory and capacity)
 VAE_BASE_CHANNELS = 64  # Compromise: not too small (32) or large (128)

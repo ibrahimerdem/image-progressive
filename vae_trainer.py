@@ -84,30 +84,23 @@ def train_worker(rank: int, world_size: int, args) -> None:
         epoch_kl_loss = 0.0
         num_batches = 0
         
-        for batch_idx, (initial_img, input_feat, target_img, _) in enumerate(train_loader):
-            # Use both initial and target images for training (double the data)
-            initial_img = initial_img.to(device)
+        for batch_idx, (initial_img, _, target_img, _) in enumerate(train_loader):
+            # Use only target images for VAE training
             target_img = target_img.to(device)
-            
-            # Resize initial images to 512x512 to match target resolution
-            initial_img_resized = F.interpolate(initial_img, size=(cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH), mode='bilinear', align_corners=False)
-            
-            # Concatenate both image sets in batch dimension [2*B, C, H, W]
-            all_images = torch.cat([initial_img_resized, target_img], dim=0)
-            batch_size = all_images.shape[0]
+            batch_size = target_img.shape[0]
             
             optimizer.zero_grad()
             
             with autocast('cuda'):
                 # Encode to latent space
                 noise = torch.randn(batch_size, 4, cfg.TARGET_HEIGHT // 8, cfg.TARGET_WIDTH // 8, device=device)
-                latents = vae_encoder(all_images, noise)
+                latents = vae_encoder(target_img, noise)
                 
                 # Decode back to image space
                 reconstructed = vae_decoder(latents)
                 
                 # Reconstruction loss (L1 or L2)
-                recon_loss = F.mse_loss(reconstructed, all_images)
+                recon_loss = F.mse_loss(reconstructed, target_img)
                 
                 # KL divergence loss (regularization)
                 # Approximate KL loss based on latent statistics
@@ -128,7 +121,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
             if rank == 0 and batch_idx % 100 == 0:
                 print(f"Epoch [{epoch+1}/{args.epochs}], Batch [{batch_idx}/{len(train_loader)}], "
                       f"Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f} "
-                      f"(Training on {batch_size} images: initial+target)")
+                      f"(Training on {batch_size} target images only)")
         
         # Log epoch average
         if rank == 0:
@@ -150,24 +143,17 @@ def train_worker(rank: int, world_size: int, args) -> None:
             
             with torch.no_grad():
                 for batch_idx, (initial_img, input_feat, target_img, _) in enumerate(val_loader):
-                    # Use both initial and target images for validation
-                    initial_img = initial_img.to(device)
+                    # Use only target images for validation
                     target_img = target_img.to(device)
-                    
-                    # Resize initial images to 512x512
-                    initial_img_resized = F.interpolate(initial_img, size=(cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH), mode='bilinear', align_corners=False)
-                    
-                    # Concatenate both image sets
-                    all_images = torch.cat([initial_img_resized, target_img], dim=0)
-                    batch_size = all_images.shape[0]
+                    batch_size = target_img.shape[0]
                     
                     # Encode and decode
                     noise = torch.randn(batch_size, 4, cfg.TARGET_HEIGHT // 8, cfg.TARGET_WIDTH // 8, device=device)
-                    latents = vae_encoder(all_images, noise)
+                    latents = vae_encoder(target_img, noise)
                     reconstructed = vae_decoder(latents)
                     
                     # Reconstruction loss
-                    recon_loss = F.mse_loss(reconstructed, all_images)
+                    recon_loss = F.mse_loss(reconstructed, target_img)
                     val_loss += recon_loss.item()
                     val_recon_loss += recon_loss.item()
                     val_batches += 1
