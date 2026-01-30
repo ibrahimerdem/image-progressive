@@ -20,6 +20,8 @@ from models.stable_diffusion import (
     StableDiffusionConditioned,
     StableDiffusionPipeline,
 )
+from models.encoder import VAE_Encoder
+from models.decoder import VAE_Decoder
 from utils.dataset import create_dataloaders
 from utils.training import (
     MetricsLogger,
@@ -32,12 +34,141 @@ from utils.training import (
 )
 
 
+def _load_vae(checkpoint_path: str, device: torch.device):
+    """Load pretrained VAE encoder and decoder from checkpoint and freeze them"""
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"VAE checkpoint not found: {checkpoint_path}")
+    
+    print(f"[SD] Loading pretrained VAE from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    
+    # Debug: print checkpoint structure
+    print(f"[SD] Checkpoint type: {type(checkpoint)}")
+    if isinstance(checkpoint, dict):
+        print(f"[SD] Checkpoint keys: {list(checkpoint.keys())[:10]}")
+        
+        # Check if encoder/decoder are stored as nested dicts (common format)
+        if 'encoder' in checkpoint and 'decoder' in checkpoint:
+            print(f"[SD] Found 'encoder' and 'decoder' as top-level keys")
+            encoder_weights = checkpoint['encoder']
+            decoder_weights = checkpoint['decoder']
+            
+            # Check if they are state_dicts or need further unwrapping
+            if isinstance(encoder_weights, dict):
+                print(f"[SD] Encoder has {len(encoder_weights)} keys")
+                print(f"[SD] Sample encoder keys: {list(encoder_weights.keys())[:3]}")
+            if isinstance(decoder_weights, dict):
+                print(f"[SD] Decoder has {len(decoder_weights)} keys")
+                print(f"[SD] Sample decoder keys: {list(decoder_weights.keys())[:3]}")
+            
+            vae_encoder = VAE_Encoder().to(device)
+            vae_decoder = VAE_Decoder().to(device)
+            
+            # Load the state dicts
+            try:
+                vae_encoder.load_state_dict(encoder_weights, strict=True)
+                print(f"[SD] ✓ Loaded encoder weights ({len(encoder_weights)} keys)")
+            except Exception as e:
+                print(f"[SD] ✗ Failed to load encoder: {e}")
+                raise
+            
+            try:
+                vae_decoder.load_state_dict(decoder_weights, strict=True)
+                print(f"[SD] ✓ Loaded decoder weights ({len(decoder_weights)} keys)")
+            except Exception as e:
+                print(f"[SD] ✗ Failed to load decoder: {e}")
+                raise
+            
+            # Freeze VAE parameters
+            for param in vae_encoder.parameters():
+                param.requires_grad = False
+            for param in vae_decoder.parameters():
+                param.requires_grad = False
+            
+            vae_encoder.eval()
+            vae_decoder.eval()
+            
+            print(f"[SD] VAE loaded and frozen successfully")
+            return vae_encoder, vae_decoder
+        
+        # Check for common checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            print(f"[SD] Found 'model_state_dict', using it")
+            checkpoint = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            print(f"[SD] Found 'state_dict', using it")
+            checkpoint = checkpoint['state_dict']
+    
+    vae_encoder = VAE_Encoder().to(device)
+    vae_decoder = VAE_Decoder().to(device)
+    
+    # Try multiple key patterns
+    # Pattern 1: encoder.X.Y, decoder.X.Y
+    encoder_state = {k.replace('encoder.', ''): v for k, v in checkpoint.items() if k.startswith('encoder.')}
+    decoder_state = {k.replace('decoder.', ''): v for k, v in checkpoint.items() if k.startswith('decoder.')}
+    
+    # Pattern 2: Direct weights (no prefix)
+    if not encoder_state and not decoder_state:
+        print(f"[SD] No 'encoder.'/'decoder.' prefix found, checking sample keys...")
+        sample_keys = list(checkpoint.keys())[:5]
+        print(f"[SD] Sample keys: {sample_keys}")
+        
+        # Try to split by checking if keys match encoder/decoder structure
+        encoder_param_names = set(n for n, _ in vae_encoder.named_parameters())
+        decoder_param_names = set(n for n, _ in vae_decoder.named_parameters())
+        
+        encoder_state = {k: v for k, v in checkpoint.items() if k in encoder_param_names}
+        decoder_state = {k: v for k, v in checkpoint.items() if k in decoder_param_names}
+        
+        print(f"[SD] Matched by parameter names: encoder={len(encoder_state)}, decoder={len(decoder_state)}")
+    
+    # Load encoder weights
+    if encoder_state:
+        try:
+            vae_encoder.load_state_dict(encoder_state, strict=True)
+            print(f"[SD] ✓ Loaded encoder weights ({len(encoder_state)} keys)")
+        except Exception as e:
+            print(f"[SD] ✗ Failed to load encoder: {e}")
+            raise
+    else:
+        print(f"[SD] ✗ WARNING: No encoder weights found in checkpoint")
+        print(f"[SD] Expected encoder keys like: {list(vae_encoder.state_dict().keys())[:3]}")
+    
+    # Load decoder weights
+    if decoder_state:
+        try:
+            vae_decoder.load_state_dict(decoder_state, strict=True)
+            print(f"[SD] ✓ Loaded decoder weights ({len(decoder_state)} keys)")
+        except Exception as e:
+            print(f"[SD] ✗ Failed to load decoder: {e}")
+            raise
+    else:
+        print(f"[SD] ✗ WARNING: No decoder weights found in checkpoint")
+        print(f"[SD] Expected decoder keys like: {list(vae_decoder.state_dict().keys())[:3]}")
+    
+    if not encoder_state or not decoder_state:
+        raise RuntimeError("Failed to load VAE weights. Check checkpoint format.")
+    
+    # Freeze VAE parameters
+    for param in vae_encoder.parameters():
+        param.requires_grad = False
+    for param in vae_decoder.parameters():
+        param.requires_grad = False
+    
+    vae_encoder.eval()
+    vae_decoder.eval()
+    
+    print(f"[SD] VAE loaded and frozen successfully")
+    return vae_encoder, vae_decoder
+
+
 def _measure_denoising_quality(
     model: nn.Module,
     diffusion: GaussianDiffusion,
     features: torch.Tensor,
     targets: torch.Tensor,
     device: torch.device,
+    vae_encoder=None,
     timesteps_to_test: list = [100, 200, 400, 600, 800],
 ):
     """
@@ -58,12 +189,24 @@ def _measure_denoising_quality(
     prediction_stats = {}
     
     with torch.no_grad():
+        # Encode targets to latent space if VAE is provided
+        if vae_encoder is not None:
+            noise_for_vae = torch.randn(
+                targets.size(0), 4,
+                targets.size(2) // 8, targets.size(3) // 8,
+                device=device
+            )
+            targets_latent = vae_encoder(targets, noise_for_vae)
+            # Note: VAE encoder already scales by 0.18215
+        else:
+            targets_latent = targets
+        
         for t_val in timesteps_to_test:
-            t = torch.full((targets.size(0),), t_val, dtype=torch.long, device=device)
-            noise = torch.randn_like(targets)
+            t = torch.full((targets_latent.size(0),), t_val, dtype=torch.long, device=device)
+            noise = torch.randn_like(targets_latent)
             
             # Add noise at this timestep
-            noisy = diffusion.q_sample(targets, t, noise)
+            noisy = diffusion.q_sample(targets_latent, t, noise)
             
             # Predict noise
             pred_noise = model(noisy, t, features)
@@ -138,6 +281,7 @@ def _run_validation(
     clip_preprocess,
     sample_dir: str,
     epoch: int,
+    vae_encoder=None,
     rank: int = 0,
     max_batches: int = 10,
 ):
@@ -259,7 +403,7 @@ def _run_validation(
             
             # Measure denoising quality at different timesteps (first batch only)
             timestep_losses, pred_stats = _measure_denoising_quality(
-                model, diffusion, features, targets, device,
+                model, diffusion, features, targets, device, vae_encoder,
                 timesteps_to_test=[100, 200, 400, 600, 800]
             )
 
@@ -312,11 +456,17 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     print(f"[SD] Training features: {sample_train_features.shape}")
     print(f"[SD] Validation features: {sample_val_features.shape}")
     
-    base_model = StableDiffusionConditioned()
+    # Load pretrained VAE encoder and decoder (frozen)
+    vae_encoder, vae_decoder = _load_vae(cfg.SD_INITIAL_ENCODER_CKPT, device)
+    
+    # Model works in latent space (4 channels) not RGB space
+    base_model = StableDiffusionConditioned(latent_channels=4)
 
     diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
-    pipeline = StableDiffusionPipeline(model.module, diffusion)
+    
+    # Pipeline needs VAE for encoding/decoding
+    pipeline = StableDiffusionPipeline(model.module, diffusion, vae_encoder, vae_decoder)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.SD_LR)
     use_amp = device.type == "cuda"
@@ -325,7 +475,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 
     ema_helper = ModelEMA(base_model, cfg.SD_EMA_DECAY)
     ema_helper.to(device)
-    ema_pipeline = StableDiffusionPipeline(ema_helper.ema, diffusion) if rank == 0 else None
+    ema_pipeline = StableDiffusionPipeline(ema_helper.ema, diffusion, vae_encoder, vae_decoder) if rank == 0 else None
 
     start_epoch = 0
     if retrain and checkpoint_path:
@@ -397,7 +547,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 print(f"[SD] Epoch {epoch} - Processing batch {batch_idx}/{len(train_loader)}, features shape: {features.shape}")
 
             with amp_ctx():
-                loss_dict = diffusion.p_loss(model, targets, features)
+                loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder)
                 loss = loss_dict['loss']
                 loss_metrics = loss_dict.get('metrics', {})
 
@@ -473,6 +623,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 clip_preprocess,
                 sample_dir,
                 epoch,
+                vae_encoder,
                 rank,
             )
 

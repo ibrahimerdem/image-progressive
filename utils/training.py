@@ -130,14 +130,14 @@ def visualize_results(
     
     for i in range(num_samples):
         # Detach and denormalize images
-        initial = denormalize_image(initial_images[i].detach()).cpu().permute(1, 2, 0).numpy()
-        generated = denormalize_image(generated_images[i].detach()).cpu().permute(1, 2, 0).numpy()
-        target = denormalize_image(target_images[i].detach()).cpu().permute(1, 2, 0).numpy()
+        initial = denormalize_image(initial_images[i].detach()).cpu().permute(1, 2, 0)
+        generated = denormalize_image(generated_images[i].detach()).cpu().permute(1, 2, 0)
+        target = denormalize_image(target_images[i].detach()).cpu().permute(1, 2, 0)
         
-        # Clip to [0, 1]
-        initial = np.clip(initial, 0, 1)
-        generated = np.clip(generated, 0, 1)
-        target = np.clip(target, 0, 1)
+        # Convert to float32 and clip to [0, 1]
+        initial = np.clip(initial.float().numpy(), 0, 1).astype(np.float32)
+        generated = np.clip(generated.float().numpy(), 0, 1).astype(np.float32)
+        target = np.clip(target.float().numpy(), 0, 1).astype(np.float32)
         
         # Plot
         axes[i, 0]. imshow(initial)
@@ -312,8 +312,9 @@ def save_diffusion_intermediates(intermediates, sample_dir, epoch, sample_idx=0)
     
     for idx, (step, img_tensor) in enumerate(intermediates):
         # Take first image from batch
-        img = denormalize_image(img_tensor[sample_idx].detach()).cpu().permute(1, 2, 0).numpy()
-        img = np.clip(img, 0, 1)
+        img = denormalize_image(img_tensor[sample_idx].detach()).cpu().permute(1, 2, 0)
+        # Convert to float32 and clip to [0, 1]
+        img = np.clip(img.float().numpy(), 0, 1).astype(np.float32)
         
         axes[idx].imshow(img)
         axes[idx].set_title(f'Step {step}')

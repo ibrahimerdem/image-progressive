@@ -225,11 +225,26 @@ class GaussianDiffusion(nn.Module):
         x_start: torch.Tensor,
         features: torch.Tensor,
         initial_image: Optional[torch.Tensor] = None,
+        vae_encoder=None,
     ) -> dict:
-        batch_size = x_start.size(0)
-        t = torch.randint(0, self.timesteps, (batch_size,), device=x_start.device)
-        noise = torch.randn_like(x_start)
-        x_t = self.q_sample(x_start, t, noise)
+        # If VAE encoder provided, encode images to latent space
+        if vae_encoder is not None:
+            with torch.no_grad():
+                # VAE encoder expects noise for reparameterization
+                noise_for_vae = torch.randn(
+                    x_start.size(0), 4, 
+                    x_start.size(2) // 8, x_start.size(3) // 8,
+                    device=x_start.device
+                )
+                # VAE encoder already scales by 0.18215 internally
+                x_start_latent = vae_encoder(x_start, noise_for_vae)
+        else:
+            x_start_latent = x_start
+        
+        batch_size = x_start_latent.size(0)
+        t = torch.randint(0, self.timesteps, (batch_size,), device=x_start_latent.device)
+        noise = torch.randn_like(x_start_latent)
+        x_t = self.q_sample(x_start_latent, t, noise)
         pred_noise = model(x_t, t, features)
         noise_loss = F.mse_loss(pred_noise, noise)
         return {'loss': noise_loss, 'metrics': {'noise_loss': noise_loss.item()}}
@@ -241,9 +256,14 @@ class GaussianDiffusion(nn.Module):
         steps: Optional[int] = None,
         save_intermediates: bool = False,
         eta: float = 0.0,
+        latent_shape: tuple = None,  # (B, C, H, W) for latent space
     ):
         steps = steps or self.timesteps
-        shape = (features.size(0), cfg.CHANNELS, cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH)
+        if latent_shape is None:
+            # Default to RGB image space (backward compatibility)
+            shape = (features.size(0), cfg.CHANNELS, cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH)
+        else:
+            shape = latent_shape
         img = torch.randn(shape, device=features.device)
         intermediates = []
         if steps < self.timesteps:
@@ -267,7 +287,13 @@ class GaussianDiffusion(nn.Module):
             sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
             sqrt_alpha_bar_t = torch.clamp(sqrt_alpha_bar_t, min=1e-8)
             pred_x0 = (img - sqrt_one_minus_alpha_bar_t * epsilon) / sqrt_alpha_bar_t
-            pred_x0 = torch.clamp(pred_x0, -10.0, 10.0)
+            # Clamp predicted x0: use wider range for latents, tight range for images
+            if latent_shape is not None:
+                # Latent space: use much wider range (VAE latents can be large)
+                pred_x0 = torch.clamp(pred_x0, -20.0, 20.0)
+            else:
+                # Image space: standard pixel range
+                pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
             variance = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)
             variance = torch.clamp(variance, min=0.0, max=1.0)
             sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
@@ -276,24 +302,27 @@ class GaussianDiffusion(nn.Module):
             x_prev = sqrt_alpha_bar_prev * pred_x0 + dir_xt
             img = x_prev
             if save_intermediates and step_idx % 10 == 0:
-                intermediates.append((timestep.item(), torch.clamp(img.clone(), -1.0, 1.0)))
+                # Save intermediates without clamping (decoder will handle it)
+                intermediates.append((timestep.item(), img.clone()))
         
-        final = torch.clamp(img, -1.0, 1.0)
+        # Final output: don't clamp latents, let decoder handle it
+        final = img if latent_shape is not None else torch.clamp(img, -1.0, 1.0)
         if save_intermediates:
             return final, intermediates
         return final
 
 
 class StableDiffusionConditioned(nn.Module):
-    def __init__(self):
+    def __init__(self, latent_channels: int = 4):
         super().__init__()
         cond_dim = cfg.SD_EMB_DIM * 2
         time_dim = cond_dim
         feature_dim = 9 * 512
         self.feature_projection = FeatureEmbedding(num_features=9, num_bins=101, embed_dim=512)
         self.time_embedding = TimeEmbedding(time_dim)
+        # UNet works in latent space (4 channels) not RGB space (3 channels)
         self.unet = ImprovedUNet(
-            cfg.CHANNELS, 
+            latent_channels,  # 4 channels for latent space
             base_channels=cfg.SD_BASE_CHANNELS, 
             time_dim=time_dim, 
             feature_dim=feature_dim,
@@ -303,23 +332,63 @@ class StableDiffusionConditioned(nn.Module):
 
     def forward(
         self,
-        noisy_image: torch.Tensor,
+        noisy_latent: torch.Tensor,
         timesteps: torch.Tensor,
         features: torch.Tensor,
     ) -> torch.Tensor:
         time_emb = self.time_embedding(timesteps) * self.time_scale
         feature_emb = self.feature_projection(features).unsqueeze(1) * self.feature_scale
-        output = self.unet(noisy_image, time_emb, feature_emb)
+        output = self.unet(noisy_latent, time_emb, feature_emb)
         return output
 
 
 class StableDiffusionPipeline:
-    def __init__(self, model: StableDiffusionConditioned, schedule: GaussianDiffusion):
+    def __init__(self, model: StableDiffusionConditioned, schedule: GaussianDiffusion, 
+                 vae_encoder=None, vae_decoder=None):
         self.model = model
         self.schedule = schedule
+        self.vae_encoder = vae_encoder
+        self.vae_decoder = vae_decoder
 
     def sample(self, features: torch.Tensor, steps: Optional[int] = None, save_intermediates: bool = False):
-        return self.schedule.sample(self.model, features, steps, save_intermediates=save_intermediates)
+        # Sample in latent space if VAE is provided
+        if self.vae_encoder is not None and self.vae_decoder is not None:
+            # Latent space: 4 channels, H/8, W/8
+            batch_size = features.size(0)
+            latent_h = cfg.TARGET_HEIGHT // 8
+            latent_w = cfg.TARGET_WIDTH // 8
+            latent_shape = (batch_size, 4, latent_h, latent_w)
+            
+            # Generate latents
+            result = self.schedule.sample(
+                self.model, features, steps, 
+                save_intermediates=save_intermediates,
+                latent_shape=latent_shape
+            )
+            
+            if save_intermediates and isinstance(result, tuple):
+                latents, intermediates = result
+                # Decode final latents to images
+                images = self.vae_decoder(latents)
+                # Clamp decoded images to reasonable range for visualization
+                images = torch.clamp(images, -1.0, 1.0)
+                # Also decode intermediates
+                decoded_intermediates = []
+                for t, latent in intermediates:
+                    img = self.vae_decoder(latent)
+                    img = torch.clamp(img, -1.0, 1.0)
+                    decoded_intermediates.append((t, img))
+                return images, decoded_intermediates
+            else:
+                latents = result
+                # Decode latents to images
+                images = self.vae_decoder(latents)
+                # Clamp decoded images to reasonable range for visualization
+                images = torch.clamp(images, -1.0, 1.0)
+                return images
+        else:
+            # Original behavior: sample directly in image space
+            return self.schedule.sample(self.model, features, steps, save_intermediates=save_intermediates)
 
 
 class ModelEMA:
