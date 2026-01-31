@@ -55,12 +55,10 @@ SD_ATTENTION_HEADS = 2
 SD_ATTENTION_RESOLUTION = [32, 16]
 SD_EMA_DECAY = 0.9995
 SD_GRAD_CLIP = 0.5       # More aggressive gradient clipping
-SD_DDP_TIMEOUT_MINUTES = 30  # Increase DDP timeout for slow validation
-SD_CFG_DROPOUT = 0.0  # DISABLED: Was teaching model to ignore features!
-SD_X0_LOSS_WEIGHT = 0.0  # DISABLED: Causing NaN - use noise prediction only
+SD_DDP_TIMEOUT_MINUTES = 30
 SD_PERCEPTUAL_WEIGHT = 0.5  # Perceptual L1 loss for better visual alignment
 SD_USE_CROSS_ATTN = True  # Enable cross-attention for sequence features [B, N, D]
-SD_VAE_CKPT = "checkpoints/vae_epoch_10.pth"
+SD_VAE_CKPT = "checkpoints/vae_epoch_20.pth"
 SD_FREEZE_VAE = False
 
 DEVICE_IDS = [0, 1]
