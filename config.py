@@ -20,11 +20,9 @@ FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_ra
 FEATURE_NORMALIZATION = True
 FEATURE_MINS = [5.6,15,0,16.87,-1.91,-16.75,1,1,1000]
 FEATURE_MAXS = [30,42,95,40,1.62,-0.5,4,7,7000]
-FEATURE_SEQUENCE_LENGTH = 16  # 0 = single vector [D], >0 = sequence [N, D] for cross-attention
 INITIAL_IMAGE = False
 ENCODER_PATH = "checkpoints/encoder_epoch_50.pth"
 FREEZE_ENCODER = True
-
 
 # Model / training defaults
 NOISE_DIM = 128
@@ -58,13 +56,13 @@ SD_GRAD_CLIP = 0.5       # More aggressive gradient clipping
 SD_DDP_TIMEOUT_MINUTES = 30
 SD_PERCEPTUAL_WEIGHT = 0.5  # Perceptual L1 loss for better visual alignment
 SD_USE_CROSS_ATTN = True  # Enable cross-attention for sequence features [B, N, D]
-SD_VAE_CKPT = "checkpoints/vae_epoch_20.pth"
+SD_VAE_CKPT = "checkpoints/vae_epoch_50.pth"
 SD_FREEZE_VAE = False
 
 DEVICE_IDS = [0, 1]
 WORLD_SIZE = len(DEVICE_IDS)
 
 # Per-GPU batch size and dataloader workers
-BATCH_SIZE_PER_GPU = 2
+BATCH_SIZE_PER_GPU = 4
 NUM_WORKERS = 4
 
