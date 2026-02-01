@@ -20,6 +20,8 @@ from models.stable_diffusion import (
     StableDiffusionConditioned,
     StableDiffusionPipeline,
 )
+from models.encoder import VAE_Encoder
+from models.decoder import VAE_Decoder
 from utils.dataset import create_dataloaders
 from utils.training import (
     MetricsLogger,
@@ -32,12 +34,141 @@ from utils.training import (
 )
 
 
+def _load_vae(checkpoint_path: str, device: torch.device):
+    """Load pretrained VAE encoder and decoder from checkpoint and freeze them"""
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"VAE checkpoint not found: {checkpoint_path}")
+    
+    print(f"[SD] Loading pretrained VAE from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    
+    # Debug: print checkpoint structure
+    print(f"[SD] Checkpoint type: {type(checkpoint)}")
+    if isinstance(checkpoint, dict):
+        print(f"[SD] Checkpoint keys: {list(checkpoint.keys())[:10]}")
+        
+        # Check if encoder/decoder are stored as nested dicts (common format)
+        if 'encoder' in checkpoint and 'decoder' in checkpoint:
+            print(f"[SD] Found 'encoder' and 'decoder' as top-level keys")
+            encoder_weights = checkpoint['encoder']
+            decoder_weights = checkpoint['decoder']
+            
+            # Check if they are state_dicts or need further unwrapping
+            if isinstance(encoder_weights, dict):
+                print(f"[SD] Encoder has {len(encoder_weights)} keys")
+                print(f"[SD] Sample encoder keys: {list(encoder_weights.keys())[:3]}")
+            if isinstance(decoder_weights, dict):
+                print(f"[SD] Decoder has {len(decoder_weights)} keys")
+                print(f"[SD] Sample decoder keys: {list(decoder_weights.keys())[:3]}")
+            
+            vae_encoder = VAE_Encoder().to(device)
+            vae_decoder = VAE_Decoder().to(device)
+            
+            # Load the state dicts
+            try:
+                vae_encoder.load_state_dict(encoder_weights, strict=True)
+                print(f"[SD] ✓ Loaded encoder weights ({len(encoder_weights)} keys)")
+            except Exception as e:
+                print(f"[SD] ✗ Failed to load encoder: {e}")
+                raise
+            
+            try:
+                vae_decoder.load_state_dict(decoder_weights, strict=True)
+                print(f"[SD] ✓ Loaded decoder weights ({len(decoder_weights)} keys)")
+            except Exception as e:
+                print(f"[SD] ✗ Failed to load decoder: {e}")
+                raise
+            
+            # Freeze VAE parameters
+            for param in vae_encoder.parameters():
+                param.requires_grad = False
+            for param in vae_decoder.parameters():
+                param.requires_grad = False
+            
+            vae_encoder.eval()
+            vae_decoder.eval()
+            
+            print(f"[SD] VAE loaded and frozen successfully")
+            return vae_encoder, vae_decoder
+        
+        # Check for common checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            print(f"[SD] Found 'model_state_dict', using it")
+            checkpoint = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            print(f"[SD] Found 'state_dict', using it")
+            checkpoint = checkpoint['state_dict']
+    
+    vae_encoder = VAE_Encoder().to(device)
+    vae_decoder = VAE_Decoder().to(device)
+    
+    # Try multiple key patterns
+    # Pattern 1: encoder.X.Y, decoder.X.Y
+    encoder_state = {k.replace('encoder.', ''): v for k, v in checkpoint.items() if k.startswith('encoder.')}
+    decoder_state = {k.replace('decoder.', ''): v for k, v in checkpoint.items() if k.startswith('decoder.')}
+    
+    # Pattern 2: Direct weights (no prefix)
+    if not encoder_state and not decoder_state:
+        print(f"[SD] No 'encoder.'/'decoder.' prefix found, checking sample keys...")
+        sample_keys = list(checkpoint.keys())[:5]
+        print(f"[SD] Sample keys: {sample_keys}")
+        
+        # Try to split by checking if keys match encoder/decoder structure
+        encoder_param_names = set(n for n, _ in vae_encoder.named_parameters())
+        decoder_param_names = set(n for n, _ in vae_decoder.named_parameters())
+        
+        encoder_state = {k: v for k, v in checkpoint.items() if k in encoder_param_names}
+        decoder_state = {k: v for k, v in checkpoint.items() if k in decoder_param_names}
+        
+        print(f"[SD] Matched by parameter names: encoder={len(encoder_state)}, decoder={len(decoder_state)}")
+    
+    # Load encoder weights
+    if encoder_state:
+        try:
+            vae_encoder.load_state_dict(encoder_state, strict=True)
+            print(f"[SD] ✓ Loaded encoder weights ({len(encoder_state)} keys)")
+        except Exception as e:
+            print(f"[SD] ✗ Failed to load encoder: {e}")
+            raise
+    else:
+        print(f"[SD] ✗ WARNING: No encoder weights found in checkpoint")
+        print(f"[SD] Expected encoder keys like: {list(vae_encoder.state_dict().keys())[:3]}")
+    
+    # Load decoder weights
+    if decoder_state:
+        try:
+            vae_decoder.load_state_dict(decoder_state, strict=True)
+            print(f"[SD] ✓ Loaded decoder weights ({len(decoder_state)} keys)")
+        except Exception as e:
+            print(f"[SD] ✗ Failed to load decoder: {e}")
+            raise
+    else:
+        print(f"[SD] ✗ WARNING: No decoder weights found in checkpoint")
+        print(f"[SD] Expected decoder keys like: {list(vae_decoder.state_dict().keys())[:3]}")
+    
+    if not encoder_state or not decoder_state:
+        raise RuntimeError("Failed to load VAE weights. Check checkpoint format.")
+    
+    # Freeze VAE parameters
+    for param in vae_encoder.parameters():
+        param.requires_grad = False
+    for param in vae_decoder.parameters():
+        param.requires_grad = False
+    
+    vae_encoder.eval()
+    vae_decoder.eval()
+    
+    print(f"[SD] VAE loaded and frozen successfully")
+    return vae_encoder, vae_decoder
+
+
 def _measure_denoising_quality(
     model: nn.Module,
     diffusion: GaussianDiffusion,
     features: torch.Tensor,
     targets: torch.Tensor,
     device: torch.device,
+    vae_encoder=None,
     timesteps_to_test: list = [100, 200, 400, 600, 800],
 ):
     """
@@ -58,12 +189,24 @@ def _measure_denoising_quality(
     prediction_stats = {}
     
     with torch.no_grad():
+        # Encode targets to latent space if VAE is provided
+        if vae_encoder is not None:
+            noise_for_vae = torch.randn(
+                targets.size(0), 4,
+                targets.size(2) // 8, targets.size(3) // 8,
+                device=device
+            )
+            targets_latent = vae_encoder(targets, noise_for_vae)
+            # Note: VAE encoder already scales by 0.18215
+        else:
+            targets_latent = targets
+        
         for t_val in timesteps_to_test:
-            t = torch.full((targets.size(0),), t_val, dtype=torch.long, device=device)
-            noise = torch.randn_like(targets)
+            t = torch.full((targets_latent.size(0),), t_val, dtype=torch.long, device=device)
+            noise = torch.randn_like(targets_latent)
             
             # Add noise at this timestep
-            noisy = diffusion.q_sample(targets, t, noise)
+            noisy = diffusion.q_sample(targets_latent, t, noise)
             
             # Predict noise
             pred_noise = model(noisy, t, features)
@@ -81,7 +224,6 @@ def _measure_denoising_quality(
             }
     
     return losses_by_timestep, prediction_stats
-
 
 
 def _setup_ddp(rank: int, world_size: int) -> torch.device:
@@ -133,14 +275,13 @@ def _run_validation(
     pipeline: StableDiffusionPipeline,
     diffusion: GaussianDiffusion,
     val_loader,
-    train_loader,  # Added: to sample from training set
-    device: torch.device,
+    device,
     clip_model,
     clip_preprocess,
     sample_dir: str,
     epoch: int,
+    vae_encoder=None,
     rank: int = 0,
-    max_batches: int = 10,  # Limit validation to first 10 batches
 ):
     if val_loader is None or clip_model is None or clip_preprocess is None:
         return None
@@ -160,55 +301,11 @@ def _run_validation(
     total_samples = 0
 
     autocast_ctx = (lambda: autocast(device_type="cuda")) if device.type == "cuda" else (lambda: nullcontext())
-    
-    # Save intermediates at key epochs: 5, 10, 20, 50, 100
-    save_intermediates = epoch in [5, 10, 20, 50, 100]
-    
-    if epoch in [5, 10, 20, 50, 100]:
-        print(f"[SD] Epoch {epoch}: Saving intermediate diffusion steps + train sample")
-    
-    if epoch == 5:
-        print(f"[SD] Validation: FULL GENERATION from pure noise using {cfg.SD_SAMPLE_STEPS} sampling steps")
 
-    # FIRST: Generate from one training sample to verify reconstruction ability
-    if rank == 0 and train_loader is not None:
-        with torch.no_grad():
-            with autocast_ctx():
-                # Get one batch from training set
-                train_iter = iter(train_loader)
-                _, train_features, train_targets, _ = next(train_iter)
-                train_features = train_features.to(device)
-                train_targets = train_targets.to(device)
-                
-                # Generate from pure noise (full generation like inference)
-                train_samples = pipeline.sample(train_features, steps=cfg.SD_SAMPLE_STEPS, save_intermediates=False)
-                
-                # Save training set generation
-                save_random_sample_pairs(
-                    train_targets,
-                    train_samples,
-                    train_targets,
-                    sample_dir,
-                    epoch,
-                    prefix="sd_train",
-                    num_samples=min(train_targets.size(0), 4),  # Save first 4
-                )
-                
-                # Compute metrics for training sample
-                train_psnr = calculate_psnr(train_samples, train_targets)
-                train_ssim = calculate_ssim(train_samples, train_targets)
-                train_clip_sum, train_clip_bs = compute_clip_metrics_batch(
-                    train_samples, train_targets, clip_model, clip_preprocess, device
-                )
-                train_clip = train_clip_sum / train_clip_bs if train_clip_bs > 0 else 0.0
-                
-                print(f"[SD] Train Sample Gen: PSNR={train_psnr:.2f} dB, SSIM={train_ssim:.4f}, CLIP={train_clip:.4f}")
-
-    # VALIDATION SET: Generate from pure noise (exactly like generation script)
+    # VALIDATION SET: Calculate metrics over entire validation dataset
+    # Features are [B, 9] tensor (9 continuous features normalized [0-1])
     for idx, (_, features, target_images, _) in enumerate(val_loader):
-        if idx >= max_batches: 
-            break
-            
+        
         features = features.to(device)
         targets = target_images.to(device)
 
@@ -216,21 +313,8 @@ def _run_validation(
             with autocast_ctx():
                 val_steps = cfg.SD_SAMPLE_STEPS
                 
-                # Always generate from pure noise (full generation)
-                if idx == 0 and save_intermediates:
-                    result = pipeline.sample(features, steps=val_steps, save_intermediates=True)
-                    if isinstance(result, tuple):
-                        samples, intermediates = result
-                        save_diffusion_intermediates(intermediates, sample_dir, epoch, sample_idx=0)
-                        
-                        # Print timestep schedule for debugging (epoch 5 only)
-                        if epoch == 5:
-                            timesteps = [t for t, _ in intermediates]
-                            print(f"[SD] Full generation saved intermediates at timesteps: {timesteps}")
-                    else:
-                        samples = result
-                else:
-                    samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
+                # Generate from pure noise (full generation)
+                samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
                 
         batch_size = targets.size(0)
 
@@ -257,7 +341,7 @@ def _run_validation(
             
             # Measure denoising quality at different timesteps (first batch only)
             timestep_losses, pred_stats = _measure_denoising_quality(
-                model, diffusion, features, targets, device,
+                model, diffusion, features, targets, device, vae_encoder,
                 timesteps_to_test=[100, 200, 400, 600, 800]
             )
 
@@ -294,32 +378,35 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         world_size=world_size,
     )
 
-    # Feature dimension calculation
-    feature_dim = train_loader.dataset.input_data.shape[1]
-    seq_len = getattr(cfg, 'FEATURE_SEQUENCE_LENGTH', 0)
+    # Safety check: ensure dataloaders are not empty
+    if len(train_loader) == 0:
+        raise ValueError(f"[SD] ERROR: Training dataloader is empty! Check dataset configuration.")
+    if val_loader and len(val_loader) == 0:
+        print(f"[SD] WARNING: Validation dataloader is empty!")
     
-    # If using sequences, adjust input_dim to account for positional encoding
-    if seq_len > 0 and seq_len != feature_dim:
-        # Strategy 2: [N, D+1] where +1 is position
-        feature_input_dim = feature_dim + 1
-    else:
-        # Strategy 1: [D, D] or no sequence [D]
-        feature_input_dim = feature_dim
-
-    use_cross_attn = getattr(cfg, "SD_USE_CROSS_ATTN", False)
-    base_model = StableDiffusionConditioned(
-        input_dim=feature_input_dim,
-        use_cross_attn=use_cross_attn,
-    )
     if rank == 0:
-        mode_str = "Cross-Attention" if use_cross_attn else "FiLM"
-        seq_info = f" with {seq_len} tokens" if seq_len > 0 else ""
-        print(f"[SD] Using {mode_str} conditioning for features{seq_info}")
-        print(f"[SD] Feature input dimension: {feature_input_dim} (original: {feature_dim})")
-    diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
+        print(f"[SD] Training batches per epoch: {len(train_loader)}")
+        print(f"[SD] Validation batches per epoch: {len(val_loader) if val_loader else 0}")
 
+    sample_train_features = train_loader.dataset.input_data[0]
+    sample_val_features = val_loader.dataset.input_data[0]
+    
+    print(f"[SD] Training features: {sample_train_features.shape}")
+    print(f"[SD] Validation features: {sample_val_features.shape}")
+    
+    # Load pretrained VAE encoder and decoder (frozen)
+    vae_encoder, vae_decoder = _load_vae(cfg.SD_VAE_CKPT, device)
+    
+    # Model works in latent space (4 channels) not RGB space
+    base_model = StableDiffusionConditioned(latent_channels=4,
+                                            emb_dim=cfg.SD_EMB_DIM,
+                                            base_channels=cfg.SD_BASE_CHANNELS)
+
+    diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
-    pipeline = StableDiffusionPipeline(model.module, diffusion)
+    
+    # Pipeline needs VAE for encoding/decoding
+    pipeline = StableDiffusionPipeline(model.module, diffusion, vae_encoder, vae_decoder)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.SD_LR)
     use_amp = device.type == "cuda"
@@ -328,7 +415,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 
     ema_helper = ModelEMA(base_model, cfg.SD_EMA_DECAY)
     ema_helper.to(device)
-    ema_pipeline = StableDiffusionPipeline(ema_helper.ema, diffusion) if rank == 0 else None
+    ema_pipeline = StableDiffusionPipeline(ema_helper.ema, diffusion, vae_encoder, vae_decoder) if rank == 0 else None
 
     start_epoch = 0
     if retrain and checkpoint_path:
@@ -390,22 +477,17 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         diffusion.train()
 
         start_time = time.time()
-        for batch_idx, (initial_images, features, target_images, _) in enumerate(train_loader):
+        for batch_idx, (_, features, target_images, _) in enumerate(train_loader):
+            # Features are [B, 9] vector - 9 continuous features normalized [0-1]
             features = features.to(device)
             targets = target_images.to(device)
+            
+            # Debug: Print first batch info
+            if batch_idx == 0 and rank == 0:
+                print(f"[SD] Epoch {epoch} - Processing batch {batch_idx}/{len(train_loader)}, features shape: {features.shape}")
 
             with amp_ctx():
-                cfg_dropout = getattr(cfg, "SD_CFG_DROPOUT", 0.1)
-                x0_loss_weight = getattr(cfg, "SD_X0_LOSS_WEIGHT", 0.0)
-                perceptual_weight = getattr(cfg, "SD_PERCEPTUAL_WEIGHT", 0.0)
-                
-                loss_dict = diffusion.p_loss(
-                    model, targets, features, 
-                    cfg_dropout=cfg_dropout,
-                    use_x0_loss=(x0_loss_weight > 0),
-                    x0_loss_weight=x0_loss_weight,
-                    feature_consistency_weight=perceptual_weight
-                )
+                loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder)
                 loss = loss_dict['loss']
                 loss_metrics = loss_dict.get('metrics', {})
 
@@ -437,6 +519,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                     f"[SD] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
                     f"Loss: {epoch_loss / steps:.4f} | Grad Norm: {grad_norm:.4f}"
                 )
+        
+        # End of batch loop - log completion
+        if rank == 0:
+            print(f"[SD] Epoch {epoch} - Completed all {len(train_loader)} batches in {time.time() - start_time:.2f}s")
 
         loss_tensor = torch.tensor([epoch_loss, steps], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -471,23 +557,17 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 val_pipeline,
                 diffusion,
                 val_loader,
-                train_loader,  # Pass train_loader for training sample generation
                 device,
                 clip_model,
                 clip_preprocess,
                 sample_dir,
                 epoch,
+                vae_encoder,
                 rank,
             )
-            print(f"[SD] Rank {rank} finished validation")
 
-        # Keep all ranks in sync after validation before next epoch
         if dist.is_initialized():
-            if rank == 0:
-                print(f"[SD] Rank {rank} entering second barrier after validation")
             dist.barrier()
-            if rank == 0:
-                print(f"[SD] Rank {rank} passed second barrier")
 
         if rank == 0:
             elapsed = time.time() - start_time

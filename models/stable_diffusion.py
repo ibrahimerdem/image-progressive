@@ -35,154 +35,88 @@ class TimeEmbedding(nn.Module):
         return self.mlp(emb)
 
 
-class FeatureProjector(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int):
+class FeatureEmbedding(nn.Module):
+    def __init__(self, num_features: int = 9, embed_dim: int = 512):
         super().__init__()
-        hidden = max(output_dim, input_dim * 2)
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden),
+        self.num_features = num_features
+        self.projection = nn.Sequential(
+            nn.Linear(num_features, num_features * 256),
             nn.SiLU(),
-            nn.Linear(hidden, output_dim),
+            nn.Linear(num_features * 256, num_features * embed_dim),
         )
-
+    
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            features: [B, input_dim] or [B, N, input_dim]
-        Returns:
-            [B, output_dim] or [B, N, output_dim]
-        """
-        return self.net(features)
+        B, F = features.shape
+        return self.projection(features)  # [B, num_features * embed_dim]
 
 
 class CrossAttention(nn.Module):
-    """Cross-attention layer for conditioning on sequence features."""
-    def __init__(self, query_dim: int, context_dim: int, heads: int = 8):
+    def __init__(self, query_dim: int, context_dim: int, heads: int = 8, chunk_size: int = 1024):
         super().__init__()
         self.heads = heads
         self.scale = (query_dim // heads) ** -0.5
-        
+        self.chunk_size = chunk_size
         self.to_q = nn.Linear(query_dim, query_dim, bias=False)
         self.to_k = nn.Linear(context_dim, query_dim, bias=False)
         self.to_v = nn.Linear(context_dim, query_dim, bias=False)
         self.to_out = nn.Linear(query_dim, query_dim)
         
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, C, H, W] - image features (queries)
-            context: [B, N, D] - conditioning features (keys, values)
-        Returns:
-            [B, C, H, W] - attended features
-        """
         B, C, H, W = x.shape
-        # Flatten spatial dimensions
-        x_flat = x.view(B, C, H * W).permute(0, 2, 1)  # [B, H*W, C]
-        
-        # Multi-head attention
-        q = self.to_q(x_flat)  # [B, H*W, C]
-        k = self.to_k(context)  # [B, N, C]
-        v = self.to_v(context)  # [B, N, C]
-        
-        # Reshape for multi-head
+        x_flat = x.view(B, C, H * W).permute(0, 2, 1)
+        q = self.to_q(x_flat)
+        k = self.to_k(context)
+        v = self.to_v(context)
         head_dim = C // self.heads
-        q = q.view(B, H * W, self.heads, head_dim).permute(0, 2, 1, 3)  # [B, heads, H*W, head_dim]
-        k = k.view(B, -1, self.heads, head_dim).permute(0, 2, 1, 3)  # [B, heads, N, head_dim]
-        v = v.view(B, -1, self.heads, head_dim).permute(0, 2, 1, 3)  # [B, heads, N, head_dim]
-        
-        # Attention scores
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, heads, H*W, N]
-        attn = F.softmax(attn, dim=-1)
-        
-        # Apply attention to values
-        out = torch.matmul(attn, v)  # [B, heads, H*W, head_dim]
-        out = out.permute(0, 2, 1, 3).contiguous().view(B, H * W, C)  # [B, H*W, C]
+        q = q.view(B, H * W, self.heads, head_dim).permute(0, 2, 1, 3)
+        k = k.view(B, -1, self.heads, head_dim).permute(0, 2, 1, 3)
+        v = v.view(B, -1, self.heads, head_dim).permute(0, 2, 1, 3)
+        num_queries = q.shape[2]
+        out_chunks = []
+        for i in range(0, num_queries, self.chunk_size):
+            end = min(i + self.chunk_size, num_queries)
+            q_chunk = q[:, :, i:end, :].contiguous()
+            attn_chunk = torch.matmul(q_chunk, k.transpose(-2, -1)) * self.scale
+            attn_chunk = F.softmax(attn_chunk, dim=-1)
+            out_chunk = torch.matmul(attn_chunk, v)
+            out_chunks.append(out_chunk)
+            del attn_chunk
+        out = torch.cat(out_chunks, dim=2)
+        del out_chunks
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, H * W, C)
         out = self.to_out(out)
-        
-        # Reshape back to image
         out = out.permute(0, 2, 1).view(B, C, H, W)
         return out
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, use_cross_attn: bool = False):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.norm1 = nn.GroupNorm(8, out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act = nn.SiLU()
-        
-        # Time conditioning via FiLM
         self.time_film = nn.Linear(time_dim, out_channels * 2)
-        
-        # Feature conditioning: FiLM or Cross-Attention
-        self.use_cross_attn = use_cross_attn
-        if use_cross_attn:
-            self.cross_attn = CrossAttention(out_channels, feature_dim, heads=8)
-            self.attn_norm = nn.GroupNorm(8, out_channels)
-        else:
-            # FiLM for single-vector features
-            self.feature_film = nn.Linear(feature_dim, out_channels * 2)
-        
+        self.cross_attn = CrossAttention(out_channels, feature_dim, heads=8, chunk_size=1024)
+        self.attn_norm = nn.GroupNorm(8, out_channels)
         if in_channels != out_channels:
             self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
             self.residual = nn.Identity()
-
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, C, H, W]
-            time_emb: [B, time_dim]
-            feature_emb: [B, feature_dim] or [B, N, feature_dim]
-        """
+    
+    def _forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
         h = self.act(self.norm1(self.conv1(x)))
         h = self.norm2(self.conv2(h))
-        
-        # Apply time conditioning via FiLM
         time_film = self.time_film(time_emb).unsqueeze(-1).unsqueeze(-1)
         time_scale, time_shift = time_film.chunk(2, dim=1)
         time_scale = torch.clamp(time_scale, -3.0, 3.0)
         h = h * (1 + time_scale) + time_shift
-        
-        # Apply feature conditioning
-        if self.use_cross_attn:
-            # Cross-attention for sequence features [B, N, D]
-            h = h + self.cross_attn(self.attn_norm(h), feature_emb)
-        else:
-            # FiLM for single-vector features [B, D]
-            feature_film = self.feature_film(feature_emb).unsqueeze(-1).unsqueeze(-1)
-            feature_scale, feature_shift = feature_film.chunk(2, dim=1)
-            feature_scale = torch.clamp(feature_scale, -5.0, 5.0)
-            h = h * (1 + feature_scale) + feature_shift
-        
+        h = h + self.cross_attn(self.attn_norm(h), feature_emb)
         return self.act(h + self.residual(x))
 
-
-class SimpleUNet(nn.Module):
-    def __init__(self, in_channels: int, base_channels: int, cond_dim: int):
-        super().__init__()
-        self.pool = nn.AvgPool2d(2)
-        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
-        self.inc = ResidualBlock(in_channels, base_channels, cond_dim)
-        self.down1 = ResidualBlock(base_channels, base_channels * 2, cond_dim)
-        self.down2 = ResidualBlock(base_channels * 2, base_channels * 4, cond_dim)
-        self.mid = ResidualBlock(base_channels * 4, base_channels * 4, cond_dim)
-        self.up3 = ResidualBlock(base_channels * 8, base_channels * 2, cond_dim)
-        self.up2 = ResidualBlock(base_channels * 4, base_channels, cond_dim)
-        self.up1 = ResidualBlock(base_channels * 2, base_channels, cond_dim)
-        self.out_conv = nn.Conv2d(base_channels, in_channels, kernel_size=1)
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        h1 = self.inc(x, cond)
-        h2 = self.down1(self.pool(h1), cond)
-        h3 = self.down2(self.pool(h2), cond)
-        middle = self.mid(self.pool(h3), cond)
-        u3 = self.up3(torch.cat([self.upsample(middle), h3], dim=1), cond)
-        u2 = self.up2(torch.cat([self.upsample(u3), h2], dim=1), cond)
-        u1 = self.up1(torch.cat([self.upsample(u2), h1], dim=1), cond)
-        return self.out_conv(u1)
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
+        return torch.utils.checkpoint.checkpoint(self._forward, x, time_emb, feature_emb, use_reentrant=False)
 
 
 class AttentionBlock(nn.Module):
@@ -201,9 +135,9 @@ class AttentionBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool, use_cross_attn: bool = False):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool):
         super().__init__()
-        self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim, use_cross_attn=use_cross_attn)
+        self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim)
         self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
         self.downsample = nn.AvgPool2d(2)
 
@@ -215,9 +149,9 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool, use_cross_attn: bool = False):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool):
         super().__init__()
-        self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim, use_cross_attn=use_cross_attn)
+        self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim)
         self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
 
@@ -232,36 +166,20 @@ class UpBlock(nn.Module):
 
 
 class ImprovedUNet(nn.Module):
-    def __init__(self, in_channels: int, base_channels: int, time_dim: int, feature_dim: int, use_cross_attn: bool = False):
+    def __init__(self, in_channels: int, base_channels: int, time_dim: int, feature_dim: int):
         super().__init__()
         self.time_dim = time_dim
         self.feature_dim = feature_dim
-        self.use_cross_attn = use_cross_attn
-        
-        # Initial conv
-        self.inc = ResidualBlock(in_channels, base_channels, time_dim, feature_dim, use_cross_attn=use_cross_attn)
-        
-        # Downsampling with cross-attention in deeper layers
-        self.down1 = DownBlock(base_channels, base_channels * 2, time_dim, feature_dim, attn=False, use_cross_attn=use_cross_attn)
-        self.down2 = DownBlock(base_channels * 2, base_channels * 4, time_dim, feature_dim, attn=True, use_cross_attn=use_cross_attn)
-        
-        # Middle with cross-attention
-        self.mid = ResidualBlock(base_channels * 4, base_channels * 4, time_dim, feature_dim, use_cross_attn=use_cross_attn)
-        
-        # Upsampling with cross-attention in deeper layers
-        self.up3 = UpBlock(base_channels * 8, base_channels * 2, time_dim, feature_dim, attn=True, use_cross_attn=use_cross_attn)
-        self.up2 = UpBlock(base_channels * 4, base_channels, time_dim, feature_dim, attn=False, use_cross_attn=use_cross_attn)
-        self.up1 = UpBlock(base_channels * 2, base_channels, time_dim, feature_dim, attn=False, use_cross_attn=use_cross_attn)
-        
+        self.inc = ResidualBlock(in_channels, base_channels, time_dim, feature_dim)
+        self.down1 = DownBlock(base_channels, base_channels * 2, time_dim, feature_dim, attn=False)
+        self.down2 = DownBlock(base_channels * 2, base_channels * 4, time_dim, feature_dim, attn=True)
+        self.mid = ResidualBlock(base_channels * 4, base_channels * 4, time_dim, feature_dim)
+        self.up3 = UpBlock(base_channels * 8, base_channels * 2, time_dim, feature_dim, attn=True)
+        self.up2 = UpBlock(base_channels * 4, base_channels, time_dim, feature_dim, attn=False)
+        self.up1 = UpBlock(base_channels * 2, base_channels, time_dim, feature_dim, attn=False)
         self.out_conv = nn.Conv2d(base_channels, in_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, C, H, W]
-            time_emb: [B, time_dim]
-            feature_emb: [B, feature_dim] or [B, N, feature_dim]
-        """
         h1 = self.inc(x, time_emb, feature_emb)
         d2, skip1 = self.down1(h1, time_emb, feature_emb)
         d3, skip2 = self.down2(d2, time_emb, feature_emb)
@@ -306,64 +224,29 @@ class GaussianDiffusion(nn.Module):
         model: nn.Module,
         x_start: torch.Tensor,
         features: torch.Tensor,
-        initial_image: Optional[torch.Tensor] = None,
-        cfg_dropout: float = 0.1,  # Classifier-free guidance dropout
-        use_x0_loss: bool = True,  # Add direct x0 prediction loss
-        x0_loss_weight: float = 0.1,  # Weight for x0 loss
-        feature_consistency_weight: float = 0.0,  # Feature consistency loss
+        vae_encoder=None,
     ) -> dict:
-        """
-        Returns dict with 'loss' and optional 'metrics' for logging
-        """
-        batch_size = x_start.size(0)
-        t = torch.randint(0, self.timesteps, (batch_size,), device=x_start.device)
-        noise = torch.randn_like(x_start)
-        x_t = self.q_sample(x_start, t, noise)
+        # If VAE encoder provided, encode images to latent space
+        if vae_encoder is not None:
+            with torch.no_grad():
+                # VAE encoder expects noise for reparameterization
+                noise_for_vae = torch.randn(
+                    x_start.size(0), 4, 
+                    x_start.size(2) // 8, x_start.size(3) // 8,
+                    device=x_start.device
+                )
+                # VAE encoder already scales by 0.18215 internally
+                x_start_latent = vae_encoder(x_start, noise_for_vae)
+        else:
+            x_start_latent = x_start
         
-        # Classifier-free guidance: randomly drop conditioning
-        # This forces the model to learn both conditional and unconditional denoising
-        if cfg_dropout > 0 and self.training:
-            mask = torch.rand(batch_size, device=features.device) > cfg_dropout
-            # Expand mask to match feature dimensions: [B] -> [B, 1, ...] 
-            while len(mask.shape) < len(features.shape):
-                mask = mask.unsqueeze(-1)
-            mask = mask.float()
-            features = features * mask  # Zero out features for some samples
-        
+        batch_size = x_start_latent.size(0)
+        t = torch.randint(0, self.timesteps, (batch_size,), device=x_start_latent.device)
+        noise = torch.randn_like(x_start_latent)
+        x_t = self.q_sample(x_start_latent, t, noise)
         pred_noise = model(x_t, t, features)
-        
-        # Primary loss: noise prediction
         noise_loss = F.mse_loss(pred_noise, noise)
-        total_loss = noise_loss
-        metrics = {'noise_loss': noise_loss.item()}
-        
-        # Auxiliary loss: predict x0 directly and compare to target
-        if use_x0_loss:
-            # Predict x0 from noisy image and predicted noise
-            alpha_bar_t = self._extract(self.alphas_cumprod, t, x_t.shape)
-            sqrt_alpha_bar_t = torch.sqrt(torch.clamp(alpha_bar_t, min=1e-8))
-            sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
-            
-            pred_x0 = (x_t - sqrt_one_minus_alpha_bar_t * pred_noise) / sqrt_alpha_bar_t
-            
-            # Direct comparison to target - this guides content generation!
-            x0_loss = F.mse_loss(pred_x0, x_start)
-            metrics['x0_loss'] = x0_loss.item()
-            total_loss = total_loss + x0_loss_weight * x0_loss
-            
-            # Feature consistency: predicted x0 should have similar visual characteristics
-            # Use simple perceptual consistency via normalized L1 in pixel space
-            if feature_consistency_weight > 0:
-                # Normalize to [0, 1] range for perceptual comparison
-                pred_x0_norm = torch.clamp((pred_x0 + 1) / 2, 0, 1)
-                x_start_norm = torch.clamp((x_start + 1) / 2, 0, 1)
-                
-                # Perceptual loss: L1 distance is more aligned with human perception than L2
-                perceptual_loss = F.l1_loss(pred_x0_norm, x_start_norm)
-                metrics['perceptual_loss'] = perceptual_loss.item()
-                total_loss = total_loss + feature_consistency_weight * perceptual_loss
-        
-        return {'loss': total_loss, 'metrics': metrics}
+        return {'loss': noise_loss, 'metrics': {'noise_loss': noise_loss.item()}}
 
     def sample(
         self,
@@ -371,154 +254,143 @@ class GaussianDiffusion(nn.Module):
         features: torch.Tensor,
         steps: Optional[int] = None,
         save_intermediates: bool = False,
-        eta: float = 0.0,  # 0 = deterministic DDIM, 1 = full DDPM
+        eta: float = 0.0,
+        latent_shape: tuple = None,  # (B, C, H, W) for latent space
     ):
-        """
-        DDIM sampling with proper timestep subsampling.
-        eta=0: deterministic DDIM
-        eta=1: stochastic DDPM
-        """
         steps = steps or self.timesteps
-        shape = (features.size(0), cfg.CHANNELS, cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH)
+        if latent_shape is None:
+            # Default to RGB image space (backward compatibility)
+            shape = (features.size(0), cfg.CHANNELS, cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH)
+        else:
+            shape = latent_shape
         img = torch.randn(shape, device=features.device)
         intermediates = []
-        
-        # Create timestep schedule - evenly subsample if steps < timesteps
         if steps < self.timesteps:
             c = self.timesteps // steps
             timestep_schedule = torch.arange(0, self.timesteps, c, dtype=torch.long)
             timestep_schedule = torch.flip(timestep_schedule, [0])
         else:
             timestep_schedule = torch.arange(self.timesteps - 1, -1, -1, dtype=torch.long)
-        
         for step_idx, timestep in enumerate(timestep_schedule):
             t = torch.full((shape[0],), timestep, dtype=torch.long, device=img.device)
-            
-            # Predict noise
-            epsilon = model(img, t, features)
-            
-            # Check for NaNs/Infs immediately after prediction
-            if torch.isnan(epsilon).any() or torch.isinf(epsilon).any():
-                print(f"[WARNING] NaN/Inf detected in epsilon at timestep {timestep}")
-                epsilon = torch.nan_to_num(epsilon, nan=0.0, posinf=1.0, neginf=-1.0)
-            
-            if torch.isnan(img).any() or torch.isinf(img).any():
-                print(f"[WARNING] NaN/Inf detected in img at timestep {timestep}")
-                img = torch.nan_to_num(img, nan=0.0, posinf=1.0, neginf=-1.0)
-            
-            # Get alpha values
+            with torch.no_grad() if not model.training else torch.enable_grad():
+                epsilon = model(img, t, features)
             alpha_bar_t = self._extract(self.alphas_cumprod, t, img.shape)
-            
-            # Get next timestep's alpha
             if step_idx < len(timestep_schedule) - 1:
                 t_prev = timestep_schedule[step_idx + 1]
                 alpha_bar_prev = self._extract(self.alphas_cumprod, 
                                                torch.full_like(t, t_prev), img.shape)
             else:
                 alpha_bar_prev = torch.ones_like(alpha_bar_t)
-            
-            # Predict x0 (the clean image) using DDIM formula
             sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
             sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
-            
-            # Clamp to prevent numerical instability
             sqrt_alpha_bar_t = torch.clamp(sqrt_alpha_bar_t, min=1e-8)
-            
             pred_x0 = (img - sqrt_one_minus_alpha_bar_t * epsilon) / sqrt_alpha_bar_t
-            # Don't clamp pred_x0 here - it destroys information during iterative denoising!
-            
-            # DDIM direction term
+            # Clamp predicted x0: use wider range for latents, tight range for images
+            if latent_shape is not None:
+                # Latent space: use much wider range (VAE latents can be large)
+                pred_x0 = torch.clamp(pred_x0, -20.0, 20.0)
+            else:
+                # Image space: standard pixel range
+                pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
             variance = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)
+            variance = torch.clamp(variance, min=0.0, max=1.0)
             sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
             sqrt_one_minus_alpha_bar_prev_minus_var = torch.sqrt(torch.clamp(1.0 - alpha_bar_prev - eta**2 * variance, min=0))
             dir_xt = sqrt_one_minus_alpha_bar_prev_minus_var * epsilon
-            
-            # Compute x_{t-1}
             x_prev = sqrt_alpha_bar_prev * pred_x0 + dir_xt
-            
-            # Add stochastic noise (controlled by eta)
-            if eta > 0 and step_idx < len(timestep_schedule) - 1:
-                noise = torch.randn_like(img)
-                sigma_t = eta * torch.sqrt(variance)
-                x_prev = x_prev + sigma_t * noise
-            
             img = x_prev
-            
-            # Save intermediate at key steps
             if save_intermediates and step_idx % 10 == 0:
-                intermediates.append((timestep.item(), torch.clamp(img.clone(), -1.0, 1.0)))
+                # Save intermediates without clamping (decoder will handle it)
+                intermediates.append((timestep.item(), img.clone()))
         
-        final = torch.clamp(img, -1.0, 1.0)
+        # Final output: don't clamp latents, let decoder handle it
+        final = img if latent_shape is not None else torch.clamp(img, -1.0, 1.0)
         if save_intermediates:
             return final, intermediates
         return final
 
 
 class StableDiffusionConditioned(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        cond_dim: Optional[int] = None,
-        use_cross_attn: bool = False,  # Enable cross-attention for sequence features
-    ):
+    def __init__(self, latent_channels=4, emb_dim=512, base_channels=64):
         super().__init__()
-        if cond_dim is None:
-            cond_dim = cfg.SD_EMB_DIM * 2
-        
+        cond_dim = emb_dim * 2
         time_dim = cond_dim
-        feature_dim = cond_dim
-        self.use_cross_attn = use_cross_attn
-        
-        self.feature_projection = FeatureProjector(input_dim, feature_dim)
+        feature_dim = 9 * 512
+        self.feature_projection = FeatureEmbedding(num_features=9, embed_dim=512)
         self.time_embedding = TimeEmbedding(time_dim)
+        # UNet works in latent space (4 channels) not RGB space (3 channels)
         self.unet = ImprovedUNet(
-            cfg.CHANNELS, 
-            base_channels=cfg.SD_BASE_CHANNELS, 
+            latent_channels,  # 4 channels for latent space
+            base_channels=base_channels, 
             time_dim=time_dim, 
             feature_dim=feature_dim,
-            use_cross_attn=use_cross_attn
         )
-        
-        # Learnable scales for conditioning
-        # Feature scale MUST be stronger - features determine content!
         self.time_scale = nn.Parameter(torch.tensor(1.0))
-        self.feature_scale = nn.Parameter(torch.tensor(3.0))  # Dominant over time
+        self.feature_scale = nn.Parameter(torch.tensor(3.0))
 
     def forward(
         self,
-        noisy_image: torch.Tensor,
+        noisy_latent: torch.Tensor,
         timesteps: torch.Tensor,
         features: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            noisy_image: [B, C, H, W]
-            timesteps: [B]
-            features: [B, input_dim] or [B, N, input_dim] for sequence features
-        Returns:
-            predicted noise: [B, C, H, W]
-        """
         time_emb = self.time_embedding(timesteps) * self.time_scale
-        
-        # Project features: handles both [B, D] and [B, N, D]
-        feature_emb = self.feature_projection(features) * self.feature_scale
-        
-        # Pass to UNet - it will handle both single-vector and sequence features
-        return self.unet(noisy_image, time_emb, feature_emb)
+        feature_emb = self.feature_projection(features).unsqueeze(1) * self.feature_scale
+        output = self.unet(noisy_latent, time_emb, feature_emb)
+        return output
 
 
 class StableDiffusionPipeline:
-    def __init__(self, model: StableDiffusionConditioned, schedule: GaussianDiffusion):
+    def __init__(self, model: StableDiffusionConditioned, schedule: GaussianDiffusion, 
+                 vae_encoder=None, vae_decoder=None):
         self.model = model
         self.schedule = schedule
+        self.vae_encoder = vae_encoder
+        self.vae_decoder = vae_decoder
 
     def sample(self, features: torch.Tensor, steps: Optional[int] = None, save_intermediates: bool = False):
-        return self.schedule.sample(self.model, features, steps, save_intermediates=save_intermediates)
+        # Sample in latent space if VAE is provided
+        if self.vae_encoder is not None and self.vae_decoder is not None:
+            # Latent space: 4 channels, H/8, W/8
+            batch_size = features.size(0)
+            latent_h = cfg.TARGET_HEIGHT // 8
+            latent_w = cfg.TARGET_WIDTH // 8
+            latent_shape = (batch_size, 4, latent_h, latent_w)
+            
+            # Generate latents
+            result = self.schedule.sample(
+                self.model, features, steps, 
+                save_intermediates=save_intermediates,
+                latent_shape=latent_shape
+            )
+            
+            if save_intermediates and isinstance(result, tuple):
+                latents, intermediates = result
+                # Decode final latents to images
+                images = self.vae_decoder(latents)
+                # Clamp decoded images to reasonable range for visualization
+                images = torch.clamp(images, -1.0, 1.0)
+                # Also decode intermediates
+                decoded_intermediates = []
+                for t, latent in intermediates:
+                    img = self.vae_decoder(latent)
+                    img = torch.clamp(img, -1.0, 1.0)
+                    decoded_intermediates.append((t, img))
+                return images, decoded_intermediates
+            else:
+                latents = result
+                # Decode latents to images
+                images = self.vae_decoder(latents)
+                # Clamp decoded images to reasonable range for visualization
+                images = torch.clamp(images, -1.0, 1.0)
+                return images
+        else:
+            # Original behavior: sample directly in image space
+            return self.schedule.sample(self.model, features, steps, save_intermediates=save_intermediates)
 
 
 class ModelEMA:
-    """Exponential Moving Average of model parameters for stable training."""
-    
     def __init__(self, model: nn.Module, decay: float = 0.9995):
         import copy
         self.decay = decay
@@ -528,7 +400,6 @@ class ModelEMA:
             param.requires_grad = False
 
     def update(self, source: nn.Module):
-        """Update EMA parameters with source model parameters."""
         src = source.module if isinstance(source, nn.parallel.DistributedDataParallel) else source
         with torch.no_grad():
             ema_params = dict(self.ema.named_parameters())
@@ -537,9 +408,7 @@ class ModelEMA:
                     ema_params[name].mul_(self.decay).add_(param, alpha=1.0 - self.decay)
 
     def state_dict(self):
-        """Return EMA model state dict."""
         return self.ema.state_dict()
 
     def to(self, device):
-        """Move EMA model to device."""
         self.ema.to(device)

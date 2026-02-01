@@ -11,24 +11,12 @@ import config as cfg
 
 
 class CustomDataset(Dataset):
-    """Dataset aligned with
 
-    data/
-        initial/
-        target/
-        training_features.csv
-        validation_features.csv
-        test_features.csv
-
-    CSV columns:
-        initial_filename,target_filename,feature_1,feature_2,...
-    """
-
-    def __init__(self, split: str = "train"):
+    def __init__(self, split: str = "train", use_simple_features: bool = False):
         assert split in {"train", "val", "test"}
         self.split = split
+        self.use_simple_features = use_simple_features
 
-        # Image & feature config
         self.img_width = cfg.IMG_WIDTH
         self.img_height = cfg.IMG_HEIGHT
         self.imgh_width = cfg.TARGET_WIDTH
@@ -45,7 +33,9 @@ class CustomDataset(Dataset):
         else:
             self.csv_path = cfg.TEST_CSV
 
-        self.input_data, self.initial_paths, self.target_paths, self.recipes = self._load_data()
+        self.feature_cols = cfg.FEATURE_COLUMNS
+        
+        self.input_data, self.initial_paths, self.target_paths = self._load_data()
 
         self.transform_initial = transforms.Compose([
             transforms.Resize((self.img_height, self.img_width)),
@@ -61,63 +51,33 @@ class CustomDataset(Dataset):
 
     def _load_data(self):
         df = pd.read_csv(self.csv_path)
-
-        # Optional recipe column used only for negative sampling
-        recipes = None
-        if "recipe" in df.columns:
-            recipes = df["recipe"].astype(np.int32).values
-
-        # Determine feature columns: everything except filenames (and recipe id)
-        if cfg.FEATURE_COLUMNS:
-            feature_cols = cfg.FEATURE_COLUMNS
-        else:
-            exclude_cols = {"initial_filename", "target_filename", "recipe"}
-            feature_cols = [c for c in df.columns if c not in exclude_cols]
-
-        input_data = df[feature_cols].astype(np.float32)
-
-        # Optional normalization to [-1, 1]
-        if cfg.FEATURE_NORMALIZATION and cfg.FEATURE_MAXS and cfg.FEATURE_MINS:
-            maxs = np.array(cfg.FEATURE_MAXS, dtype=np.float32)
-            mins = np.array(cfg.FEATURE_MINS, dtype=np.float32)
-            vals = input_data.values
-            vals = 2 * (vals - mins) / (maxs - mins) - 1
-            input_data = pd.DataFrame(vals, columns=feature_cols)
-
-        input_array = input_data.values.astype(np.float32)
-        initial_paths = df["initial_filename"].values
-        target_paths = df["target_filename"].values
-
-        return input_array, initial_paths, target_paths, recipes
+        
+        maxs = np.array(cfg.FEATURE_MAXS, dtype=np.float32)
+        mins = np.array(cfg.FEATURE_MINS, dtype=np.float32)
+        
+        input_data = []
+        initial_paths = []
+        target_paths = []
+        
+        for _, row in df.iterrows():
+            features = row[self.feature_cols].values.astype(np.float32)
+            # Normalize to [0, 1] range (continuous, not discretized)
+            scaled_feats = (features - mins) / (maxs - mins)
+            scaled_feats = np.clip(scaled_feats, 0, 1)
+            
+            input_data.append(scaled_feats)
+            initial_paths.append(row['initial_filename'])
+            target_paths.append(row['target_filename'])
+        
+        input_data = np.array(input_data, dtype=np.float32)
+        return input_data, initial_paths, target_paths
 
     def __len__(self):
-        return len(self.input_data)
+        return len(self.initial_paths)
 
     def __getitem__(self, idx):
-        input_feat = torch.tensor(self.input_data[idx])  # [D]
+        input_feat = torch.tensor(self.input_data[idx], dtype=torch.float32)
         
-        # Optionally expand to sequence [N, D] for cross-attention
-        seq_len = getattr(cfg, 'FEATURE_SEQUENCE_LENGTH', 0)
-        if seq_len > 0:
-            # Strategy 1: Repeat each feature as a token
-            # Creates [N, D] where each feature dimension becomes a separate token
-            D = input_feat.shape[0]
-            if seq_len == D:
-                # Each feature becomes a token: [D] -> [D, 1] -> [D, D] (one-hot-like)
-                input_feat_seq = torch.zeros(D, D)
-                for i in range(D):
-                    input_feat_seq[i, i] = input_feat[i]
-                    # Add global context to each token
-                    input_feat_seq[i] = input_feat_seq[i] + input_feat * 0.1
-                input_feat = input_feat_seq
-            else:
-                # Strategy 2: Create N tokens, each containing all D features with positional info
-                # [D] -> [N, D+1] where +1 is position encoding
-                input_feat_seq = input_feat.unsqueeze(0).repeat(seq_len, 1)  # [N, D]
-                # Add positional encoding
-                positions = torch.linspace(0, 1, seq_len).unsqueeze(1)  # [N, 1]
-                input_feat = torch.cat([input_feat_seq, positions], dim=1)  # [N, D+1]
-
         initial_path = os.path.join(self.initial_dir, self.initial_paths[idx])
         target_path = os.path.join(self.target_dir, self.target_paths[idx])
 
@@ -127,37 +87,16 @@ class CustomDataset(Dataset):
         initial_img = self.transform_initial(initial_img)
         target_img = self.transform_target(target_img)
 
-        # For training/validation, also return a mismatched (wrong) target
-        if self.split in {"train", "val"}:
-            num_samples = len(self.target_paths)
-
-            if self.recipes is not None:
-                current_recipe = self.recipes[idx]
-                diff_recipe_indices = np.where(self.recipes != current_recipe)[0]
-
-                if len(diff_recipe_indices) == 0:
-                    if num_samples > 1:
-                        wrong_idx = (idx + np.random.randint(1, num_samples)) % num_samples
-                    else:
-                        wrong_idx = idx
-                else:
-                    wrong_idx = int(np.random.choice(diff_recipe_indices))
-            else:
-                if num_samples > 1:
-                    wrong_idx = np.random.randint(0, num_samples - 1)
-                    if wrong_idx >= idx:
-                        wrong_idx += 1
-                else:
-                    wrong_idx = idx
-
-            wrong_target_path = os.path.join(self.target_dir, self.target_paths[wrong_idx])
-            wrong_img = Image.open(wrong_target_path).convert("RGB")
-            wrong_img = self.transform_target(wrong_img)
-
-            return initial_img, input_feat, target_img, wrong_img
-
-        # For test, no wrong image is needed
-        return initial_img, input_feat, target_img, target_img
+        num_samples = len(self.initial_paths)
+        wrong_idx = np.random.randint(0, num_samples - 1)
+        if wrong_idx >= idx:
+            wrong_idx += 1
+        
+        wrong_path = os.path.join(self.target_dir, self.target_paths[wrong_idx])
+        wrong_img = Image.open(wrong_path).convert("RGB")
+        wrong_img = self.transform_target(wrong_img)
+        
+        return initial_img, input_feat, target_img, wrong_img
 
 
 def create_dataloaders(
@@ -168,11 +107,9 @@ def create_dataloaders(
     rank: int = 0,
     world_size: int = 1,
 ):
-    """Build train/val/test loaders from the shared data/ layout."""
-
-    train_dataset = CustomDataset(split="train")
-    val_dataset = CustomDataset(split="val")
-    test_dataset = CustomDataset(split="test")
+    train_dataset = CustomDataset(split="train", use_simple_features=False)
+    val_dataset = CustomDataset(split="val", use_simple_features=False)
+    test_dataset = CustomDataset(split="test", use_simple_features=False)
 
     train_sampler = None
     val_sampler = None
