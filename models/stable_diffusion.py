@@ -50,6 +50,53 @@ class FeatureEmbedding(nn.Module):
         return self.projection(features)  # [B, num_features * embed_dim]
 
 
+class ImageEmbedding(nn.Module):
+    """Encodes initial image to embedding space for conditioning."""
+    def __init__(self, in_channels: int = 3, embed_dim: int = 512, image_size: int = 128):
+        super().__init__()
+        # Convolutional encoder to extract image features
+        # Input: [B, 3, 128, 128]
+        # Output: [B, embed_dim * 9] (to match feature embedding dimension)
+        self.encoder = nn.Sequential(
+            # 128x128 -> 64x64
+            nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            # 64x64 -> 32x32
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+            # 32x32 -> 16x16
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+            # 16x16 -> 8x8
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 512),
+            nn.SiLU(),
+            # 8x8 -> 4x4
+            nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 512),
+            nn.SiLU(),
+            # 4x4 -> 1x1 (global features)
+            nn.AdaptiveAvgPool2d(1),
+        )
+        
+        # Project to match feature embedding dimension (9 * 512 = 4608)
+        self.projection = nn.Sequential(
+            nn.Linear(512, 2048),
+            nn.SiLU(),
+            nn.Linear(2048, 9 * embed_dim),  # 4608 to match FeatureEmbedding
+        )
+    
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        # images: [B, 3, 128, 128]
+        features = self.encoder(images)  # [B, 512, 1, 1]
+        features = features.flatten(1)    # [B, 512]
+        embedding = self.projection(features)  # [B, 4608]
+        return embedding
+
+
 class CrossAttention(nn.Module):
     def __init__(self, query_dim: int, context_dim: int, heads: int = 8, chunk_size: int = 1024):
         super().__init__()
@@ -225,6 +272,7 @@ class GaussianDiffusion(nn.Module):
         x_start: torch.Tensor,
         features: torch.Tensor,
         vae_encoder=None,
+        initial_images: Optional[torch.Tensor] = None,
     ) -> dict:
         # If VAE encoder provided, encode images to latent space
         if vae_encoder is not None:
@@ -244,7 +292,7 @@ class GaussianDiffusion(nn.Module):
         t = torch.randint(0, self.timesteps, (batch_size,), device=x_start_latent.device)
         noise = torch.randn_like(x_start_latent)
         x_t = self.q_sample(x_start_latent, t, noise)
-        pred_noise = model(x_t, t, features)
+        pred_noise = model(x_t, t, features, initial_images)
         noise_loss = F.mse_loss(pred_noise, noise)
         return {'loss': noise_loss, 'metrics': {'noise_loss': noise_loss.item()}}
 
@@ -256,6 +304,7 @@ class GaussianDiffusion(nn.Module):
         save_intermediates: bool = False,
         eta: float = 0.0,
         latent_shape: tuple = None,  # (B, C, H, W) for latent space
+        initial_images: Optional[torch.Tensor] = None,
     ):
         steps = steps or self.timesteps
         if latent_shape is None:
@@ -274,7 +323,7 @@ class GaussianDiffusion(nn.Module):
         for step_idx, timestep in enumerate(timestep_schedule):
             t = torch.full((shape[0],), timestep, dtype=torch.long, device=img.device)
             with torch.no_grad() if not model.training else torch.enable_grad():
-                epsilon = model(img, t, features)
+                epsilon = model(img, t, features, initial_images)
             alpha_bar_t = self._extract(self.alphas_cumprod, t, img.shape)
             if step_idx < len(timestep_schedule) - 1:
                 t_prev = timestep_schedule[step_idx + 1]
@@ -312,13 +361,22 @@ class GaussianDiffusion(nn.Module):
 
 
 class StableDiffusionConditioned(nn.Module):
-    def __init__(self, latent_channels=4, emb_dim=512, base_channels=64):
+    def __init__(self, latent_channels=4, emb_dim=512, base_channels=64, use_initial_image=False):
         super().__init__()
         cond_dim = emb_dim * 2
         time_dim = cond_dim
         feature_dim = 9 * 512
+        self.use_initial_image = use_initial_image
+        
         self.feature_projection = FeatureEmbedding(num_features=9, embed_dim=512)
         self.time_embedding = TimeEmbedding(time_dim)
+        
+        # Optional: Image embedding for initial image conditioning
+        if use_initial_image:
+            self.image_projection = ImageEmbedding(in_channels=3, embed_dim=512, image_size=128)
+            # When using image, concatenate with features: 4608 + 4608 = 9216
+            feature_dim = 9 * 512 * 2
+        
         # UNet works in latent space (4 channels) not RGB space (3 channels)
         self.unet = ImprovedUNet(
             latent_channels,  # 4 channels for latent space
@@ -328,15 +386,26 @@ class StableDiffusionConditioned(nn.Module):
         )
         self.time_scale = nn.Parameter(torch.tensor(1.0))
         self.feature_scale = nn.Parameter(torch.tensor(3.0))
+        if use_initial_image:
+            self.image_scale = nn.Parameter(torch.tensor(1.0))
 
     def forward(
         self,
         noisy_latent: torch.Tensor,
         timesteps: torch.Tensor,
         features: torch.Tensor,
+        initial_images: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         time_emb = self.time_embedding(timesteps) * self.time_scale
-        feature_emb = self.feature_projection(features).unsqueeze(1) * self.feature_scale
+        feature_emb = self.feature_projection(features) * self.feature_scale  # [B, 4608]
+        
+        # Optionally concatenate initial image embedding
+        if self.use_initial_image and initial_images is not None:
+            image_emb = self.image_projection(initial_images) * self.image_scale  # [B, 4608]
+            # Concatenate: [B, 4608] + [B, 4608] = [B, 9216]
+            feature_emb = torch.cat([feature_emb, image_emb], dim=1)
+        
+        feature_emb = feature_emb.unsqueeze(1)  # [B, 1, feature_dim]
         output = self.unet(noisy_latent, time_emb, feature_emb)
         return output
 
@@ -349,7 +418,8 @@ class StableDiffusionPipeline:
         self.vae_encoder = vae_encoder
         self.vae_decoder = vae_decoder
 
-    def sample(self, features: torch.Tensor, steps: Optional[int] = None, save_intermediates: bool = False):
+    def sample(self, features: torch.Tensor, steps: Optional[int] = None, save_intermediates: bool = False,
+               initial_images: Optional[torch.Tensor] = None):
         # Sample in latent space if VAE is provided
         if self.vae_encoder is not None and self.vae_decoder is not None:
             # Latent space: 4 channels, H/8, W/8
@@ -362,7 +432,8 @@ class StableDiffusionPipeline:
             result = self.schedule.sample(
                 self.model, features, steps, 
                 save_intermediates=save_intermediates,
-                latent_shape=latent_shape
+                latent_shape=latent_shape,
+                initial_images=initial_images
             )
             
             if save_intermediates and isinstance(result, tuple):
@@ -387,7 +458,9 @@ class StableDiffusionPipeline:
                 return images
         else:
             # Original behavior: sample directly in image space
-            return self.schedule.sample(self.model, features, steps, save_intermediates=save_intermediates)
+            return self.schedule.sample(self.model, features, steps, 
+                                       save_intermediates=save_intermediates,
+                                       initial_images=initial_images)
 
 
 class ModelEMA:

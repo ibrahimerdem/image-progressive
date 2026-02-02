@@ -20,7 +20,7 @@ FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_ra
 FEATURE_NORMALIZATION = True
 FEATURE_MINS = [5.6,15,0,16.87,-1.91,-16.75,1,1,1000]
 FEATURE_MAXS = [30,42,95,40,1.62,-0.5,4,7,7000]
-INITIAL_IMAGE = False
+INITIAL_IMAGE = True
 ENCODER_PATH = "checkpoints/encoder_epoch_50.pth"
 FREEZE_ENCODER = True
 

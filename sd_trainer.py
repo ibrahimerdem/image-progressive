@@ -2,6 +2,7 @@ import argparse
 import os
 import time
 from contextlib import nullcontext
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -170,6 +171,7 @@ def _measure_denoising_quality(
     device: torch.device,
     vae_encoder=None,
     timesteps_to_test: list = [100, 200, 400, 600, 800],
+    initial_images: Optional[torch.Tensor] = None,
 ):
     """
     Measure model's denoising ability at different noise levels.
@@ -208,8 +210,8 @@ def _measure_denoising_quality(
             # Add noise at this timestep
             noisy = diffusion.q_sample(targets_latent, t, noise)
             
-            # Predict noise
-            pred_noise = model(noisy, t, features)
+            # Predict noise (pass initial images if provided)
+            pred_noise = model(noisy, t, features, initial_images)
             
             # Calculate MSE
             mse = F.mse_loss(pred_noise, noise).item()
@@ -304,8 +306,9 @@ def _run_validation(
 
     # VALIDATION SET: Calculate metrics over entire validation dataset
     # Features are [B, 9] tensor (9 continuous features normalized [0-1])
-    for idx, (_, features, target_images, _) in enumerate(val_loader):
+    for idx, (initial_images, features, target_images, _) in enumerate(val_loader):
         
+        initial_images = initial_images.to(device)
         features = features.to(device)
         targets = target_images.to(device)
 
@@ -314,7 +317,12 @@ def _run_validation(
                 val_steps = cfg.SD_SAMPLE_STEPS
                 
                 # Generate from pure noise (full generation)
-                samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
+                # Pass initial images if config flag is enabled
+                if cfg.INITIAL_IMAGE:
+                    samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
+                                            initial_images=initial_images)
+                else:
+                    samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
                 
         batch_size = targets.size(0)
 
@@ -327,12 +335,12 @@ def _run_validation(
         total_clip += clip_sum
         clip_count += clip_bs
 
-        # Save sample generated images with target pairs (only on rank 0)
+        # Save sample generated images as triplets: initial-generated-truth (only on rank 0)
         if idx == 0 and rank == 0:
             save_random_sample_pairs(
-                targets,
-                samples,
-                targets,
+                initial_images,  # Show initial image
+                samples,         # Show generated image
+                targets,         # Show ground truth
                 sample_dir,
                 epoch,
                 prefix="sd_val",
@@ -340,10 +348,17 @@ def _run_validation(
             )
             
             # Measure denoising quality at different timesteps (first batch only)
-            timestep_losses, pred_stats = _measure_denoising_quality(
-                model, diffusion, features, targets, device, vae_encoder,
-                timesteps_to_test=[100, 200, 400, 600, 800]
-            )
+            if cfg.INITIAL_IMAGE:
+                timestep_losses, pred_stats = _measure_denoising_quality(
+                    model, diffusion, features, targets, device, vae_encoder,
+                    timesteps_to_test=[100, 200, 400, 600, 800],
+                    initial_images=initial_images
+                )
+            else:
+                timestep_losses, pred_stats = _measure_denoising_quality(
+                    model, diffusion, features, targets, device, vae_encoder,
+                    timesteps_to_test=[100, 200, 400, 600, 800]
+                )
 
     if total_samples == 0:
         return None
@@ -398,9 +413,16 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     vae_encoder, vae_decoder = _load_vae(cfg.SD_VAE_CKPT, device)
     
     # Model works in latent space (4 channels) not RGB space
+    # Enable initial image conditioning if config flag is set
     base_model = StableDiffusionConditioned(latent_channels=4,
                                             emb_dim=cfg.SD_EMB_DIM,
-                                            base_channels=cfg.SD_BASE_CHANNELS)
+                                            base_channels=cfg.SD_BASE_CHANNELS,
+                                            use_initial_image=cfg.INITIAL_IMAGE)
+    
+    if cfg.INITIAL_IMAGE:
+        print(f"[SD] Initial image conditioning ENABLED (feature_dim will be 9216)")
+    else:
+        print(f"[SD] Initial image conditioning DISABLED (feature_dim will be 4608)")
 
     diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
@@ -477,17 +499,25 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         diffusion.train()
 
         start_time = time.time()
-        for batch_idx, (_, features, target_images, _) in enumerate(train_loader):
+        for batch_idx, (initial_images, features, target_images, _) in enumerate(train_loader):
             # Features are [B, 9] vector - 9 continuous features normalized [0-1]
+            initial_images = initial_images.to(device)
             features = features.to(device)
             targets = target_images.to(device)
             
             # Debug: Print first batch info
             if batch_idx == 0 and rank == 0:
                 print(f"[SD] Epoch {epoch} - Processing batch {batch_idx}/{len(train_loader)}, features shape: {features.shape}")
+                if cfg.INITIAL_IMAGE:
+                    print(f"[SD] Initial images shape: {initial_images.shape}")
 
             with amp_ctx():
-                loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder)
+                # Pass initial images if config flag is enabled
+                if cfg.INITIAL_IMAGE:
+                    loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder,
+                                                initial_images=initial_images)
+                else:
+                    loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder)
                 loss = loss_dict['loss']
                 loss_metrics = loss_dict.get('metrics', {})
 
