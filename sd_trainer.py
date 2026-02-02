@@ -338,9 +338,9 @@ def _run_validation(
         # Save sample generated images as triplets: initial-generated-truth (only on rank 0)
         if idx == 0 and rank == 0:
             save_random_sample_pairs(
-                initial_images,  # Show initial image
-                samples,         # Show generated image
-                targets,         # Show ground truth
+                initial_images,  
+                samples,         
+                targets,         
                 sample_dir,
                 epoch,
                 prefix="sd_val",
