@@ -11,9 +11,8 @@ TEST_CSV = os.path.join(DATA_DIR, "test_features.csv")
 # Dataset
 IMG_WIDTH = 128
 IMG_HEIGHT = 128
-# Output image resolution
-TARGET_WIDTH = 768
-TARGET_HEIGHT = 768
+TARGET_WIDTH = 512
+TARGET_HEIGHT = 512
 CHANNELS = 3
 EMBEDDING_DIM = 128
 EMBEDDING_OUT_DIM = 256
@@ -32,7 +31,7 @@ FIXED_D_LR = 0.0001
 BCE_FACTOR = 1.0
 L1_FACTOR = 50.0
 L2_FACTOR = 150.0
-VAL_EPOCH = 5
+VAL_EPOCH = 2
 
 # Devices for training (indices as seen by the system)
 # Used by run_train.sh and DDP world size.
@@ -40,6 +39,11 @@ DEVICE_IDS = [0, 1]
 WORLD_SIZE = len(DEVICE_IDS)
 
 # Per-GPU batch size and dataloader workers
-BATCH_SIZE_PER_GPU = 8
+BATCH_SIZE_PER_GPU = 4
 NUM_WORKERS = 4
+
+# Debugging
+# Set True to get a detailed autograd stack trace when backward fails due to
+# in-place ops / NaNs. This will slow training significantly.
+DETECT_ANOMALY = False
 

@@ -122,35 +122,47 @@ def visualize_results(
     num_samples=4,
     save_path=None
 ):
-    num_samples = min(num_samples, initial_images.shape[0])
+    # Handle case when initial_images is None
+    if initial_images is not None:
+        num_samples = min(num_samples, initial_images.shape[0])
+        num_cols = 3
+    else:
+        num_samples = min(num_samples, generated_images.shape[0])
+        num_cols = 2
     
-    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
+    fig, axes = plt.subplots(num_samples, num_cols, figsize=(4 * num_cols, 4 * num_samples))
     if num_samples == 1:
         axes = axes.reshape(1, -1)
     
     for i in range(num_samples):
+        col_idx = 0
+        
+        # Show initial image if available
+        if initial_images is not None:
+            initial = denormalize_image(initial_images[i]).cpu().permute(1, 2, 0).numpy()
+            initial = np.clip(initial, 0, 1)
+            axes[i, col_idx].imshow(initial)
+            axes[i, col_idx].set_title('Initial Image')
+            axes[i, col_idx].axis('off')
+            col_idx += 1
+        
         # Denormalize images
-        initial = denormalize_image(initial_images[i]).cpu().permute(1, 2, 0).numpy()
         generated = denormalize_image(generated_images[i]).cpu().permute(1, 2, 0).numpy()
         target = denormalize_image(target_images[i]).cpu().permute(1, 2, 0).numpy()
         
         # Clip to [0, 1]
-        initial = np.clip(initial, 0, 1)
         generated = np.clip(generated, 0, 1)
         target = np.clip(target, 0, 1)
         
-        # Plot
-        axes[i, 0]. imshow(initial)
-        axes[i, 0].set_title('Initial Image')
-        axes[i, 0].axis('off')
+        # Plot generated and target
+        axes[i, col_idx].imshow(generated)
+        axes[i, col_idx].set_title('Generated Image')
+        axes[i, col_idx].axis('off')
+        col_idx += 1
         
-        axes[i, 1].imshow(generated)
-        axes[i, 1].set_title('Generated Image')
-        axes[i, 1].axis('off')
-        
-        axes[i, 2].imshow(target)
-        axes[i, 2]. set_title('Target Image')
-        axes[i, 2]. axis('off')
+        axes[i, col_idx].imshow(target)
+        axes[i, col_idx].set_title('Target Image')
+        axes[i, col_idx].axis('off')
     
     plt.tight_layout()
     
@@ -266,7 +278,8 @@ def compute_clip_metrics_batch(fake_images, target_images, model, preprocess, de
     batch_size = fake_images.size(0)
     sim_sum = 0.0
     for i in range(batch_size):
-        sim_sum += calculate_clip_similarity(fake_images[i], target_images[i], model, preprocess, device)
+        fake_sim = calculate_clip_similarity(fake_images[i], target_images[i], model, preprocess, device)
+        sim_sum += fake_sim
     return sim_sum, batch_size
 
 
@@ -282,14 +295,19 @@ def save_random_sample_pairs(
 
     os.makedirs(sample_dir, exist_ok=True)
 
-    batch_size = initial_images.size(0)
+    # Handle case when initial_images is None
+    if initial_images is not None:
+        batch_size = initial_images.size(0)
+    else:
+        batch_size = generated_images.size(0)
+    
     num = min(num_samples, batch_size)
 
     indices = list(range(batch_size))
     random.shuffle(indices)
     indices = indices[:num]
 
-    initials_subset = initial_images[indices]
+    initials_subset = initial_images[indices] if initial_images is not None else None
     generated_subset = generated_images[indices]
     target_subset = target_images[indices]
 

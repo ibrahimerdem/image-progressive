@@ -1,13 +1,15 @@
 import argparse
 import time
 import os
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
+import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.amp import autocast, GradScaler
 from models.multimodal_basic import Generator, Discriminator
-from models.image_encoder import load_trained_encoder
 from utils.training import (
     calculate_psnr,
     calculate_ssim,
@@ -19,6 +21,22 @@ from utils.training import (
 )
 from utils.dataset import create_dataloaders
 import config as cfg
+
+
+def _configure_torch_perf():
+    """Enable safe performance knobs for conv-heavy models.
+
+    - cudnn.benchmark: speeds up fixed-size convolutions
+    - TF32: improves matmul/conv throughput on Ampere+ with minimal quality impact
+    """
+    cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 
 def train(
@@ -34,6 +52,8 @@ def train(
     version=None
 ):
 
+    _configure_torch_perf()
+
     save_dir = "checkpoints"
     log_dir = os.path.join(save_dir, "logs")
     sample_dir = os.path.join(save_dir, "samples")
@@ -48,7 +68,7 @@ def train(
 
     metrics_logger = MetricsLogger(log_dir, f"{model_name}_{ver}_training_log.csv")
 
-    criterion = nn.BCELoss().to(device)
+    criterion = nn.BCEWithLogitsLoss().to(device)  # Changed for AMP compatibility
     l2_loss = nn.MSELoss().to(device)
     l1_loss = nn.L1Loss().to(device)
 
@@ -83,30 +103,26 @@ def train(
         for idx, (input_image, input_feat, target_image, wrong_image) in enumerate(train_loader):
             batch_time = time.time()
 
-            # If the generator uses an image encoder, pass the image; otherwise None
-            if generator.module.image_encoder if isinstance(generator, nn.DataParallel) else generator.image_encoder is not None:
-                input_image = input_image.to(device)
-            else:
-                input_image = None
-
+            # Move data to device
+            input_image = input_image.to(device) if cfg.INITIAL_IMAGE else None
             images = target_image.to(device)
             wrong_images = wrong_image.to(device)
-            embeddings = input_feat.to(device)
+            features = input_feat.to(device)  # Now called "features" not "embeddings"
             batch_size = images.size(0)
 
             # --- Train Discriminator ---
             d_optimizer.zero_grad()
 
             noise = torch.randn(batch_size, cfg.NOISE_DIM, 1, 1, device=device)
-            fake_images = generator(noise, embeddings, input_image)
+            fake_images = generator(noise, features, input_image)
 
-            real_out, real_act = discriminator(images, embeddings)
+            real_out, real_act = discriminator(images, features)
             d_loss_real = criterion(real_out, torch.full_like(real_out, 1.0, device=device))
 
-            wrong_out, _ = discriminator(wrong_images, embeddings)
+            wrong_out, _ = discriminator(wrong_images, features)
             d_loss_wrong = criterion(wrong_out, torch.full_like(wrong_out, 0.0, device=device))
 
-            fake_out, _ = discriminator(fake_images.detach(), embeddings)
+            fake_out, _ = discriminator(fake_images.detach(), features)
             d_loss_fake = criterion(fake_out, torch.full_like(fake_out, 0.0, device=device))
 
             d_loss = d_loss_real + d_loss_wrong + d_loss_fake
@@ -117,10 +133,10 @@ def train(
             g_optimizer.zero_grad()
 
             noise = torch.randn(batch_size, cfg.NOISE_DIM, 1, 1, device=device)
-            fake_images = generator(noise, embeddings, input_image)
+            fake_images = generator(noise, features, input_image)
 
-            out_fake, act_fake = discriminator(fake_images, embeddings)
-            out_real, act_real = discriminator(images, embeddings)
+            out_fake, act_fake = discriminator(fake_images, features)
+            out_real, act_real = discriminator(images, features)
 
             g_bce = cfg.BCE_FACTOR * criterion(out_fake, torch.full_like(out_fake, 1.0, device=device))
             g_l1 = cfg.L1_FACTOR * l1_loss(fake_images, images)
@@ -156,17 +172,14 @@ def train(
 
             with torch.no_grad():
                 for val_batch_idx, (v_input_image, v_input_feat, v_target_image, _) in enumerate(val_loader):
-                    if generator.module.image_encoder if isinstance(generator, nn.DataParallel) else generator.image_encoder is not None:
-                        v_input_image = v_input_image.to(device)
-                    else:
-                        v_input_image = None
-
+                    # Move data to device
+                    v_input_image = v_input_image.to(device) if cfg.INITIAL_IMAGE else None
                     v_images = v_target_image.to(device)
-                    v_embeddings = v_input_feat.to(device)
+                    v_features = v_input_feat.to(device)  # Now called "features"
                     bs = v_images.size(0)
 
                     noise = torch.randn(bs, 128, 1, 1, device=device)
-                    v_fake = generator(noise, v_embeddings, v_input_image)
+                    v_fake = generator(noise, v_features, v_input_image)
 
                     # Reconstruction L1
                     val_l1 = l1_loss(v_fake, v_images).item()
@@ -273,8 +286,13 @@ def _ddp_train_worker(
     name=None,
     version=None,
 ):
+    _configure_torch_perf()
     _setup_ddp(rank, world_size)
     device = torch.device(f"cuda:{rank}")
+
+    # Optional: helps pinpoint the exact op that causes inplace/version errors.
+    if getattr(cfg, "DETECT_ANOMALY", False):
+        torch.autograd.set_detect_anomaly(True)
 
     train_loader, val_loader, _ = create_dataloaders(
         batch_size=batch_size,
@@ -291,41 +309,36 @@ def _ddp_train_worker(
     else:
         feature_dim = len(getattr(cfg, "FEATURE_COLUMNS", []))
 
-    image_encoder = None
-    if cfg.INITIAL_IMAGE:
-        image_encoder = load_trained_encoder(
-            cfg.ENCODER_PATH,
-            device=device,
-            feature_dim=512,
-        )
-
+    # Initialize models with SD-style embeddings
     generator = Generator(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
-        embed_dim=cfg.EMBEDDING_DIM,
-        embed_out_dim=cfg.EMBEDDING_OUT_DIM,
-        input_dim=feature_dim,
+        num_features=feature_dim,  # Number of input features (9)
+        embed_dim=512,  # SD embedding dimension
         initial_image=cfg.INITIAL_IMAGE,
-        image_encoder=image_encoder,
-        freeze_encoder=cfg.FREEZE_ENCODER,
     ).to(device)
     discriminator = Discriminator(
         channels=cfg.CHANNELS,
-        embed_dim=cfg.EMBEDDING_DIM,
-        embed_out_dim=cfg.EMBEDDING_OUT_DIM,
-        input_dim=feature_dim,
+        num_features=feature_dim,  # Number of input features (9)
+        embed_dim=512,  # SD embedding dimension
     ).to(device)
 
-    # Convert BatchNorm to SyncBatchNorm for DDP
-    generator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(generator)
-    discriminator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(discriminator)
+    # NOTE: SyncBatchNorm can introduce additional collectives during forward passes.
+    # In this project it has shown a tendency to hang around validation/checkpoint
+    # boundaries, so we keep standard BatchNorm under DDP.
 
-    criterion = nn.BCELoss().to(device)
+    criterion = nn.BCEWithLogitsLoss().to(device)  # Changed for AMP compatibility
     l2_loss = nn.MSELoss().to(device)
     l1_loss = nn.L1Loss().to(device)
 
     g_optimizer = torch.optim.Adam(generator.parameters(), lr=cfg.FIXED_G_LR, betas=(0.5, 0.999))
     d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=cfg.FIXED_D_LR, betas=(0.5, 0.999))
+
+    # Setup AMP (Automatic Mixed Precision)
+    use_amp = device.type == "cuda"
+    g_scaler = GradScaler("cuda") if use_amp else None
+    d_scaler = GradScaler("cuda") if use_amp else None
+    amp_ctx = lambda: autocast(device_type="cuda") if use_amp else nullcontext()
 
     start_epoch = 0
     if retrain and checkpoint_path:
@@ -342,8 +355,8 @@ def _ddp_train_worker(
         elif rank == 0:
             print(f"[DDP] Checkpoint path {checkpoint_path} not found, starting from scratch")
 
-    generator = DDP(generator, device_ids=[rank], find_unused_parameters=True)
-    discriminator = DDP(discriminator, device_ids=[rank])
+    generator = DDP(generator, device_ids=[rank], find_unused_parameters=False)
+    discriminator = DDP(discriminator, device_ids=[rank], find_unused_parameters=False)
 
     save_dir = "checkpoints"
     log_dir = os.path.join(save_dir, "logs")
@@ -357,12 +370,15 @@ def _ddp_train_worker(
     ver = version if version else "ddp"
 
     metrics_logger = None
+    clip_model = None
+    clip_preprocess = None
+    
     if rank == 0:
         metrics_logger = MetricsLogger(log_dir, f"{model_name}_{ver}_training_log.csv")
-
-    clip_model, clip_preprocess = load_clip_model(device)
+        clip_model, clip_preprocess = load_clip_model(device)
 
     for epoch in range(start_epoch + 1, start_epoch + num_epochs + 1):
+        print(f"[GAN] Rank {rank} starting epoch {epoch}")
         if hasattr(train_loader, "sampler") and isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
 
@@ -377,52 +393,78 @@ def _ddp_train_worker(
         for input_image, input_feat, target_image, wrong_image in train_loader:
             batch_time = time.time()
 
-            input_image = input_image.to(device)
-            images = target_image.to(device)
-            wrong_images = wrong_image.to(device)
-            embeddings = input_feat.to(device)
+            # Move data to device
+            input_image = input_image.to(device, non_blocking=True) if cfg.INITIAL_IMAGE else None
+            images = target_image.to(device, non_blocking=True)
+            wrong_images = wrong_image.to(device, non_blocking=True)
+            features = input_feat.to(device, non_blocking=True)  # Now called "features"
             batch_size_local = images.size(0)
 
             # --- Train Discriminator ---
-            d_optimizer.zero_grad()
+            d_optimizer.zero_grad(set_to_none=True)
 
-            noise = torch.randn(batch_size_local, cfg.NOISE_DIM, 1, 1, device=device)
-            fake_images = generator(noise, embeddings, input_image)
+            with amp_ctx():
+                noise = torch.randn(batch_size_local, cfg.NOISE_DIM, 1, 1, device=device)
+                fake_images = generator(noise, features, input_image)
 
-            real_out, _ = discriminator(images, embeddings)
-            d_loss_real = criterion(real_out, torch.full_like(real_out, 1.0, device=device))
+                real_out, _ = discriminator(images, features)
+                d_loss_real = criterion(real_out, torch.full_like(real_out, 1.0, device=device))
 
-            wrong_out, _ = discriminator(wrong_images, embeddings)
-            d_loss_wrong = criterion(wrong_out, torch.full_like(wrong_out, 0.0, device=device))
+                wrong_out, _ = discriminator(wrong_images, features)
+                d_loss_wrong = criterion(wrong_out, torch.full_like(wrong_out, 0.0, device=device))
 
-            fake_out, _ = discriminator(fake_images.detach(), embeddings)
-            d_loss_fake = criterion(fake_out, torch.full_like(fake_out, 0.0, device=device))
+                fake_out, _ = discriminator(fake_images.detach(), features)
+                d_loss_fake = criterion(fake_out, torch.full_like(fake_out, 0.0, device=device))
 
-            d_loss = d_loss_real + d_loss_wrong + d_loss_fake
-            d_loss.backward()
-            d_optimizer.step()
+                d_loss = d_loss_real + d_loss_wrong + d_loss_fake
+            
+            if d_scaler is not None:
+                d_scaler.scale(d_loss).backward()
+                d_scaler.step(d_optimizer)
+                d_scaler.update()
+            else:
+                d_loss.backward()
+                d_optimizer.step()
+            
+            # Clear discriminator gradients and intermediate tensors
+            del fake_images, real_out, wrong_out, fake_out
+            del d_loss_real, d_loss_wrong, d_loss_fake
 
             # --- Train Generator ---
-            g_optimizer.zero_grad()
+            g_optimizer.zero_grad(set_to_none=True)
 
-            noise = torch.randn(batch_size_local, cfg.NOISE_DIM, 1, 1, device=device)
-            fake_images = generator(noise, embeddings, input_image)
+            with amp_ctx():
+                noise = torch.randn(batch_size_local, cfg.NOISE_DIM, 1, 1, device=device)
+                fake_images = generator(noise, features, input_image)
 
-            out_fake, act_fake = discriminator(fake_images, embeddings)
-            out_real, act_real = discriminator(images, embeddings)
+                out_fake, act_fake = discriminator(fake_images, features)
+                out_real, act_real = discriminator(images, features)
 
-            g_bce = cfg.BCE_FACTOR * criterion(out_fake, torch.full_like(out_fake, 1.0, device=device))
-            g_l1 = cfg.L1_FACTOR * l1_loss(fake_images, images)
-            g_l2 = cfg.L2_FACTOR * l2_loss(torch.mean(act_fake, 0), torch.mean(act_real, 0).detach())
+                g_bce = cfg.BCE_FACTOR * criterion(out_fake, torch.full_like(out_fake, 1.0, device=device))
+                g_l1 = cfg.L1_FACTOR * l1_loss(fake_images, images)
+                g_l2 = cfg.L2_FACTOR * l2_loss(torch.mean(act_fake, 0), torch.mean(act_real, 0).detach())
 
-            g_loss = g_bce + g_l1 + g_l2
-            g_loss.backward()
-            g_optimizer.step()
+                g_loss = g_bce + g_l1 + g_l2
+            
+            if g_scaler is not None:
+                g_scaler.scale(g_loss).backward()
+                g_scaler.step(g_optimizer)
+                g_scaler.update()
+            else:
+                g_loss.backward()
+                g_optimizer.step()
 
             epoch_d_loss += d_loss.item()
             epoch_g_loss += g_loss.item()
             num_batches += 1
+            
+            # Explicit memory cleanup after each batch
+            del fake_images, out_fake, act_fake, out_real, act_real
+            del g_bce, g_l1, g_l2, g_loss, d_loss
 
+        # End of batch loop
+        print(f"[GAN] Rank {rank} Epoch {epoch} - Completed all {len(train_loader)} batches in {time.time() - start_time:.2f}s")
+        
         # All-reduce train losses across ranks
         loss_tensor = torch.tensor([epoch_d_loss, epoch_g_loss, num_batches], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -430,76 +472,119 @@ def _ddp_train_worker(
         avg_d_loss = total_d_loss / max(total_batches, 1)
         avg_g_loss = total_g_loss / max(total_batches, 1)
 
-        if (val_loader is not None) and (cfg.VAL_EPOCH <= 1 or epoch % cfg.VAL_EPOCH == 0):
-            # --- Validation metrics ---
-            generator.eval()
-            discriminator.eval()
+        print(f"[GAN] Rank {rank} finished all_reduce for epoch {epoch}")
+        
+        # Keep all ranks in sync before validation
+        if dist.is_initialized():
+            print(f"[GAN] Rank {rank} entering barrier before validation")
+            dist.barrier()
+            print(f"[GAN] Rank {rank} passed barrier")
 
-            val_l1_total = 0.0
-            val_psnr_sum = 0.0
-            val_ssim_sum = 0.0
-            val_clip_sum = 0.0
-            val_count = 0
+        val_metrics = None
+        should_validate = (
+            rank == 0
+            and val_loader is not None
+            and (cfg.VAL_EPOCH <= 1 or epoch % cfg.VAL_EPOCH == 0)
+        )
+        
+        if should_validate:
+            print(f"[GAN] Rank {rank} starting validation")
+            # --- Validation metrics (Rank 0 only) ---
+            try:
+                generator.eval()
+                discriminator.eval()
 
-            with torch.no_grad():
-                for val_batch_idx, (v_input_image, v_input_feat, v_target_image, _) in enumerate(val_loader):
-                    v_input_image = v_input_image.to(device)
-                    v_images = v_target_image.to(device)
-                    v_embeddings = v_input_feat.to(device)
-                    bs = v_images.size(0)
+                val_l1_total = 0.0
+                val_psnr_sum = 0.0
+                val_ssim_sum = 0.0
+                val_clip_sum = 0.0
+                val_count = 0
 
-                    noise = torch.randn(bs, cfg.NOISE_DIM, 1, 1, device=device)
-                    v_fake = generator(noise, v_embeddings, v_input_image)
+                with torch.no_grad():
+                    for val_batch_idx, (v_input_image, v_input_feat, v_target_image, _) in enumerate(val_loader):
+                        # Move data to device
+                        v_input_image = v_input_image.to(device) if cfg.INITIAL_IMAGE else None
+                        v_images = v_target_image.to(device)
+                        v_features = v_input_feat.to(device)
+                        bs = v_images.size(0)
 
-                    val_l1 = l1_loss(v_fake, v_images).item()
-                    val_l1_total += val_l1 * bs
+                        noise = torch.randn(bs, cfg.NOISE_DIM, 1, 1, device=device)
+                        v_fake = generator(noise, v_features, v_input_image)
 
-                    batch_psnr = calculate_psnr(v_fake, v_images)
-                    batch_ssim = calculate_ssim(v_fake, v_images)
-                    val_psnr_sum += batch_psnr * bs
-                    val_ssim_sum += batch_ssim * bs
+                        val_l1 = l1_loss(v_fake, v_images).item()
+                        val_l1_total += val_l1 * bs
 
-                    clip_sum_batch, _ = compute_clip_metrics_batch(v_fake, v_images, clip_model, clip_preprocess, device)
-                    val_clip_sum += clip_sum_batch
+                        batch_psnr = calculate_psnr(v_fake, v_images)
+                        batch_ssim = calculate_ssim(v_fake, v_images)
+                        val_psnr_sum += batch_psnr * bs
+                        val_ssim_sum += batch_ssim * bs
 
-                    if val_batch_idx == 0 and rank == 0:
-                        save_random_sample_pairs(
-                            v_input_image,
-                            v_fake,
-                            v_images,
-                            sample_dir,
-                            epoch,
-                            prefix="val_ddp",
-                            num_samples=4,
-                        )
+                        clip_sum_batch, _ = compute_clip_metrics_batch(v_fake, v_images, clip_model, clip_preprocess, device)
+                        val_clip_sum += clip_sum_batch
 
-                    val_count += bs
+                        if val_batch_idx == 0:
+                            save_random_sample_pairs(
+                                v_input_image,
+                                v_fake,
+                                v_images,
+                                sample_dir,
+                                epoch,
+                                prefix="val_ddp",
+                                num_samples=4,
+                            )
 
-            val_tensor = torch.tensor(
-                [val_l1_total, val_psnr_sum, val_ssim_sum, val_clip_sum, val_count],
-                device=device,
-            )
-            dist.all_reduce(val_tensor, op=dist.ReduceOp.SUM)
-            (
-                total_l1,
-                total_psnr,
-                total_ssim,
-                total_clip,
-                total_count,
-            ) = val_tensor.tolist()
+                        val_count += bs
+                        
+                        # Clear memory after each validation batch
+                        del v_fake, noise, v_images, v_features
+                        if v_input_image is not None:
+                            del v_input_image
+                
+                avg_val_l1 = val_l1_total / max(val_count, 1)
+                avg_val_psnr = val_psnr_sum / max(val_count, 1)
+                avg_val_ssim = val_ssim_sum / max(val_count, 1)
+                avg_val_clip = val_clip_sum / max(val_count, 1)
+                
+                val_metrics = {
+                    "val_l1": avg_val_l1,
+                    "val_psnr": avg_val_psnr,
+                    "val_ssim": avg_val_ssim,
+                    "val_clip": avg_val_clip,
+                }
+                
+            except Exception as e:
+                print(f"[GAN] Validation failed at epoch {epoch}, batch {val_batch_idx}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                val_metrics = None
+            
+            # Set models back to train mode
+            generator.train()
+            discriminator.train()
+            
+            # Force cleanup after validation completes - only on rank 0 which did validation
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            print(f"[GAN] Rank {rank} completed validation, memory cleared")
+        
+        # Keep all ranks in sync after validation
+        if dist.is_initialized():
+            print(f"[GAN] Rank {rank} entering barrier after validation")
+            dist.barrier()
+            print(f"[GAN] Rank {rank} passed barrier after validation")
 
-            avg_val_l1 = total_l1 / max(total_count, 1)
-            avg_val_psnr = total_psnr / max(total_count, 1)
-            avg_val_ssim = total_ssim / max(total_count, 1)
-            avg_val_clip = total_clip / max(total_count, 1)
-
-            if rank == 0:
-                elapsed = time.time() - start_time
+        if rank == 0:
+            elapsed = time.time() - start_time
+            if val_metrics:
                 print(
-                    f"[DDP] Epoch [{epoch}/{start_epoch + num_epochs}] - "
+                    f"[GAN] Epoch [{epoch}/{start_epoch + num_epochs}] - "
                     f"Train D: {avg_d_loss:.4f}, Train G: {avg_g_loss:.4f}, "
-                    f"Val L1: {avg_val_l1:.4f}, Val CLIP: {avg_val_clip:.4f} "
-                    f"(PSNR: {avg_val_psnr:.2f}, SSIM: {avg_val_ssim:.4f}) | "
+                    f"Val L1: {val_metrics['val_l1']:.4f}, Val CLIP: {val_metrics['val_clip']:.4f} "
+                    f"(PSNR: {val_metrics['val_psnr']:.2f}, SSIM: {val_metrics['val_ssim']:.4f}) | "
                     f"Time: {elapsed:.2f}s"
                 )
 
@@ -508,14 +593,44 @@ def _ddp_train_worker(
                         "epoch": epoch,
                         "train_d_loss": avg_d_loss,
                         "train_g_loss": avg_g_loss,
-                        "val_l1": avg_val_l1,
-                        "val_psnr": avg_val_psnr,
-                        "val_ssim": avg_val_ssim,
-                        "val_clip": avg_val_clip,
+                        "val_l1": val_metrics['val_l1'],
+                        "val_psnr": val_metrics['val_psnr'],
+                        "val_ssim": val_metrics['val_ssim'],
+                        "val_clip": val_metrics['val_clip'],
                     }
                 )
+            else:
+                print(f"[GAN] Epoch [{epoch}/{start_epoch + num_epochs}] - "
+                      f"Train D: {avg_d_loss:.4f}, Train G: {avg_g_loss:.4f} | "
+                      f"Time: {elapsed:.2f}s")
+                metrics_logger.log(
+                    {
+                        "epoch": epoch,
+                        "train_d_loss": avg_d_loss,
+                        "train_g_loss": avg_g_loss,
+                    }
+                )
+        
+        # --- Checkpoint sync (broadcast decision + bracket slow I/O) ---
+        # IMPORTANT: all ranks must execute the same sequence of collectives.
+        # Rank 0 decides whether a checkpoint will be written this epoch.
+        if dist.is_initialized():
+            do_save_tensor = torch.tensor(
+                [1 if (rank == 0 and val_metrics is not None) else 0],
+                device=device,
+                dtype=torch.int32,
+            )
+            dist.broadcast(do_save_tensor, src=0)
+            do_save = bool(do_save_tensor.item())
+            print(f"[GAN] Rank {rank} checkpoint decision do_save={do_save}")
 
-                # Save checkpoint after validation
+            # Sync point before any potential slow disk I/O
+            print(f"[GAN] Rank {rank} entering barrier before checkpoint")
+            dist.barrier()
+            print(f"[GAN] Rank {rank} passed barrier before checkpoint")
+
+            if do_save and rank == 0:
+                print(f"[GAN] Rank {rank} saving checkpoint...")
                 val_ckpt = os.path.join(save_dir, f"{model_name}_{ver}_epoch_{epoch}.pth")
                 torch.save(
                     {
@@ -524,30 +639,28 @@ def _ddp_train_worker(
                         "g_optimizer_state_dict": g_optimizer.state_dict(),
                         "d_optimizer_state_dict": d_optimizer.state_dict(),
                         "epoch": epoch,
-                        "val_l1": avg_val_l1,
-                        "val_psnr": avg_val_psnr,
-                        "val_ssim": avg_val_ssim,
-                        "val_clip": avg_val_clip,
+                        "val_l1": val_metrics['val_l1'],
+                        "val_psnr": val_metrics['val_psnr'],
+                        "val_ssim": val_metrics['val_ssim'],
+                        "val_clip": val_metrics['val_clip'],
                     },
                     val_ckpt,
                 )
-                print(f"[DDP] Checkpoint saved to {val_ckpt}")
-        elif rank == 0:
-            elapsed = time.time() - start_time
-            print(
-                f"[DDP] Epoch [{epoch}/{start_epoch + num_epochs}] - "
-                f"Train D: {avg_d_loss:.4f}, Train G: {avg_g_loss:.4f} "
-                f"(no validation this epoch) | Time: {elapsed:.2f}s"
-            )
+                # Ensure CUDA work is complete before releasing other rank
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print(f"[GAN] Checkpoint saved to {val_ckpt}")
 
-            metrics_logger.log(
-                {
-                    "epoch": epoch,
-                    "train_d_loss": avg_d_loss,
-                    "train_g_loss": avg_g_loss,
-                }
-            )
+            # Always run the same collective sequence, even when skipping.
+            print(f"[GAN] Rank {rank} entering barrier after checkpoint")
+            dist.barrier()
+            print(f"[GAN] Rank {rank} passed barrier after checkpoint")
 
+            if not do_save:
+                print(f"[GAN] Rank {rank} skipping checkpoint this epoch")
+
+    # End of epoch loop - no barrier needed, DDP handles synchronization
+    
     if rank == 0:
         final_ckpt = os.path.join("checkpoints", f"{model_name}_{ver}_final_ddp.pth")
         torch.save(
@@ -639,14 +752,6 @@ def main() -> None:
     val_dataset = val_loader.dataset
     feature_dim = train_dataset.input_data.shape[1]
 
-    image_encoder = None
-    if cfg.INITIAL_IMAGE:
-        image_encoder = load_trained_encoder(
-            cfg.ENCODER_PATH,
-            device=device,
-            feature_dim=512,
-        )
-
     print("=" * 80)
     print("Dataset summary")
     print(f"Train samples: {len(train_dataset)}")
@@ -656,24 +761,22 @@ def main() -> None:
     print(f"Initial image size: {cfg.IMG_WIDTH}x{cfg.IMG_HEIGHT}")
     print(f"Target image size: {cfg.TARGET_WIDTH}x{cfg.TARGET_HEIGHT}")
     print(f"Device: {device}")
-    print(f"Using image encoder: {cfg.INITIAL_IMAGE}, freeze: {cfg.FREEZE_ENCODER}")
+    print(f"Using initial image: {cfg.INITIAL_IMAGE}")
+    print(f"SD-style embeddings: feature_dim={feature_dim}, embed_dim=512")
     print("=" * 80)
 
+    # Initialize models with SD-style embeddings
     generator = Generator(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
-        embed_dim=cfg.EMBEDDING_DIM,
-        embed_out_dim=cfg.EMBEDDING_OUT_DIM,
-        input_dim=feature_dim,
+        num_features=feature_dim,  # Number of input features (9)
+        embed_dim=512,  # SD embedding dimension
         initial_image=cfg.INITIAL_IMAGE,
-        image_encoder=image_encoder,
-        freeze_encoder=cfg.FREEZE_ENCODER,
     ).to(device)
     discriminator = Discriminator(
         channels=cfg.CHANNELS,
-        embed_dim=cfg.EMBEDDING_DIM,
-        embed_out_dim=cfg.EMBEDDING_OUT_DIM,
-        input_dim=feature_dim,
+        num_features=feature_dim,  # Number of input features (9)
+        embed_dim=512,  # SD embedding dimension
     ).to(device)
 
     print(
