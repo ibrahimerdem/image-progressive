@@ -140,7 +140,7 @@ def visualize_results(
         target = np.clip(target, 0, 1)
         
         # Plot
-        axes[i, 0]. imshow(initial)
+        axes[i, 0].imshow(initial)
         axes[i, 0].set_title('Initial Image')
         axes[i, 0].axis('off')
         
@@ -149,8 +149,8 @@ def visualize_results(
         axes[i, 1].axis('off')
         
         axes[i, 2].imshow(target)
-        axes[i, 2]. set_title('Target Image')
-        axes[i, 2]. axis('off')
+        axes[i, 2].set_title('Target Image')
+        axes[i, 2].axis('off')
     
     plt.tight_layout()
     
@@ -175,9 +175,9 @@ class AverageMeter:
     
     def update(self, val, n=1):
         self.val = val
-        self. sum += val * n
+        self.sum += val * n
         self.count += n
-        self. avg = self.sum / self. count
+        self.avg = self.sum / self.count
 
 
 class EarlyStopping:
@@ -191,14 +191,14 @@ class EarlyStopping:
         self.early_stop = False
     
     def __call__(self, val_loss: float) -> bool:
-        if self. best_loss is None: 
+        if self.best_loss is None: 
             self.best_loss = val_loss
-        elif val_loss > self.best_loss - self. min_delta:
-            self. counter += 1
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
-            self. best_loss = val_loss
+            self.best_loss = val_loss
             self.counter = 0
         
         return self.early_stop

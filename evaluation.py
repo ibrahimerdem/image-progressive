@@ -17,7 +17,6 @@ from PIL import Image
 import pandas as pd
 import numpy as np
 from models.multimodal_basic import Generator
-from models.image_encoder import load_trained_encoder
 from utils.training import (
     calculate_psnr,
     calculate_ssim,
@@ -40,25 +39,13 @@ def load_generator_from_checkpoint(checkpoint_path, device):
     # Determine feature dimension from config
     feature_dim = len(cfg.FEATURE_COLUMNS)
     
-    # Load image encoder if needed
-    image_encoder = None
-    if cfg.INITIAL_IMAGE:
-        image_encoder = load_trained_encoder(
-            cfg.ENCODER_PATH,
-            device=device,
-            feature_dim=512,
-        )
-    
-    # Create generator
+    # Create generator with built-in ImageEmbedding
     generator = Generator(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
-        embed_dim=cfg.EMBEDDING_DIM,
-        embed_out_dim=cfg.EMBEDDING_OUT_DIM,
-        input_dim=feature_dim,
+        embed_dim=cfg.EMBEDDING_OUT_DIM,
+        num_features=feature_dim,
         initial_image=cfg.INITIAL_IMAGE,
-        image_encoder=image_encoder,
-        freeze_encoder=cfg.FREEZE_ENCODER,
     ).to(device)
     
     # Load state dict

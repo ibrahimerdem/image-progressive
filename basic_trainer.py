@@ -7,7 +7,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from models.multimodal_basic import Generator, Discriminator
-from models.image_encoder import load_trained_encoder
 from utils.training import (
     calculate_psnr,
     calculate_ssim,
@@ -83,8 +82,8 @@ def train(
         for idx, (input_image, input_feat, target_image, wrong_image) in enumerate(train_loader):
             batch_time = time.time()
 
-            # If the generator uses an image encoder, pass the image; otherwise None
-            if generator.module.image_encoder if isinstance(generator, nn.DataParallel) else generator.image_encoder is not None:
+            # If the generator uses an image embedding, pass the image; otherwise None
+            if generator.module.image_embedding if isinstance(generator, nn.DataParallel) else generator.image_embedding is not None:
                 input_image = input_image.to(device)
             else:
                 input_image = None
@@ -156,7 +155,7 @@ def train(
 
             with torch.no_grad():
                 for val_batch_idx, (v_input_image, v_input_feat, v_target_image, _) in enumerate(val_loader):
-                    if generator.module.image_encoder if isinstance(generator, nn.DataParallel) else generator.image_encoder is not None:
+                    if generator.module.image_embedding if isinstance(generator, nn.DataParallel) else generator.image_embedding is not None:
                         v_input_image = v_input_image.to(device)
                     else:
                         v_input_image = None
@@ -254,7 +253,8 @@ def train(
 def _setup_ddp(rank: int, world_size: int):
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # Add timeout to prevent infinite hangs
+    dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=torch.distributed.timedelta(seconds=1800))
     torch.cuda.set_device(rank)
 
 
@@ -276,9 +276,12 @@ def _ddp_train_worker(
     _setup_ddp(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
+    # Reduce workers for DDP to prevent deadlocks (max 2 per GPU)
+    num_workers = min(cfg.NUM_WORKERS, 2)
+    
     train_loader, val_loader, _ = create_dataloaders(
         batch_size=batch_size,
-        num_workers=cfg.NUM_WORKERS,
+        num_workers=num_workers,
         pin_memory=True,
         distributed=True,
         rank=rank,
@@ -291,29 +294,19 @@ def _ddp_train_worker(
     else:
         feature_dim = len(getattr(cfg, "FEATURE_COLUMNS", []))
 
-    image_encoder = None
-    if cfg.INITIAL_IMAGE:
-        image_encoder = load_trained_encoder(
-            cfg.ENCODER_PATH,
-            device=device,
-            feature_dim=512,
-        )
-
+    # Generator no longer needs external image_encoder - it has ImageEmbedding built-in
     generator = Generator(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
-        embed_dim=cfg.EMBEDDING_DIM,
-        embed_out_dim=cfg.EMBEDDING_OUT_DIM,
-        input_dim=feature_dim,
+        embed_dim=cfg.EMBEDDING_OUT_DIM,  # Use EMBEDDING_OUT_DIM as embed_dim
+        num_features=feature_dim,
         initial_image=cfg.INITIAL_IMAGE,
-        image_encoder=image_encoder,
-        freeze_encoder=cfg.FREEZE_ENCODER,
     ).to(device)
+    
     discriminator = Discriminator(
         channels=cfg.CHANNELS,
-        embed_dim=cfg.EMBEDDING_DIM,
-        embed_out_dim=cfg.EMBEDDING_OUT_DIM,
-        input_dim=feature_dim,
+        embed_dim=cfg.EMBEDDING_OUT_DIM,  # Use EMBEDDING_OUT_DIM as embed_dim
+        num_features=feature_dim,
     ).to(device)
 
     # Convert BatchNorm to SyncBatchNorm for DDP
@@ -342,7 +335,8 @@ def _ddp_train_worker(
         elif rank == 0:
             print(f"[DDP] Checkpoint path {checkpoint_path} not found, starting from scratch")
 
-    generator = DDP(generator, device_ids=[rank], find_unused_parameters=True)
+    # Remove find_unused_parameters to prevent DDP deadlocks
+    generator = DDP(generator, device_ids=[rank], find_unused_parameters=False)
     discriminator = DDP(discriminator, device_ids=[rank])
 
     save_dir = "checkpoints"
@@ -377,10 +371,11 @@ def _ddp_train_worker(
         for input_image, input_feat, target_image, wrong_image in train_loader:
             batch_time = time.time()
 
-            input_image = input_image.to(device)
-            images = target_image.to(device)
-            wrong_images = wrong_image.to(device)
-            embeddings = input_feat.to(device)
+            # Non-blocking transfers to prevent synchronization issues
+            input_image = input_image.to(device, non_blocking=True)
+            images = target_image.to(device, non_blocking=True)
+            wrong_images = wrong_image.to(device, non_blocking=True)
+            embeddings = input_feat.to(device, non_blocking=True)
             batch_size_local = images.size(0)
 
             # --- Train Discriminator ---
@@ -400,6 +395,8 @@ def _ddp_train_worker(
 
             d_loss = d_loss_real + d_loss_wrong + d_loss_fake
             d_loss.backward()
+            # Add gradient clipping to prevent gradient explosion
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
             d_optimizer.step()
 
             # --- Train Generator ---
@@ -417,12 +414,17 @@ def _ddp_train_worker(
 
             g_loss = g_bce + g_l1 + g_l2
             g_loss.backward()
+            # Add gradient clipping to prevent gradient explosion
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
             g_optimizer.step()
 
             epoch_d_loss += d_loss.item()
             epoch_g_loss += g_loss.item()
             num_batches += 1
 
+        # Synchronize all processes before aggregating metrics
+        dist.barrier()
+        
         # All-reduce train losses across ranks
         loss_tensor = torch.tensor([epoch_d_loss, epoch_g_loss, num_batches], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -443,9 +445,10 @@ def _ddp_train_worker(
 
             with torch.no_grad():
                 for val_batch_idx, (v_input_image, v_input_feat, v_target_image, _) in enumerate(val_loader):
-                    v_input_image = v_input_image.to(device)
-                    v_images = v_target_image.to(device)
-                    v_embeddings = v_input_feat.to(device)
+                    # Non-blocking transfers for validation
+                    v_input_image = v_input_image.to(device, non_blocking=True)
+                    v_images = v_target_image.to(device, non_blocking=True)
+                    v_embeddings = v_input_feat.to(device, non_blocking=True)
                     bs = v_images.size(0)
 
                     noise = torch.randn(bs, cfg.NOISE_DIM, 1, 1, device=device)
@@ -475,6 +478,9 @@ def _ddp_train_worker(
 
                     val_count += bs
 
+            # Synchronize all processes before aggregating validation metrics
+            dist.barrier()
+            
             val_tensor = torch.tensor(
                 [val_l1_total, val_psnr_sum, val_ssim_sum, val_clip_sum, val_count],
                 device=device,
@@ -639,14 +645,6 @@ def main() -> None:
     val_dataset = val_loader.dataset
     feature_dim = train_dataset.input_data.shape[1]
 
-    image_encoder = None
-    if cfg.INITIAL_IMAGE:
-        image_encoder = load_trained_encoder(
-            cfg.ENCODER_PATH,
-            device=device,
-            feature_dim=512,
-        )
-
     print("=" * 80)
     print("Dataset summary")
     print(f"Train samples: {len(train_dataset)}")
@@ -656,24 +654,21 @@ def main() -> None:
     print(f"Initial image size: {cfg.IMG_WIDTH}x{cfg.IMG_HEIGHT}")
     print(f"Target image size: {cfg.TARGET_WIDTH}x{cfg.TARGET_HEIGHT}")
     print(f"Device: {device}")
-    print(f"Using image encoder: {cfg.INITIAL_IMAGE}, freeze: {cfg.FREEZE_ENCODER}")
+    print(f"Using initial image: {cfg.INITIAL_IMAGE}")
     print("=" * 80)
 
     generator = Generator(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
-        embed_dim=cfg.EMBEDDING_DIM,
-        embed_out_dim=cfg.EMBEDDING_OUT_DIM,
-        input_dim=feature_dim,
+        embed_dim=cfg.EMBEDDING_OUT_DIM,  # Use EMBEDDING_OUT_DIM as embed_dim
+        num_features=feature_dim,
         initial_image=cfg.INITIAL_IMAGE,
-        image_encoder=image_encoder,
-        freeze_encoder=cfg.FREEZE_ENCODER,
     ).to(device)
+    
     discriminator = Discriminator(
         channels=cfg.CHANNELS,
-        embed_dim=cfg.EMBEDDING_DIM,
-        embed_out_dim=cfg.EMBEDDING_OUT_DIM,
-        input_dim=feature_dim,
+        embed_dim=cfg.EMBEDDING_OUT_DIM,  # Use EMBEDDING_OUT_DIM as embed_dim
+        num_features=feature_dim,
     ).to(device)
 
     print(
