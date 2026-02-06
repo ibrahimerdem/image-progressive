@@ -145,8 +145,18 @@ class ResidualBlock(nn.Module):
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act = nn.SiLU()
         self.time_film = nn.Linear(time_dim, out_channels * 2)
-        self.cross_attn = CrossAttention(out_channels, feature_dim, heads=8, chunk_size=1024)
+        
+        # Enhanced cross-attention with more heads for better feature conditioning
+        self.cross_attn = CrossAttention(out_channels, feature_dim, heads=16, chunk_size=1024)
         self.attn_norm = nn.GroupNorm(8, out_channels)
+        
+        # Adaptive feature modulation for target-aware generation
+        self.feature_modulation = nn.Sequential(
+            nn.Linear(feature_dim, out_channels * 2),
+            nn.SiLU(),
+            nn.Linear(out_channels * 2, out_channels * 2)
+        )
+        
         if in_channels != out_channels:
             self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
@@ -155,11 +165,22 @@ class ResidualBlock(nn.Module):
     def _forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
         h = self.act(self.norm1(self.conv1(x)))
         h = self.norm2(self.conv2(h))
+        
+        # Time-based FiLM conditioning
         time_film = self.time_film(time_emb).unsqueeze(-1).unsqueeze(-1)
         time_scale, time_shift = time_film.chunk(2, dim=1)
         time_scale = torch.clamp(time_scale, -3.0, 3.0)
         h = h * (1 + time_scale) + time_shift
+        
+        # Adaptive feature modulation (target-aware)
+        feature_mod = self.feature_modulation(feature_emb.squeeze(1)).unsqueeze(-1).unsqueeze(-1)
+        feat_scale, feat_shift = feature_mod.chunk(2, dim=1)
+        feat_scale = torch.clamp(feat_scale, -2.0, 2.0)
+        h = h * (1 + feat_scale) + feat_shift
+        
+        # Cross-attention for feature conditioning
         h = h + self.cross_attn(self.attn_norm(h), feature_emb)
+        
         return self.act(h + self.residual(x))
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
@@ -222,7 +243,7 @@ class ImprovedUNet(nn.Module):
         self.down2 = DownBlock(base_channels * 2, base_channels * 4, time_dim, feature_dim, attn=True)
         self.mid = ResidualBlock(base_channels * 4, base_channels * 4, time_dim, feature_dim)
         self.up3 = UpBlock(base_channels * 8, base_channels * 2, time_dim, feature_dim, attn=True)
-        self.up2 = UpBlock(base_channels * 4, base_channels, time_dim, feature_dim, attn=False)
+        self.up2 = UpBlock(base_channels * 4, base_channels, time_dim, feature_dim, attn=True)
         self.up1 = UpBlock(base_channels * 2, base_channels, time_dim, feature_dim, attn=False)
         self.out_conv = nn.Conv2d(base_channels, in_channels, kernel_size=1)
 
@@ -385,9 +406,9 @@ class StableDiffusionConditioned(nn.Module):
             feature_dim=feature_dim,
         )
         self.time_scale = nn.Parameter(torch.tensor(1.0))
-        self.feature_scale = nn.Parameter(torch.tensor(3.0))
+        self.feature_scale = nn.Parameter(torch.tensor(5.0))  # Increased from 3.0 for stronger feature conditioning
         if use_initial_image:
-            self.image_scale = nn.Parameter(torch.tensor(1.0))
+            self.image_scale = nn.Parameter(torch.tensor(2.0))  # Increased from 1.0 for stronger image conditioning
 
     def forward(
         self,
