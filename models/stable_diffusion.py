@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import config as cfg
-
+from models.attention import SelfAttention, CrossAttention
 
 def get_timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
     half_dim = dim // 2
@@ -31,7 +31,12 @@ class TimeEmbedding(nn.Module):
         )
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        # Convert timesteps to embedding (handles int->float conversion)
         emb = get_timestep_embedding(timesteps, self.dim)
+        
+        # Ensure dtype matches the model weights (important for AMP/mixed precision)
+        emb = emb.to(dtype=next(self.mlp.parameters()).dtype)
+        
         return self.mlp(emb)
 
 
@@ -97,165 +102,391 @@ class ImageEmbedding(nn.Module):
         return embedding
 
 
-class CrossAttention(nn.Module):
-    def __init__(self, query_dim: int, context_dim: int, heads: int = 8, chunk_size: int = 1024):
-        super().__init__()
-        self.heads = heads
-        self.scale = (query_dim // heads) ** -0.5
-        self.chunk_size = chunk_size
-        self.to_q = nn.Linear(query_dim, query_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, query_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, query_dim, bias=False)
-        self.to_out = nn.Linear(query_dim, query_dim)
-        
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        x_flat = x.view(B, C, H * W).permute(0, 2, 1)
-        q = self.to_q(x_flat)
-        k = self.to_k(context)
-        v = self.to_v(context)
-        head_dim = C // self.heads
-        q = q.view(B, H * W, self.heads, head_dim).permute(0, 2, 1, 3)
-        k = k.view(B, -1, self.heads, head_dim).permute(0, 2, 1, 3)
-        v = v.view(B, -1, self.heads, head_dim).permute(0, 2, 1, 3)
-        num_queries = q.shape[2]
-        out_chunks = []
-        for i in range(0, num_queries, self.chunk_size):
-            end = min(i + self.chunk_size, num_queries)
-            q_chunk = q[:, :, i:end, :].contiguous()
-            attn_chunk = torch.matmul(q_chunk, k.transpose(-2, -1)) * self.scale
-            attn_chunk = F.softmax(attn_chunk, dim=-1)
-            out_chunk = torch.matmul(attn_chunk, v)
-            out_chunks.append(out_chunk)
-            del attn_chunk
-        out = torch.cat(out_chunks, dim=2)
-        del out_chunks
-        out = out.permute(0, 2, 1, 3).contiguous().view(B, H * W, C)
-        out = self.to_out(out)
-        out = out.permute(0, 2, 1).view(B, C, H, W)
-        return out
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.norm1 = nn.GroupNorm(8, out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.norm2 = nn.GroupNorm(8, out_channels)
-        self.act = nn.SiLU()
-        self.time_film = nn.Linear(time_dim, out_channels * 2)
-        
-        # Enhanced cross-attention with more heads for better feature conditioning
-        self.cross_attn = CrossAttention(out_channels, feature_dim, heads=16, chunk_size=1024)
-        self.attn_norm = nn.GroupNorm(8, out_channels)
-        
-        # Adaptive feature modulation for target-aware generation
-        self.feature_modulation = nn.Sequential(
-            nn.Linear(feature_dim, out_channels * 2),
-            nn.SiLU(),
-            nn.Linear(out_channels * 2, out_channels * 2)
-        )
-        
-        if in_channels != out_channels:
-            self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        else:
-            self.residual = nn.Identity()
-    
-    def _forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
-        h = self.act(self.norm1(self.conv1(x)))
-        h = self.norm2(self.conv2(h))
-        
-        # Time-based FiLM conditioning
-        time_film = self.time_film(time_emb).unsqueeze(-1).unsqueeze(-1)
-        time_scale, time_shift = time_film.chunk(2, dim=1)
-        time_scale = torch.clamp(time_scale, -3.0, 3.0)
-        h = h * (1 + time_scale) + time_shift
-        
-        # Adaptive feature modulation (target-aware)
-        feature_mod = self.feature_modulation(feature_emb.squeeze(1)).unsqueeze(-1).unsqueeze(-1)
-        feat_scale, feat_shift = feature_mod.chunk(2, dim=1)
-        feat_scale = torch.clamp(feat_scale, -2.0, 2.0)
-        h = h * (1 + feat_scale) + feat_shift
-        
-        # Cross-attention for feature conditioning
-        h = h + self.cross_attn(self.attn_norm(h), feature_emb)
-        
-        return self.act(h + self.residual(x))
-
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
-        return torch.utils.checkpoint.checkpoint(self._forward, x, time_emb, feature_emb, use_reentrant=False)
-
-
-class AttentionBlock(nn.Module):
-    def __init__(self, channels: int, num_heads: int):
-        super().__init__()
-        self.norm = nn.GroupNorm(8, channels)
-        self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
-        normed = self.norm(x)
-        flat = normed.view(b, c, -1).permute(2, 0, 1)
-        attn_out, _ = self.attn(flat, flat, flat)
-        attn_out = attn_out.permute(1, 2, 0).view(b, c, h, w)
-        return x + attn_out
-
-
-class DownBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool):
-        super().__init__()
-        self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim)
-        self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
-        self.downsample = nn.AvgPool2d(2)
-
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor):
-        h = self.res(x, time_emb, feature_emb)
-        if self.attn is not None:
-            h = self.attn(h)
-        return self.downsample(h), h
-
-
-class UpBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool):
-        super().__init__()
-        self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim)
-        self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
-        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor):
-        if x.shape[-2:] != skip.shape[-2:]:
-            x = self.upsample(x)
-        h = torch.cat([x, skip], dim=1)
-        h = self.res(h, time_emb, feature_emb)
-        if self.attn is not None:
-            h = self.attn(h)
-        return h
 
 
 class ImprovedUNet(nn.Module):
+    """UNet using the new UNET_ResidualBlock and UNET_AttentionBlock components"""
     def __init__(self, in_channels: int, base_channels: int, time_dim: int, feature_dim: int):
         super().__init__()
         self.time_dim = time_dim
         self.feature_dim = feature_dim
-        self.inc = ResidualBlock(in_channels, base_channels, time_dim, feature_dim)
-        self.down1 = DownBlock(base_channels, base_channels * 2, time_dim, feature_dim, attn=False)
-        self.down2 = DownBlock(base_channels * 2, base_channels * 4, time_dim, feature_dim, attn=True)
-        self.mid = ResidualBlock(base_channels * 4, base_channels * 4, time_dim, feature_dim)
-        self.up3 = UpBlock(base_channels * 8, base_channels * 2, time_dim, feature_dim, attn=True)
-        self.up2 = UpBlock(base_channels * 4, base_channels, time_dim, feature_dim, attn=True)
-        self.up1 = UpBlock(base_channels * 2, base_channels, time_dim, feature_dim, attn=False)
-        self.out_conv = nn.Conv2d(base_channels, in_channels, kernel_size=1)
+        
+        # Adaptive time embedding to convert time_dim to 1280 (standard for UNET blocks)
+        self.time_adapter = nn.Linear(time_dim, 1280) if time_dim != 1280 else nn.Identity()
+        
+        # Initial convolution
+        self.inc = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        
+        # Encoder path with SwitchSequential
+        self.down1 = SwitchSequential(
+            UNET_ResidualBlock(base_channels, base_channels * 2, 1280),
+            nn.AvgPool2d(2)
+        )
+        
+        self.down2 = SwitchSequential(
+            UNET_ResidualBlock(base_channels * 2, base_channels * 4, 1280),
+            UNET_AttentionBlock(8, base_channels * 4 // 8, feature_dim),
+            nn.AvgPool2d(2)
+        )
+        
+        # Bottleneck
+        self.mid = SwitchSequential(
+            UNET_ResidualBlock(base_channels * 4, base_channels * 4, 1280),
+            UNET_AttentionBlock(8, base_channels * 4 // 8, feature_dim),
+            UNET_ResidualBlock(base_channels * 4, base_channels * 4, 1280)
+        )
+        
+        # Decoder path with SwitchSequential  
+        self.up3 = SwitchSequential(
+            UNET_ResidualBlock(base_channels * 8, base_channels * 2, 1280),
+            UNET_AttentionBlock(8, base_channels * 2 // 8, feature_dim),
+            Upsample(base_channels * 2)
+        )
+        
+        self.up2 = SwitchSequential(
+            UNET_ResidualBlock(base_channels * 4, base_channels, 1280),
+            UNET_AttentionBlock(8, base_channels // 8, feature_dim),
+            Upsample(base_channels)
+        )
+        
+        self.up1 = SwitchSequential(
+            UNET_ResidualBlock(base_channels * 2, base_channels, 1280)
+        )
+        
+        # Output convolution
+        self.out_conv = nn.Sequential(
+            nn.GroupNorm(32, base_channels),
+            nn.SiLU(),
+            nn.Conv2d(base_channels, in_channels, kernel_size=1)
+        )
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
-        h1 = self.inc(x, time_emb, feature_emb)
-        d2, skip1 = self.down1(h1, time_emb, feature_emb)
-        d3, skip2 = self.down2(d2, time_emb, feature_emb)
-        middle = self.mid(d3, time_emb, feature_emb)
-        u3 = self.up3(middle, skip2, time_emb, feature_emb)
-        u2 = self.up2(u3, skip1, time_emb, feature_emb)
-        u1 = self.up1(u2, h1, time_emb, feature_emb)
+        # Adapt time embedding to 1280 dimensions
+        time_emb_adapted = self.time_adapter(time_emb)  # [B, 1280]
+        
+        # Initial convolution
+        h1 = self.inc(x)
+        
+        # Encoder
+        d2 = self.down1(h1, feature_emb, time_emb_adapted)
+        d3 = self.down2(d2, feature_emb, time_emb_adapted)
+        
+        # Bottleneck
+        middle = self.mid(d3, feature_emb, time_emb_adapted)
+        
+        # Decoder with skip connections
+        u3 = torch.cat([middle, d3], dim=1)
+        u3 = self.up3(u3, feature_emb, time_emb_adapted)
+        
+        u2 = torch.cat([u3, d2], dim=1)
+        u2 = self.up2(u2, feature_emb, time_emb_adapted)
+        
+        u1 = torch.cat([u2, h1], dim=1)
+        u1 = self.up1(u1, feature_emb, time_emb_adapted)
+        
         return self.out_conv(u1)
+
+
+class TimeEmbeddingUNET(nn.Module):
+    """Time embedding for UNET blocks - expects pre-computed embeddings"""
+    def __init__(self, n_embd):
+        super().__init__()
+        self.linear_1 = nn.Linear(n_embd, 4 * n_embd)
+        self.linear_2 = nn.Linear(4 * n_embd, 4 * n_embd)
+
+    def forward(self, x):
+        # x: (B, 320) - already embedded
+
+        # (B, 320) -> (B, 1280)
+        x = self.linear_1(x)
+        
+        # (B, 1280) -> (B, 1280)
+        x = F.silu(x) 
+        
+        # (B, 1280) -> (B, 1280)
+        x = self.linear_2(x)
+
+        return x
+
+class UNET_ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, n_time=1280):
+        super().__init__()
+        self.groupnorm_feature = nn.GroupNorm(32, in_channels)
+        self.conv_feature = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.linear_time = nn.Linear(n_time, out_channels)
+
+        self.groupnorm_merged = nn.GroupNorm(32, out_channels)
+        self.conv_merged = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
+        if in_channels == out_channels:
+            self.residual_layer = nn.Identity()
+        else:
+            self.residual_layer = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0)
+    
+    def forward(self, feature, time):
+        # feature: (Batch_Size, In_Channels, Height, Width)
+        # time: (1, 1280)
+
+        residue = feature
+        
+        # (Batch_Size, In_Channels, Height, Width) -> (Batch_Size, In_Channels, Height, Width)
+        feature = self.groupnorm_feature(feature)
+        
+        # (Batch_Size, In_Channels, Height, Width) -> (Batch_Size, In_Channels, Height, Width)
+        feature = F.silu(feature)
+        
+        # (Batch_Size, In_Channels, Height, Width) -> (Batch_Size, Out_Channels, Height, Width)
+        feature = self.conv_feature(feature)
+        
+        # (1, 1280) -> (1, 1280)
+        time = F.silu(time)
+
+        # (1, 1280) -> (1, Out_Channels)
+        time = self.linear_time(time)
+        
+        # Add width and height dimension to time. 
+        # (Batch_Size, Out_Channels, Height, Width) + (1, Out_Channels, 1, 1) -> (Batch_Size, Out_Channels, Height, Width)
+        merged = feature + time.unsqueeze(-1).unsqueeze(-1)
+        
+        # (Batch_Size, Out_Channels, Height, Width) -> (Batch_Size, Out_Channels, Height, Width)
+        merged = self.groupnorm_merged(merged)
+        
+        # (Batch_Size, Out_Channels, Height, Width) -> (Batch_Size, Out_Channels, Height, Width)
+        merged = F.silu(merged)
+        
+        # (Batch_Size, Out_Channels, Height, Width) -> (Batch_Size, Out_Channels, Height, Width)
+        merged = self.conv_merged(merged)
+        
+        # (Batch_Size, Out_Channels, Height, Width) + (Batch_Size, Out_Channels, Height, Width) -> (Batch_Size, Out_Channels, Height, Width)
+        return merged + self.residual_layer(residue)
+
+class UNET_AttentionBlock(nn.Module):
+    def __init__(self, n_head: int, n_embd: int, d_context=768):
+        super().__init__()
+        channels = n_head * n_embd
+        
+        self.groupnorm = nn.GroupNorm(32, channels, eps=1e-6)
+        self.conv_input = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+
+        self.layernorm_1 = nn.LayerNorm(channels)
+        self.attention_1 = SelfAttention(n_head, channels, in_proj_bias=False)
+        self.layernorm_2 = nn.LayerNorm(channels)
+        self.attention_2 = CrossAttention(n_head, channels, d_context, in_proj_bias=False)
+        self.layernorm_3 = nn.LayerNorm(channels)
+        self.linear_geglu_1  = nn.Linear(channels, 4 * channels * 2)
+        self.linear_geglu_2 = nn.Linear(4 * channels, channels)
+
+        self.conv_output = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+    
+    def forward(self, x, context):
+        # x: (Batch_Size, Features, Height, Width)
+        # context: (Batch_Size, Seq_Len, Dim)
+
+        residue_long = x
+
+        # (Batch_Size, Features, Height, Width) -> (Batch_Size, Features, Height, Width)
+        x = self.groupnorm(x)
+        
+        # (Batch_Size, Features, Height, Width) -> (Batch_Size, Features, Height, Width)
+        x = self.conv_input(x)
+        
+        n, c, h, w = x.shape
+        
+        # (Batch_Size, Features, Height, Width) -> (Batch_Size, Features, Height * Width)
+        x = x.view((n, c, h * w))
+        
+        # (Batch_Size, Features, Height * Width) -> (Batch_Size, Height * Width, Features)
+        x = x.transpose(-1, -2)
+        
+        # Normalization + Self-Attention with skip connection
+
+        # (Batch_Size, Height * Width, Features)
+        residue_short = x
+        
+        # (Batch_Size, Height * Width, Features) -> (Batch_Size, Height * Width, Features)
+        x = self.layernorm_1(x)
+        
+        # (Batch_Size, Height * Width, Features) -> (Batch_Size, Height * Width, Features)
+        x = self.attention_1(x)
+        
+        # (Batch_Size, Height * Width, Features) + (Batch_Size, Height * Width, Features) -> (Batch_Size, Height * Width, Features)
+        x += residue_short
+        
+        # (Batch_Size, Height * Width, Features)
+        residue_short = x
+
+        # Normalization + Cross-Attention with skip connection
+        
+        # (Batch_Size, Height * Width, Features) -> (Batch_Size, Height * Width, Features)
+        x = self.layernorm_2(x)
+        
+        # (Batch_Size, Height * Width, Features) -> (Batch_Size, Height * Width, Features)
+        x = self.attention_2(x, context)
+        
+        # (Batch_Size, Height * Width, Features) + (Batch_Size, Height * Width, Features) -> (Batch_Size, Height * Width, Features)
+        x += residue_short
+        
+        # (Batch_Size, Height * Width, Features)
+        residue_short = x
+
+        # Normalization + FFN with GeGLU and skip connection
+        
+        # (Batch_Size, Height * Width, Features) -> (Batch_Size, Height * Width, Features)
+        x = self.layernorm_3(x)
+        
+        # GeGLU as implemented in the original code: https://github.com/CompVis/stable-diffusion/blob/21f890f9da3cfbeaba8e2ac3c425ee9e998d5229/ldm/modules/attention.py#L37C10-L37C10
+        # (Batch_Size, Height * Width, Features) -> two tensors of shape (Batch_Size, Height * Width, Features * 4)
+        x, gate = self.linear_geglu_1(x).chunk(2, dim=-1) 
+        
+        # Element-wise product: (Batch_Size, Height * Width, Features * 4) * (Batch_Size, Height * Width, Features * 4) -> (Batch_Size, Height * Width, Features * 4)
+        x = x * F.gelu(gate)
+        
+        # (Batch_Size, Height * Width, Features * 4) -> (Batch_Size, Height * Width, Features)
+        x = self.linear_geglu_2(x)
+        
+        # (Batch_Size, Height * Width, Features) + (Batch_Size, Height * Width, Features) -> (Batch_Size, Height * Width, Features)
+        x += residue_short
+        
+        # (Batch_Size, Height * Width, Features) -> (Batch_Size, Features, Height * Width)
+        x = x.transpose(-1, -2)
+        
+        # (Batch_Size, Features, Height * Width) -> (Batch_Size, Features, Height, Width)
+        x = x.view((n, c, h, w))
+
+        # Final skip connection between initial input and output of the block
+        # (Batch_Size, Features, Height, Width) + (Batch_Size, Features, Height, Width) -> (Batch_Size, Features, Height, Width)
+        return self.conv_output(x) + residue_long
+
+class Upsample(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+    
+    def forward(self, x):
+        # (Batch_Size, Features, Height, Width) -> (Batch_Size, Features, Height * 2, Width * 2)
+        x = F.interpolate(x, scale_factor=2, mode='nearest') 
+        return self.conv(x)
+
+class SwitchSequential(nn.Sequential):
+    def forward(self, x, context, time):
+        for layer in self:
+            if isinstance(layer, UNET_AttentionBlock):
+                x = layer(x, context)
+            elif isinstance(layer, UNET_ResidualBlock):
+                x = layer(x, time)
+            else:
+                x = layer(x)
+        return x
+
+class UNET(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Reduced channel counts: 320->256, 640->512, 1280->768
+        # Remove deepest layer (Height/64) to save memory
+        self.encoders = nn.ModuleList([
+            # (Batch_Size, 4, Height / 8, Width / 8) -> (Batch_Size, 256, Height / 8, Width / 8)
+            SwitchSequential(nn.Conv2d(4, 256, kernel_size=3, padding=1)),
+            
+            # (Batch_Size, 256, Height / 8, Width / 8) -> (Batch_Size, 256, Height / 8, Width / 8)
+            SwitchSequential(UNET_ResidualBlock(256, 256), UNET_AttentionBlock(8, 32)),
+            
+            # (Batch_Size, 256, Height / 8, Width / 8) -> (Batch_Size, 256, Height / 16, Width / 16)
+            SwitchSequential(nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1)),
+            
+            # (Batch_Size, 256, Height / 16, Width / 16) -> (Batch_Size, 512, Height / 16, Width / 16)
+            SwitchSequential(UNET_ResidualBlock(256, 512), UNET_AttentionBlock(8, 64)),
+            
+            # (Batch_Size, 512, Height / 16, Width / 16) -> (Batch_Size, 512, Height / 32, Width / 32)
+            SwitchSequential(nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=1)),
+            
+            # (Batch_Size, 512, Height / 32, Width / 32) -> (Batch_Size, 768, Height / 32, Width / 32)
+            SwitchSequential(UNET_ResidualBlock(512, 768), UNET_AttentionBlock(8, 96)),
+            
+            # (Batch_Size, 768, Height / 32, Width / 32) -> (Batch_Size, 768, Height / 32, Width / 32)
+            SwitchSequential(UNET_ResidualBlock(768, 768)),
+        ])
+
+        self.bottleneck = SwitchSequential(
+            # (Batch_Size, 768, Height / 32, Width / 32) -> (Batch_Size, 768, Height / 32, Width / 32)
+            UNET_ResidualBlock(768, 768), 
+            
+            # (Batch_Size, 768, Height / 32, Width / 32) -> (Batch_Size, 768, Height / 32, Width / 32)
+            UNET_AttentionBlock(8, 96), 
+            
+            # (Batch_Size, 768, Height / 32, Width / 32) -> (Batch_Size, 768, Height / 32, Width / 32)
+            UNET_ResidualBlock(768, 768), 
+        )
+        
+        self.decoders = nn.ModuleList([
+            # (Batch_Size, 1536, Height / 32, Width / 32) -> (Batch_Size, 768, Height / 32, Width / 32)
+            # Skip from encoder[6]: 768 channels
+            SwitchSequential(UNET_ResidualBlock(1536, 768)),
+            
+            # (Batch_Size, 1536, Height / 32, Width / 32) -> (Batch_Size, 768, Height / 32, Width / 32)
+            # Skip from encoder[5]: 768 channels
+            SwitchSequential(UNET_ResidualBlock(1536, 768), UNET_AttentionBlock(8, 96)),
+            
+            # (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 512, Height / 32, Width / 32) -> (Batch_Size, 512, Height / 16, Width / 16)
+            # Skip from encoder[4]: 512 channels, then upsample
+            SwitchSequential(UNET_ResidualBlock(1280, 512), Upsample(512)),
+            
+            # (Batch_Size, 1024, Height / 16, Width / 16) -> (Batch_Size, 512, Height / 16, Width / 16)
+            # Skip from encoder[3]: 512 channels
+            SwitchSequential(UNET_ResidualBlock(1024, 512), UNET_AttentionBlock(8, 64)),
+            
+            # (Batch_Size, 768, Height / 16, Width / 16) -> (Batch_Size, 256, Height / 16, Width / 16) -> (Batch_Size, 256, Height / 8, Width / 8)
+            # Skip from encoder[2]: 256 channels, then upsample
+            SwitchSequential(UNET_ResidualBlock(768, 256), Upsample(256)),
+            
+            # (Batch_Size, 512, Height / 8, Width / 8) -> (Batch_Size, 256, Height / 8, Width / 8)
+            # Skip from encoder[1]: 256 channels
+            SwitchSequential(UNET_ResidualBlock(512, 256), UNET_AttentionBlock(8, 32)),
+            
+            # (Batch_Size, 512, Height / 8, Width / 8) -> (Batch_Size, 256, Height / 8, Width / 8)
+            # Skip from encoder[0]: 256 channels
+            SwitchSequential(UNET_ResidualBlock(512, 256), UNET_AttentionBlock(8, 32)),
+        ])
+
+    def forward(self, x, context, time):
+        # x: (Batch_Size, 4, Height / 8, Width / 8)
+        # context: (Batch_Size, Seq_Len, Dim) 
+        # time: (1, 1280)
+
+        skip_connections = []
+        for layers in self.encoders:
+            x = layers(x, context, time)
+            skip_connections.append(x)
+
+        x = self.bottleneck(x, context, time)
+
+        for layers in self.decoders:
+            # Since we always concat with the skip connection of the encoder, the number of features increases before being sent to the decoder's layer
+            x = torch.cat((x, skip_connections.pop()), dim=1) 
+            x = layers(x, context, time)
+        
+        return x
+
+
+class UNET_OutputLayer(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.groupnorm = nn.GroupNorm(32, in_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+    
+    def forward(self, x):
+        # x: (Batch_Size, 320, Height / 8, Width / 8)
+
+        # (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8)
+        x = self.groupnorm(x)
+        
+        # (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8)
+        x = F.silu(x)
+        
+        # (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 4, Height / 8, Width / 8)
+        x = self.conv(x)
+        
+        # (Batch_Size, 4, Height / 8, Width / 8) 
+        return x
 
 
 class GaussianDiffusion(nn.Module):
@@ -384,27 +615,24 @@ class GaussianDiffusion(nn.Module):
 class StableDiffusionConditioned(nn.Module):
     def __init__(self, latent_channels=4, emb_dim=512, base_channels=64, use_initial_image=False):
         super().__init__()
-        cond_dim = emb_dim * 2
-        time_dim = cond_dim
-        feature_dim = 9 * 512
         self.use_initial_image = use_initial_image
         
-        self.feature_projection = FeatureEmbedding(num_features=9, embed_dim=512)
-        self.time_embedding = TimeEmbedding(time_dim)
+        # UNET expects context with d_context=768 dimension
+        # So we project features to 768-dim space
+        self.feature_projection = FeatureEmbedding(num_features=9, embed_dim=768)
+        
+        # TimeEmbedding outputs time_dim dimensions, but UNET expects 1280
+        self.time_embedding = TimeEmbedding(320)  # 320 -> 1280 via TimeEmbeddingUNET
+        self.time_adapter = TimeEmbeddingUNET(320)  # Converts 320 -> 1280
         
         # Optional: Image embedding for initial image conditioning
         if use_initial_image:
-            self.image_projection = ImageEmbedding(in_channels=3, embed_dim=512, image_size=128)
-            # When using image, concatenate with features: 4608 + 4608 = 9216
-            feature_dim = 9 * 512 * 2
+            self.image_projection = ImageEmbedding(in_channels=3, embed_dim=768, image_size=128)
         
-        # UNet works in latent space (4 channels) not RGB space (3 channels)
-        self.unet = ImprovedUNet(
-            latent_channels,  # 4 channels for latent space
-            base_channels=base_channels, 
-            time_dim=time_dim, 
-            feature_dim=feature_dim,
-        )
+        # Standard UNET architecture
+        self.unet = UNET()
+        self.output_layer = UNET_OutputLayer(256, latent_channels)  # Updated to match smaller UNET
+        
         self.time_scale = nn.Parameter(torch.tensor(1.0))
         self.feature_scale = nn.Parameter(torch.tensor(5.0))  # Increased from 3.0 for stronger feature conditioning
         if use_initial_image:
@@ -417,17 +645,29 @@ class StableDiffusionConditioned(nn.Module):
         features: torch.Tensor,
         initial_images: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        time_emb = self.time_embedding(timesteps) * self.time_scale
-        feature_emb = self.feature_projection(features) * self.feature_scale  # [B, 4608]
+        # Generate time embedding: timesteps -> (B, 320) -> (B, 1280)
+        time_emb = self.time_embedding(timesteps)  # [B, 320]
+        time_emb = self.time_adapter(time_emb) * self.time_scale  # [B, 1280]
+        
+        # Generate feature context embedding: [B, 9] -> [B, 9*768=6912]
+        feature_emb = self.feature_projection(features) * self.feature_scale  # [B, 6912]
         
         # Optionally concatenate initial image embedding
         if self.use_initial_image and initial_images is not None:
-            image_emb = self.image_projection(initial_images) * self.image_scale  # [B, 4608]
-            # Concatenate: [B, 4608] + [B, 4608] = [B, 9216]
+            image_emb = self.image_projection(initial_images) * self.image_scale  # [B, 6912]
+            # Concatenate: [B, 6912] + [B, 6912] = [B, 13824]
             feature_emb = torch.cat([feature_emb, image_emb], dim=1)
         
-        feature_emb = feature_emb.unsqueeze(1)  # [B, 1, feature_dim]
-        output = self.unet(noisy_latent, time_emb, feature_emb)
+        # Reshape feature_emb to (B, Seq_Len, Dim) format expected by UNET
+        # Split into sequence format: [B, feature_dim] -> [B, 9, 768] or [B, 18, 768]
+        B = feature_emb.shape[0]
+        seq_len = feature_emb.shape[1] // 768
+        context = feature_emb.view(B, seq_len, 768)  # [B, 9 or 18, 768]
+        
+        # UNET forward: (latent, context, time)
+        output = self.unet(noisy_latent, context, time_emb)
+        output = self.output_layer(output)
+        
         return output
 
 
