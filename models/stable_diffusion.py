@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import config as cfg
 
 
-def get_timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
+def get_timestep_embedding(timesteps, dim):
     half_dim = dim // 2
     freq = torch.exp(
         -math.log(10000) * torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) / half_dim
@@ -21,7 +21,7 @@ def get_timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class TimeEmbedding(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim):
         super().__init__()
         self.dim = dim
         self.mlp = nn.Sequential(
@@ -30,13 +30,13 @@ class TimeEmbedding(nn.Module):
             nn.Linear(dim * 4, dim),
         )
 
-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+    def forward(self, timesteps):
         emb = get_timestep_embedding(timesteps, self.dim)
         return self.mlp(emb)
 
 
 class FeatureEmbedding(nn.Module):
-    def __init__(self, num_features: int = 9, embed_dim: int = 512):
+    def __init__(self, num_features=9, embed_dim=512):
         super().__init__()
         self.num_features = num_features
         self.projection = nn.Sequential(
@@ -45,16 +45,14 @@ class FeatureEmbedding(nn.Module):
             nn.Linear(num_features * 256, num_features * embed_dim),
         )
     
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def forward(self, features: torch.Tensor):
         B, F = features.shape
         return self.projection(features)  # [B, num_features * embed_dim]
 
 
 class ImageEmbedding(nn.Module):
-    """Encodes initial image to embedding space for conditioning."""
-    def __init__(self, in_channels: int = 3, embed_dim: int = 512, image_size: int = 128):
+    def __init__(self, in_channels=3, embed_dim=512, image_size=128):
         super().__init__()
-        # Convolutional encoder to extract image features
         # Input: [B, 3, 128, 128]
         # Output: [B, embed_dim * 9] (to match feature embedding dimension)
         self.encoder = nn.Sequential(
@@ -145,18 +143,8 @@ class ResidualBlock(nn.Module):
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act = nn.SiLU()
         self.time_film = nn.Linear(time_dim, out_channels * 2)
-        
-        # Enhanced cross-attention with more heads for better feature conditioning
-        self.cross_attn = CrossAttention(out_channels, feature_dim, heads=16, chunk_size=1024)
+        self.cross_attn = CrossAttention(out_channels, feature_dim, heads=8, chunk_size=1024)
         self.attn_norm = nn.GroupNorm(8, out_channels)
-        
-        # Adaptive feature modulation for target-aware generation
-        self.feature_modulation = nn.Sequential(
-            nn.Linear(feature_dim, out_channels * 2),
-            nn.SiLU(),
-            nn.Linear(out_channels * 2, out_channels * 2)
-        )
-        
         if in_channels != out_channels:
             self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
@@ -165,22 +153,11 @@ class ResidualBlock(nn.Module):
     def _forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
         h = self.act(self.norm1(self.conv1(x)))
         h = self.norm2(self.conv2(h))
-        
-        # Time-based FiLM conditioning
         time_film = self.time_film(time_emb).unsqueeze(-1).unsqueeze(-1)
         time_scale, time_shift = time_film.chunk(2, dim=1)
         time_scale = torch.clamp(time_scale, -3.0, 3.0)
         h = h * (1 + time_scale) + time_shift
-        
-        # Adaptive feature modulation (target-aware)
-        feature_mod = self.feature_modulation(feature_emb.squeeze(1)).unsqueeze(-1).unsqueeze(-1)
-        feat_scale, feat_shift = feature_mod.chunk(2, dim=1)
-        feat_scale = torch.clamp(feat_scale, -2.0, 2.0)
-        h = h * (1 + feat_scale) + feat_shift
-        
-        # Cross-attention for feature conditioning
         h = h + self.cross_attn(self.attn_norm(h), feature_emb)
-        
         return self.act(h + self.residual(x))
 
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
@@ -188,12 +165,12 @@ class ResidualBlock(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, channels: int, num_heads: int):
+    def __init__(self, channels, num_heads):
         super().__init__()
         self.norm = nn.GroupNorm(8, channels)
         self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         b, c, h, w = x.shape
         normed = self.norm(x)
         flat = normed.view(b, c, -1).permute(2, 0, 1)
@@ -203,13 +180,13 @@ class AttentionBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool):
+    def __init__(self, in_channels, out_channels, time_dim, feature_dim, attn):
         super().__init__()
         self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim)
         self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
         self.downsample = nn.AvgPool2d(2)
 
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor):
+    def forward(self, x, time_emb, feature_emb):
         h = self.res(x, time_emb, feature_emb)
         if self.attn is not None:
             h = self.attn(h)
@@ -217,13 +194,13 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool):
+    def __init__(self, in_channels, out_channels, time_dim, feature_dim, attn):
         super().__init__()
         self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim)
         self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor):
+    def forward(self, x, skip, time_emb, feature_emb):
         if x.shape[-2:] != skip.shape[-2:]:
             x = self.upsample(x)
         h = torch.cat([x, skip], dim=1)
@@ -234,12 +211,12 @@ class UpBlock(nn.Module):
 
 
 class ImprovedUNet(nn.Module):
-    def __init__(self, in_channels: int, base_channels: int, time_dim: int, feature_dim: int):
+    def __init__(self, in_channels, base_channels, time_dim, feature_dim):
         super().__init__()
         self.time_dim = time_dim
         self.feature_dim = feature_dim
         self.inc = ResidualBlock(in_channels, base_channels, time_dim, feature_dim)
-        self.down1 = DownBlock(base_channels, base_channels * 2, time_dim, feature_dim, attn=False)
+        self.down1 = DownBlock(base_channels, base_channels * 2, time_dim, feature_dim, attn=True)
         self.down2 = DownBlock(base_channels * 2, base_channels * 4, time_dim, feature_dim, attn=True)
         self.mid = ResidualBlock(base_channels * 4, base_channels * 4, time_dim, feature_dim)
         self.up3 = UpBlock(base_channels * 8, base_channels * 2, time_dim, feature_dim, attn=True)
@@ -247,7 +224,7 @@ class ImprovedUNet(nn.Module):
         self.up1 = UpBlock(base_channels * 2, base_channels, time_dim, feature_dim, attn=False)
         self.out_conv = nn.Conv2d(base_channels, in_channels, kernel_size=1)
 
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, time_emb, feature_emb):
         h1 = self.inc(x, time_emb, feature_emb)
         d2, skip1 = self.down1(h1, time_emb, feature_emb)
         d3, skip2 = self.down2(d2, time_emb, feature_emb)
@@ -398,7 +375,6 @@ class StableDiffusionConditioned(nn.Module):
             # When using image, concatenate with features: 4608 + 4608 = 9216
             feature_dim = 9 * 512 * 2
         
-        # UNet works in latent space (4 channels) not RGB space (3 channels)
         self.unet = ImprovedUNet(
             latent_channels,  # 4 channels for latent space
             base_channels=base_channels, 
@@ -406,9 +382,9 @@ class StableDiffusionConditioned(nn.Module):
             feature_dim=feature_dim,
         )
         self.time_scale = nn.Parameter(torch.tensor(1.0))
-        self.feature_scale = nn.Parameter(torch.tensor(5.0))  # Increased from 3.0 for stronger feature conditioning
+        self.feature_scale = nn.Parameter(torch.tensor(3.0))
         if use_initial_image:
-            self.image_scale = nn.Parameter(torch.tensor(2.0))  # Increased from 1.0 for stronger image conditioning
+            self.image_scale = nn.Parameter(torch.tensor(1.0))
 
     def forward(
         self,
@@ -448,8 +424,7 @@ class StableDiffusionPipeline:
             latent_h = cfg.TARGET_HEIGHT // 8
             latent_w = cfg.TARGET_WIDTH // 8
             latent_shape = (batch_size, 4, latent_h, latent_w)
-            
-            # Generate latents
+
             result = self.schedule.sample(
                 self.model, features, steps, 
                 save_intermediates=save_intermediates,
@@ -485,7 +460,7 @@ class StableDiffusionPipeline:
 
 
 class ModelEMA:
-    def __init__(self, model: nn.Module, decay: float = 0.9995):
+    def __init__(self, model, decay=0.9995):
         import copy
         self.decay = decay
         self.ema = copy.deepcopy(model)
@@ -493,7 +468,7 @@ class ModelEMA:
         for param in self.ema.parameters():
             param.requires_grad = False
 
-    def update(self, source: nn.Module):
+    def update(self, source):
         src = source.module if isinstance(source, nn.parallel.DistributedDataParallel) else source
         with torch.no_grad():
             ema_params = dict(self.ema.named_parameters())

@@ -12,7 +12,7 @@ import config as cfg
 
 class CustomDataset(Dataset):
 
-    def __init__(self, split: str = "train", use_simple_features: bool = False):
+    def __init__(self, split="train", use_simple_features=False):
         assert split in {"train", "val", "test"}
         self.split = split
         self.use_simple_features = use_simple_features
@@ -61,7 +61,7 @@ class CustomDataset(Dataset):
         
         for _, row in df.iterrows():
             features = row[self.feature_cols].values.astype(np.float32)
-            # Normalize to [0, 1] range (continuous, not discretized)
+    
             scaled_feats = (features - mins) / (maxs - mins)
             scaled_feats = np.clip(scaled_feats, 0, 1)
             
@@ -100,12 +100,12 @@ class CustomDataset(Dataset):
 
 
 def create_dataloaders(
-    batch_size: int,
-    num_workers: int = 4,
-    pin_memory: bool = True,
-    distributed: bool = False,
-    rank: int = 0,
-    world_size: int = 1,
+    batch_size,
+    num_workers=4,
+    pin_memory=True,
+    distributed=False,
+    rank=0,
+    world_size=1,
 ):
     train_dataset = CustomDataset(split="train", use_simple_features=False)
     val_dataset = CustomDataset(split="val", use_simple_features=False)
