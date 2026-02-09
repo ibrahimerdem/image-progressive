@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class FeatureEmbedding(nn.Module):
-    def __init__(self, num_features: int = 9, embed_dim: int = 512):
+    def __init__(self, num_features=9, embed_dim=512):
         super().__init__()
         self.num_features = num_features
         self.projection = nn.Sequential(
@@ -13,14 +13,16 @@ class FeatureEmbedding(nn.Module):
             nn.Linear(num_features * 256, num_features * embed_dim),
         )
     
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def forward(self, features: torch.Tensor):
         B, F = features.shape
         return self.projection(features)
 
 
 class ImageEmbedding(nn.Module):
-    def __init__(self, in_channels: int = 3, embed_dim: int = 512, image_size: int = 128):
+    def __init__(self, in_channels=3, embed_dim=512, num_features=9, image_size=128):
         super().__init__()
+        self.num_features = num_features
+        self.embed_dim = embed_dim
         self.encoder = nn.Sequential(
             # 128x128 -> 64x64
             nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1),
@@ -49,14 +51,14 @@ class ImageEmbedding(nn.Module):
         self.projection = nn.Sequential(
             nn.Linear(512, 2048),
             nn.SiLU(),
-            nn.Linear(2048, 9 * embed_dim),  # 4608 to match FeatureEmbedding
+            nn.Linear(2048, num_features * embed_dim),  # Match FeatureEmbedding output
         )
     
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, images):
         # images: [B, 3, 128, 128]
         features = self.encoder(images)  # [B, 512, 1, 1]
         features = features.flatten(1)    # [B, 512]
-        embedding = self.projection(features)  # [B, 4608]
+        embedding = self.projection(features)  # [B, num_features * embed_dim]
         return embedding
     
     
@@ -99,12 +101,13 @@ class Generator(nn.Module):
         # Feature embedding: outputs [B, num_features * embed_dim] = [B, 4608]
         self.feature_embedding = FeatureEmbedding(num_features=num_features, embed_dim=embed_dim)
 
-        feature_emb_dim = num_features * embed_dim  # 4608
+        feature_emb_dim = num_features * embed_dim
         
         if initial_image:
-            # Image embedding: encodes 128x128 input image to [B, 4608]
-            self.image_embedding = ImageEmbedding(in_channels=3, embed_dim=embed_dim, image_size=128)
-            # Concatenate feature embedding + image embedding: 4608 + 4608 = 9216
+            # Image embedding: encodes 128x128 input image to [B, num_features * embed_dim]
+            self.image_embedding = ImageEmbedding(in_channels=3, embed_dim=embed_dim, 
+                                                  num_features=num_features, image_size=128)
+            # Concatenate feature embedding + image embedding
             combined_emb_dim = feature_emb_dim * 2
         else:
             self.image_embedding = None
@@ -147,35 +150,21 @@ class Generator(nn.Module):
         self.tanh = nn.Tanh()
 
     def forward(self, noise, features, initial_image=None):
-        """
-        Forward pass of the generator.
-        
-        Args:
-            noise: [B, noise_dim, 1, 1] - Random noise vector
-            features: [B, num_features] - Input features (9 features)
-            initial_image: [B, 3, 128, 128] - Optional initial image (if initial_image=True)
-        
-        Returns:
-            [B, 3, 512, 512] - Generated image
-        """
-        # Embed features: [B, 9] -> [B, 4608]
+        # Embed features: [B, num_features] -> [B, num_features * embed_dim]
         feature_emb = self.feature_embedding(features)
-        
-        # If using initial image, embed and concatenate
+
         if self.initial_image and initial_image is not None and self.image_embedding is not None:
-            # Embed initial image: [B, 3, 128, 128] -> [B, 4608]
+            # Embed initial image: [B, 3, 128, 128] -> [B, num_features * embed_dim]
             image_emb = self.image_embedding(initial_image)
-            # Concatenate: [B, 4608] + [B, 4608] = [B, 9216]
+            # Concatenate: [B, num_features * embed_dim] + [B, num_features * embed_dim]
             combined_emb = torch.cat([feature_emb, image_emb], dim=1)
         else:
-            # Use only feature embedding: [B, 4608]
+            # Use only feature embedding
             combined_emb = feature_emb
 
-        # Flatten noise and concatenate with embeddings
         noise_flat = noise.view(noise.shape[0], -1)  # [B, noise_dim]
         combined_features = torch.cat([noise_flat, combined_emb], dim=1)  # [B, noise_dim + emb_dim]
-        
-        # Project to initial feature map: [B, 1024*4*4]
+
         z = self.fc(combined_features)
         z = z.view(z.shape[0], 1024, 4, 4)  # [B, 1024, 4, 4]
 
@@ -207,7 +196,7 @@ class Discriminator(nn.Module):
 
         # Feature embedding for conditioning
         self.feature_embedding = FeatureEmbedding(num_features=num_features, embed_dim=embed_dim)
-        feature_emb_dim = num_features * embed_dim  # 4608
+        feature_emb_dim = num_features * embed_dim
 
         # Discriminator convolution layers for 512x512 input
         # Input: [B, 3, 512, 512]
@@ -226,53 +215,35 @@ class Discriminator(nn.Module):
         self.bn4 = nn.BatchNorm2d(256)
         self.relu4 = nn.LeakyReLU(0.2, inplace=False)
 
-        # Self-attention at 32x32 resolution (moved here to save memory)
         self.attn = SelfAttention(256)
 
         self.conv5 = nn.Conv2d(256, 512, 4, 2, 1)  # -> [B, 512, 16, 16]
         self.bn5 = nn.BatchNorm2d(512)
         self.relu5 = nn.LeakyReLU(0.2, inplace=False)
 
-        # Final output layer with feature concatenation
         # At 16x16 resolution: 512 image features + 4608 text features per spatial location
         self.output = nn.Conv2d(512 + feature_emb_dim, 1, 4, 1, 0, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x, features):
-        """
-        Forward pass of the discriminator.
-        
-        Args:
-            x: [B, 3, 512, 512] - Input image
-            features: [B, num_features] - Conditioning features
-        
-        Returns:
-            out: [B] - Probability that input is real (0-1)
-            x_out: [B, 512, 16, 16] - Intermediate activations for feature matching
-        """
-        # Convolutional feature extraction
         x_out = self.relu1(self.conv1(x))        # [B, 32, 256, 256]
         x_out = self.relu2(self.bn2(self.conv2(x_out)))  # [B, 64, 128, 128]
         x_out = self.relu3(self.bn3(self.conv3(x_out)))  # [B, 128, 64, 64]
         x_out = self.relu4(self.bn4(self.conv4(x_out)))  # [B, 256, 32, 32]
-        
-        # Apply self-attention at 32x32 resolution (saves memory)
-        x_out = self.attn(x_out)                 # [B, 256, 32, 32] with attention
+
+        x_out = self.attn(x_out)                 # [B, 256, 32, 32]
         
         x_out = self.relu5(self.bn5(self.conv5(x_out)))  # [B, 512, 16, 16]
 
-        batch_size, _, height, width = x_out.size()
+        _, _, height, width = x_out.size()
 
-        # Embed features and expand spatially to match feature map
-        feature_emb = self.feature_embedding(features)  # [B, 4608]
-        feature_emb = feature_emb.view(feature_emb.size(0), feature_emb.size(1), 1, 1)  # [B, 4608, 1, 1]
-        feature_emb = feature_emb.expand(-1, -1, height, width)  # [B, 4608, 16, 16]
-        
-        # Concatenate image features with conditioning features
-        combined = torch.cat([x_out, feature_emb], dim=1)  # [B, 512+4608, 16, 16]
+        feature_emb = self.feature_embedding(features)  # [B, num_features * embed_dim]
+        feature_emb = feature_emb.view(feature_emb.size(0), feature_emb.size(1), 1, 1)
+        feature_emb = feature_emb.expand(-1, -1, height, width)
 
-        # Final classification
-        out = self.output(combined)  # [B, 1, 13, 13] or similar depending on padding
+        combined = torch.cat([x_out, feature_emb], dim=1)  # [B, 512 + feature_emb_dim, 16, 16]
+
+        out = self.output(combined)  # [B, 1, 13, 13]
         out = self.sigmoid(out)      # [B, 1, 13, 13]
 
         return out.squeeze(), x_out

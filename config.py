@@ -14,15 +14,14 @@ IMG_HEIGHT = 128
 TARGET_WIDTH = 512
 TARGET_HEIGHT = 512
 CHANNELS = 3
-EMBEDDING_DIM = 128
-EMBEDDING_OUT_DIM = 256
+EMBEDDING_OUT_DIM = 512
 FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_raw", "cielab_a_raw", "cielab_b_raw", "bleaching", "duration", "concentration"]
 FEATURE_NORMALIZATION = True
 FEATURE_MINS = [5.6,15,0,16.87,-1.91,-16.75,1,1,1000]
 FEATURE_MAXS = [30,42,95,40,1.62,-0.5,4,7,7000]
 INITIAL_IMAGE = True
 
-# Model / training defaults
+# gan training defaults
 NOISE_DIM = 128
 FIXED_G_LR = 0.0001
 FIXED_D_LR = 0.0001
@@ -31,12 +30,9 @@ L1_FACTOR = 50.0
 L2_FACTOR = 150.0
 VAL_EPOCH = 5
 
-# Devices for training (indices as seen by the system)
-# Used by run_train.sh and DDP world size.
+# ddp
 DEVICE_IDS = [0, 1]
 WORLD_SIZE = len(DEVICE_IDS)
-
-# Per-GPU batch size and dataloader workers
 BATCH_SIZE_PER_GPU = 8
 NUM_WORKERS = 4
 

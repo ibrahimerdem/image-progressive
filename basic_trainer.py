@@ -294,18 +294,17 @@ def _ddp_train_worker(
     else:
         feature_dim = len(getattr(cfg, "FEATURE_COLUMNS", []))
 
-    # Generator no longer needs external image_encoder - it has ImageEmbedding built-in
     generator = Generator(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
-        embed_dim=cfg.EMBEDDING_OUT_DIM,  # Use EMBEDDING_OUT_DIM as embed_dim
+        embed_dim=cfg.EMBEDDING_OUT_DIM,
         num_features=feature_dim,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
     discriminator = Discriminator(
         channels=cfg.CHANNELS,
-        embed_dim=cfg.EMBEDDING_OUT_DIM,  # Use EMBEDDING_OUT_DIM as embed_dim
+        embed_dim=cfg.EMBEDDING_OUT_DIM,
         num_features=feature_dim,
     ).to(device)
 
