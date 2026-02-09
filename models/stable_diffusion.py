@@ -84,10 +84,10 @@ class ImageEmbedding(nn.Module):
         self.projection = nn.Sequential(
             nn.Linear(512, 2048),
             nn.SiLU(),
-            nn.Linear(2048, 9 * embed_dim),  # 4608 to match FeatureEmbedding
+            nn.Linear(2048, 9 * embed_dim),  # 4608
         )
     
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, images):
         # images: [B, 3, 128, 128]
         features = self.encoder(images)  # [B, 512, 1, 1]
         features = features.flatten(1)    # [B, 512]
@@ -96,7 +96,7 @@ class ImageEmbedding(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim: int, context_dim: int, heads: int = 8, chunk_size: int = 1024):
+    def __init__(self, query_dim, context_dim, heads=8, chunk_size=1024):
         super().__init__()
         self.heads = heads
         self.scale = (query_dim // heads) ** -0.5
@@ -106,7 +106,7 @@ class CrossAttention(nn.Module):
         self.to_v = nn.Linear(context_dim, query_dim, bias=False)
         self.to_out = nn.Linear(query_dim, query_dim)
         
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, context):
         B, C, H, W = x.shape
         x_flat = x.view(B, C, H * W).permute(0, 2, 1)
         q = self.to_q(x_flat)
@@ -135,7 +135,7 @@ class CrossAttention(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int):
+    def __init__(self, in_channels, out_channels, time_dim, feature_dim):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.norm1 = nn.GroupNorm(8, out_channels)
@@ -150,7 +150,7 @@ class ResidualBlock(nn.Module):
         else:
             self.residual = nn.Identity()
     
-    def _forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
+    def _forward(self, x, time_emb, feature_emb):
         h = self.act(self.norm1(self.conv1(x)))
         h = self.norm2(self.conv2(h))
         time_film = self.time_film(time_emb).unsqueeze(-1).unsqueeze(-1)
@@ -160,7 +160,7 @@ class ResidualBlock(nn.Module):
         h = h + self.cross_attn(self.attn_norm(h), feature_emb)
         return self.act(h + self.residual(x))
 
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, time_emb, feature_emb):
         return torch.utils.checkpoint.checkpoint(self._forward, x, time_emb, feature_emb, use_reentrant=False)
 
 
@@ -170,7 +170,7 @@ class AttentionBlock(nn.Module):
         self.norm = nn.GroupNorm(8, channels)
         self.attn = nn.MultiheadAttention(channels, num_heads, batch_first=False)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         b, c, h, w = x.shape
         normed = self.norm(x)
         flat = normed.view(b, c, -1).permute(2, 0, 1)
@@ -266,13 +266,13 @@ class GaussianDiffusion(nn.Module):
 
     def p_loss(
         self,
-        model: nn.Module,
-        x_start: torch.Tensor,
-        features: torch.Tensor,
+        model,
+        x_start,
+        features,
         vae_encoder=None,
-        initial_images: Optional[torch.Tensor] = None,
-    ) -> dict:
-        # If VAE encoder provided, encode images to latent space
+        initial_images=None,
+    ):
+
         if vae_encoder is not None:
             with torch.no_grad():
                 # VAE encoder expects noise for reparameterization
@@ -281,7 +281,6 @@ class GaussianDiffusion(nn.Module):
                     x_start.size(2) // 8, x_start.size(3) // 8,
                     device=x_start.device
                 )
-                # VAE encoder already scales by 0.18215 internally
                 x_start_latent = vae_encoder(x_start, noise_for_vae)
         else:
             x_start_latent = x_start
@@ -296,21 +295,21 @@ class GaussianDiffusion(nn.Module):
 
     def sample(
         self,
-        model: nn.Module,
-        features: torch.Tensor,
-        steps: Optional[int] = None,
-        save_intermediates: bool = False,
-        eta: float = 0.0,
-        latent_shape: tuple = None,  # (B, C, H, W) for latent space
-        initial_images: Optional[torch.Tensor] = None,
+        model,
+        features,
+        steps=None,
+        save_intermediates=False,
+        eta=0.0,
+        latent_shape=None,  # (B, C, H, W) for latent space
+        initial_images=None,
     ):
         steps = steps or self.timesteps
         if latent_shape is None:
-            # Default to RGB image space (backward compatibility)
             shape = (features.size(0), cfg.CHANNELS, cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH)
         else:
             shape = latent_shape
         img = torch.randn(shape, device=features.device)
+
         intermediates = []
         if steps < self.timesteps:
             c = self.timesteps // steps
@@ -318,6 +317,7 @@ class GaussianDiffusion(nn.Module):
             timestep_schedule = torch.flip(timestep_schedule, [0])
         else:
             timestep_schedule = torch.arange(self.timesteps - 1, -1, -1, dtype=torch.long)
+        
         for step_idx, timestep in enumerate(timestep_schedule):
             t = torch.full((shape[0],), timestep, dtype=torch.long, device=img.device)
             with torch.no_grad() if not model.training else torch.enable_grad():
@@ -333,6 +333,7 @@ class GaussianDiffusion(nn.Module):
             sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
             sqrt_alpha_bar_t = torch.clamp(sqrt_alpha_bar_t, min=1e-8)
             pred_x0 = (img - sqrt_one_minus_alpha_bar_t * epsilon) / sqrt_alpha_bar_t
+
             # Clamp predicted x0: use wider range for latents, tight range for images
             if latent_shape is not None:
                 # Latent space: use much wider range (VAE latents can be large)
@@ -340,6 +341,7 @@ class GaussianDiffusion(nn.Module):
             else:
                 # Image space: standard pixel range
                 pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
+
             variance = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)
             variance = torch.clamp(variance, min=0.0, max=1.0)
             sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
@@ -369,7 +371,6 @@ class StableDiffusionConditioned(nn.Module):
         self.feature_projection = FeatureEmbedding(num_features=9, embed_dim=512)
         self.time_embedding = TimeEmbedding(time_dim)
         
-        # Optional: Image embedding for initial image conditioning
         if use_initial_image:
             self.image_projection = ImageEmbedding(in_channels=3, embed_dim=512, image_size=128)
             # When using image, concatenate with features: 4608 + 4608 = 9216
@@ -388,15 +389,14 @@ class StableDiffusionConditioned(nn.Module):
 
     def forward(
         self,
-        noisy_latent: torch.Tensor,
-        timesteps: torch.Tensor,
-        features: torch.Tensor,
-        initial_images: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        noisy_latent,
+        timesteps,
+        features,
+        initial_images=None,
+    ):
         time_emb = self.time_embedding(timesteps) * self.time_scale
         feature_emb = self.feature_projection(features) * self.feature_scale  # [B, 4608]
-        
-        # Optionally concatenate initial image embedding
+
         if self.use_initial_image and initial_images is not None:
             image_emb = self.image_projection(initial_images) * self.image_scale  # [B, 4608]
             # Concatenate: [B, 4608] + [B, 4608] = [B, 9216]
@@ -408,16 +408,16 @@ class StableDiffusionConditioned(nn.Module):
 
 
 class StableDiffusionPipeline:
-    def __init__(self, model: StableDiffusionConditioned, schedule: GaussianDiffusion, 
+    def __init__(self, model, schedule, 
                  vae_encoder=None, vae_decoder=None):
         self.model = model
         self.schedule = schedule
         self.vae_encoder = vae_encoder
         self.vae_decoder = vae_decoder
 
-    def sample(self, features: torch.Tensor, steps: Optional[int] = None, save_intermediates: bool = False,
-               initial_images: Optional[torch.Tensor] = None):
-        # Sample in latent space if VAE is provided
+    def sample(self, features, steps=None, save_intermediates=False,
+               initial_images=None):
+       
         if self.vae_encoder is not None and self.vae_decoder is not None:
             # Latent space: 4 channels, H/8, W/8
             batch_size = features.size(0)
@@ -434,11 +434,8 @@ class StableDiffusionPipeline:
             
             if save_intermediates and isinstance(result, tuple):
                 latents, intermediates = result
-                # Decode final latents to images
                 images = self.vae_decoder(latents)
-                # Clamp decoded images to reasonable range for visualization
                 images = torch.clamp(images, -1.0, 1.0)
-                # Also decode intermediates
                 decoded_intermediates = []
                 for t, latent in intermediates:
                     img = self.vae_decoder(latent)
@@ -447,13 +444,10 @@ class StableDiffusionPipeline:
                 return images, decoded_intermediates
             else:
                 latents = result
-                # Decode latents to images
                 images = self.vae_decoder(latents)
-                # Clamp decoded images to reasonable range for visualization
                 images = torch.clamp(images, -1.0, 1.0)
                 return images
         else:
-            # Original behavior: sample directly in image space
             return self.schedule.sample(self.model, features, steps, 
                                        save_intermediates=save_intermediates,
                                        initial_images=initial_images)

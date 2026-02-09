@@ -80,11 +80,9 @@ def load_checkpoint(
     return epoch, loss
 
 def denormalize_image(image: torch.Tensor) -> torch.Tensor:
-    """Denormalize image from [-1, 1] to [0, 1]"""
     return (image + 1) / 2
 
 def calculate_psnr(img1, img2):
-    """Calculate PSNR between two images. Detach to avoid grad issues during validation."""
     img1 = denormalize_image(img1.detach()).cpu().numpy()
     img2 = denormalize_image(img2.detach()).cpu().numpy()
     
@@ -100,7 +98,6 @@ def calculate_psnr(img1, img2):
     return np.mean(psnr_values)
 
 def calculate_ssim(img1, img2):
-    """Calculate SSIM between two images. Detach to avoid grad issues during validation."""
     img1 = denormalize_image(img1.detach()).cpu().numpy()
     img2 = denormalize_image(img2.detach()).cpu().numpy()
     
@@ -162,7 +159,6 @@ def visualize_results(
 
 
 class AverageMeter:
-    """Computes and stores the average and current value"""
     
     def __init__(self):
         self.reset()
@@ -181,16 +177,14 @@ class AverageMeter:
 
 
 class EarlyStopping:
-    """Early stopping to stop training when validation loss doesn't improve"""
-    
-    def __init__(self, patience: int = 10, min_delta: float = 0.0):
+    def __init__(self, patience=10, min_delta=0.0):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
         self.best_loss = None
         self.early_stop = False
     
-    def __call__(self, val_loss: float) -> bool:
+    def __call__(self, val_loss):
         if self. best_loss is None: 
             self.best_loss = val_loss
         elif val_loss > self.best_loss - self. min_delta:
@@ -205,23 +199,20 @@ class EarlyStopping:
 
 
 def count_parameters(model):
-    """Count trainable parameters"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 class MetricsLogger:
-
-    def __init__(self, log_dir: str, filename: str):
+    def __init__(self, log_dir, filename):
         os.makedirs(log_dir, exist_ok=True)
         self.log_path = os.path.join(log_dir, filename)
         self.header_written = os.path.exists(self.log_path) and os.path.getsize(self.log_path) > 0
 
-    def log(self, metrics: dict):
+    def log(self, metrics):
 
         if not metrics:
             return
 
-        # Ensure deterministic column order
         keys = list(metrics.keys())
         values = [metrics[k] for k in keys]
 
@@ -298,22 +289,18 @@ def save_random_sample_pairs(
 
 
 def save_diffusion_intermediates(intermediates, sample_dir, epoch, sample_idx=0):
-    """Save intermediate diffusion steps as a grid."""
     os.makedirs(sample_dir, exist_ok=True)
     
     num_steps = len(intermediates)
     if num_steps == 0:
         return
     
-    # Create a grid showing denoising progress
     fig, axes = plt.subplots(1, num_steps, figsize=(3 * num_steps, 3))
     if num_steps == 1:
         axes = [axes]
     
     for idx, (step, img_tensor) in enumerate(intermediates):
-        # Take first image from batch
         img = denormalize_image(img_tensor[sample_idx].detach()).cpu().permute(1, 2, 0)
-        # Convert to float32 and clip to [0, 1]
         img = np.clip(img.float().numpy(), 0, 1).astype(np.float32)
         
         axes[idx].imshow(img)

@@ -1,12 +1,3 @@
-#!/usr/bin/env python
-"""
-Test and Inference Script for Stable Diffusion Model
-
-This script provides evaluation functionality for the SD model:
-1. Evaluate model performance on test dataset
-2. Generate images with the diffusion process
-"""
-
 import argparse
 import os
 import time
@@ -33,8 +24,8 @@ from utils.dataset import create_dataloaders
 import config as cfg
 
 
-def load_vae(checkpoint_path: str, device: torch.device):
-    """Load pretrained VAE encoder and decoder"""
+def load_vae(checkpoint_path, device):
+
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"VAE checkpoint not found: {checkpoint_path}")
     
@@ -58,8 +49,7 @@ def load_vae(checkpoint_path: str, device: torch.device):
     return vae_encoder, vae_decoder
 
 
-def load_sd_model_from_checkpoint(checkpoint_path: str, vae_checkpoint_path: str, device: torch.device):
-    """Load SD model and VAE from checkpoints."""
+def load_sd_model_from_checkpoint(checkpoint_path, vae_checkpoint_path, device):
     print(f"Loading SD checkpoint from: {checkpoint_path}")
     
     if not os.path.exists(checkpoint_path):
@@ -97,8 +87,7 @@ def load_sd_model_from_checkpoint(checkpoint_path: str, vae_checkpoint_path: str
         sd_model.load_state_dict(checkpoint)
     
     sd_model.eval()
-    
-    # Create pipeline
+ 
     pipeline = StableDiffusionPipeline(
         model=sd_model,
         schedule=schedule,
@@ -113,32 +102,18 @@ def load_sd_model_from_checkpoint(checkpoint_path: str, vae_checkpoint_path: str
 
 
 def evaluate_test_set(
-    pipeline: StableDiffusionPipeline,
-    device: torch.device,
-    batch_size: int = 8,
-    num_workers: int = 2,
-    save_samples: bool = True,
-    num_inference_steps: int = 50,
+    pipeline,
+    device,
+    batch_size=8,
+    num_workers=2,
+    save_samples=True,
+    num_inference_steps=50,
 ):
-    """
-    Evaluate SD model performance on test dataset.
-    
-    Args:
-        pipeline: StableDiffusionPipeline
-        device: Device to run evaluation on
-        batch_size: Batch size for evaluation
-        num_workers: Number of dataloader workers
-        save_samples: Whether to save sample outputs
-        num_inference_steps: Number of diffusion steps for sampling
-    
-    Returns:
-        Dictionary with evaluation metrics
-    """
+
     print("\n" + "="*60)
     print("EVALUATING SD MODEL ON TEST DATASET")
     print("="*60)
-    
-    # Create test dataloader
+
     _, _, test_loader = create_dataloaders(
         batch_size=batch_size,
         num_workers=num_workers,
@@ -179,16 +154,14 @@ def evaluate_test_set(
             input_feat = input_feat.to(device)
             
             batch_size_local = target_image.size(0)
-            
-            # Generate images using diffusion
+
             generated_images = pipeline.sample(
                 features=input_feat,
                 steps=num_inference_steps,
                 save_intermediates=False,
                 initial_images=input_image
             )
-            
-            # Calculate metrics
+
             l1 = l1_loss(generated_images, target_image).item()
             psnr = calculate_psnr(generated_images, target_image)
             ssim = calculate_ssim(generated_images, target_image)
@@ -202,7 +175,6 @@ def evaluate_test_set(
             total_clip += clip_score
             total_count += batch_size_local
             
-            # Save samples from first batch only (same as GAN evaluation)
             if save_samples and batch_idx == 0:
                 num_samples = min(8, batch_size_local)
                 for i in range(num_samples):
@@ -231,8 +203,7 @@ def evaluate_test_set(
                 print(f"Processed {batch_idx + 1}/{len(test_loader)} batches...")
         
         elapsed_time = time.time() - start_time
-    
-    # Calculate average metrics
+
     avg_l1 = total_l1 / total_count
     avg_psnr = total_psnr / total_count
     avg_ssim = total_ssim / total_count

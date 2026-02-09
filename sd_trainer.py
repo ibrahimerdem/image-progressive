@@ -35,15 +35,13 @@ from utils.training import (
 )
 
 
-def _load_vae(checkpoint_path: str, device: torch.device):
-    """Load pretrained VAE encoder and decoder from checkpoint and freeze them"""
+def _load_vae(checkpoint_path, device):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"VAE checkpoint not found: {checkpoint_path}")
     
     print(f"[SD] Loading pretrained VAE from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     
-    # Debug: print checkpoint structure
     print(f"[SD] Checkpoint type: {type(checkpoint)}")
     if isinstance(checkpoint, dict):
         print(f"[SD] Checkpoint keys: {list(checkpoint.keys())[:10]}")
@@ -164,28 +162,15 @@ def _load_vae(checkpoint_path: str, device: torch.device):
 
 
 def _measure_denoising_quality(
-    model: nn.Module,
-    diffusion: GaussianDiffusion,
-    features: torch.Tensor,
-    targets: torch.Tensor,
-    device: torch.device,
+    model,
+    diffusion,
+    features,
+    targets,
+    device,
     vae_encoder=None,
-    timesteps_to_test: list = [100, 200, 400, 600, 800],
-    initial_images: Optional[torch.Tensor] = None,
+    timesteps_to_test=[100, 200, 400, 600, 800],
+    initial_images=None,
 ):
-    """
-    Measure model's denoising ability at different noise levels.
-    Returns MSE loss for each tested timestep + prediction statistics.
-    
-    Lower loss = better denoising at that noise level
-    < 0.05: Model denoises well at this timestep
-    0.05-0.1: Model is learning
-    > 0.1: Model struggles at this noise level
-    
-    Also returns prediction variance to detect mode collapse.
-    Healthy model: variance > 0.5
-    Collapsed model: variance < 0.1 (predicting near-constant values)
-    """
     model.eval()
     losses_by_timestep = {}
     prediction_stats = {}
@@ -228,11 +213,10 @@ def _measure_denoising_quality(
     return losses_by_timestep, prediction_stats
 
 
-def _setup_ddp(rank: int, world_size: int) -> torch.device:
+def _setup_ddp(rank, world_size):
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
-    
-    # Set DDP timeout for slow validation
+
     timeout_minutes = getattr(cfg, "SD_DDP_TIMEOUT_MINUTES", 10)
     timeout = torch.distributed.timedelta(minutes=timeout_minutes)
     
@@ -247,7 +231,7 @@ def _cleanup_ddp() -> None:
         dist.destroy_process_group()
 
 
-def _save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, save_dir: str, version: str, ema_model=None) -> str:
+def _save_checkpoint(model, optimizer, epoch, save_dir, version, ema_model=None):
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
@@ -263,7 +247,7 @@ def _save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, epoch: 
     return filename
 
 
-def _load_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, checkpoint_path: str) -> int:
+def _load_checkpoint(model, optimizer, checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     target = model.module if isinstance(model, DDP) else model
     target.load_state_dict(checkpoint["model_state_dict"])
@@ -273,17 +257,17 @@ def _load_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer, checkpo
 
 
 def _run_validation(
-    model: nn.Module,
-    pipeline: StableDiffusionPipeline,
-    diffusion: GaussianDiffusion,
+    model,
+    pipeline,
+    diffusion,
     val_loader,
     device,
     clip_model,
     clip_preprocess,
-    sample_dir: str,
-    epoch: int,
+    sample_dir,
+    epoch,
     vae_encoder=None,
-    rank: int = 0,
+    rank=0,
 ):
     if val_loader is None or clip_model is None or clip_preprocess is None:
         return None
@@ -304,8 +288,6 @@ def _run_validation(
 
     autocast_ctx = (lambda: autocast(device_type="cuda")) if device.type == "cuda" else (lambda: nullcontext())
 
-    # VALIDATION SET: Calculate metrics over entire validation dataset
-    # Features are [B, 9] tensor (9 continuous features normalized [0-1])
     for idx, (initial_images, features, target_images, _) in enumerate(val_loader):
         
         initial_images = initial_images.to(device)
@@ -316,8 +298,6 @@ def _run_validation(
             with autocast_ctx():
                 val_steps = cfg.SD_SAMPLE_STEPS
                 
-                # Generate from pure noise (full generation)
-                # Pass initial images if config flag is enabled
                 if cfg.INITIAL_IMAGE:
                     samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
                                             initial_images=initial_images)
@@ -574,7 +554,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         should_validate = (
             rank == 0
             and val_loader is not None
-            and (cfg.VAL_EPOCH <= 1 or epoch % cfg.VAL_EPOCH == 0)
+            and (cfg.SD_VAL_EPOCH <= 1 or epoch % cfg.SD_VAL_EPOCH == 0)
         )
         if should_validate:
             print(f"[SD] Rank {rank} starting validation")
@@ -645,31 +625,6 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 
                 metrics_logger.log(log_dict)
                 
-                # Print progress summary at key milestones
-                if epoch in [10, 20, 30, 50, 75, 100]:
-                    print(f"\n{'='*60}")
-                    print(f"PROGRESS SUMMARY - Epoch {epoch}/100")
-                    print(f"{'='*60}")
-                    print(f"Training Loss:  {avg_loss:.4f}")
-                    print(f"PSNR:          {val_metrics['val_psnr']:.2f} dB  (target: >25 dB)")
-                    print(f"SSIM:          {val_metrics['val_ssim']:.4f}  (target: >0.75)")
-                    print(f"CLIP Sim:      {val_metrics['val_clip']:.4f}  (target: >0.70)")
-                    
-                    # Prediction variance (collapse detection)
-                    pred_var = val_metrics.get('pred_variance', 0)
-                    if pred_var < 0.1:
-                        var_status = "⚠️  MODE COLLAPSE"
-                    elif pred_var < 0.3:
-                        var_status = "⚠ Low (risk)"
-                    else:
-                        var_status = "✓ Healthy"
-                    print(f"Pred Variance: {pred_var:.4f}  {var_status}")
-                    
-                    # Count how many timesteps are learned well
-                    good_timesteps = sum(1 for k in timestep_keys if val_metrics[k] < 0.05)
-                    total_timesteps = len(timestep_keys)
-                    print(f"Learned steps: {good_timesteps}/{total_timesteps} timesteps < 0.05 loss")
-                    print(f"{'='*60}\n")
             else:
                 print(f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | Time: {elapsed:.2f}s")
                 metrics_logger.log({"epoch": epoch, "train_loss": avg_loss})
