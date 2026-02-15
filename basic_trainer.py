@@ -81,12 +81,8 @@ def train(
 
         for idx, (input_image, input_feat, target_image, wrong_image) in enumerate(train_loader):
             batch_time = time.time()
-
-            # If the generator uses an image embedding, pass the image; otherwise None
-            if generator.module.image_embedding if isinstance(generator, nn.DataParallel) else generator.image_embedding is not None:
-                input_image = input_image.to(device)
-            else:
-                input_image = None
+            
+            input_image = input_image.to(device)
 
             images = target_image.to(device)
             wrong_images = wrong_image.to(device)
@@ -155,10 +151,8 @@ def train(
 
             with torch.no_grad():
                 for val_batch_idx, (v_input_image, v_input_feat, v_target_image, _) in enumerate(val_loader):
-                    if generator.module.image_embedding if isinstance(generator, nn.DataParallel) else generator.image_embedding is not None:
-                        v_input_image = v_input_image.to(device)
-                    else:
-                        v_input_image = None
+                    # Always use initial image (required)
+                    v_input_image = v_input_image.to(device)
 
                     v_images = v_target_image.to(device)
                     v_embeddings = v_input_feat.to(device)
@@ -288,24 +282,20 @@ def _ddp_train_worker(
         world_size=world_size,
     )
 
-    train_dataset = train_loader.dataset
-    if hasattr(train_dataset, "input_data"):
-        feature_dim = train_dataset.input_data.shape[1]
-    else:
-        feature_dim = len(getattr(cfg, "FEATURE_COLUMNS", []))
-
     generator = Generator(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
-        num_features=feature_dim,
+        num_types=cfg.NUM_TYPES,
+        num_replications=cfg.NUM_REPLICATIONS,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
     discriminator = Discriminator(
         channels=cfg.CHANNELS,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
-        num_features=feature_dim,
+        num_types=cfg.NUM_TYPES,
+        num_replications=cfg.NUM_REPLICATIONS,
     ).to(device)
 
     # Convert BatchNorm to SyncBatchNorm for DDP
@@ -642,13 +632,13 @@ def main() -> None:
     # Dataset / feature info for the user
     train_dataset = train_loader.dataset
     val_dataset = val_loader.dataset
-    feature_dim = train_dataset.input_data.shape[1]
 
     print("=" * 80)
     print("Dataset summary")
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
-    print(f"Feature dimension: {feature_dim}")
+    print(f"Feature columns: {cfg.FEATURE_COLUMNS}")
+    print(f"Num types: {cfg.NUM_TYPES}, Num replications: {cfg.NUM_REPLICATIONS}")
     print(f"Batch size: {cfg.BATCH_SIZE_PER_GPU}")
     print(f"Initial image size: {cfg.IMG_WIDTH}x{cfg.IMG_HEIGHT}")
     print(f"Target image size: {cfg.TARGET_WIDTH}x{cfg.TARGET_HEIGHT}")
@@ -659,15 +649,17 @@ def main() -> None:
     generator = Generator(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
-        embed_dim=cfg.EMBEDDING_OUT_DIM,  # Use EMBEDDING_OUT_DIM as embed_dim
-        num_features=feature_dim,
+        embed_dim=cfg.EMBEDDING_OUT_DIM,
+        num_types=cfg.NUM_TYPES,
+        num_replications=cfg.NUM_REPLICATIONS,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
     discriminator = Discriminator(
         channels=cfg.CHANNELS,
-        embed_dim=cfg.EMBEDDING_OUT_DIM,  # Use EMBEDDING_OUT_DIM as embed_dim
-        num_features=feature_dim,
+        embed_dim=cfg.EMBEDDING_OUT_DIM,
+        num_types=cfg.NUM_TYPES,
+        num_replications=cfg.NUM_REPLICATIONS,
     ).to(device)
 
     print(

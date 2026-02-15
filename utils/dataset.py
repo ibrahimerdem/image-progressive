@@ -11,24 +11,11 @@ import config as cfg
 
 
 class CustomDataset(Dataset):
-    """Dataset aligned with
-
-    data/
-        initial/
-        target/
-        training_features.csv
-        validation_features.csv
-        test_features.csv
-
-    CSV columns:
-        initial_filename,target_filename,feature_1,feature_2,...
-    """
 
     def __init__(self, split: str = "train"):
         assert split in {"train", "val", "test"}
         self.split = split
 
-        # Image & feature config
         self.img_width = cfg.IMG_WIDTH
         self.img_height = cfg.IMG_HEIGHT
         self.imgh_width = cfg.TARGET_WIDTH
@@ -62,39 +49,34 @@ class CustomDataset(Dataset):
     def _load_data(self):
         df = pd.read_csv(self.csv_path)
 
-        # Optional recipe column used only for negative sampling
         recipes = None
         if "recipe" in df.columns:
             recipes = df["recipe"].astype(np.int32).values
 
-        # Determine feature columns: everything except filenames (and recipe id)
-        if cfg.FEATURE_COLUMNS:
-            feature_cols = cfg.FEATURE_COLUMNS
-        else:
-            exclude_cols = {"initial_filename", "target_filename", "recipe"}
-            feature_cols = [c for c in df.columns if c not in exclude_cols]
+        type_indices = df["type"].astype(np.int32).values - 1
+        replication_indices = df["replication"].astype(np.int32).values - 1 
 
-        input_data = df[feature_cols].astype(np.float32)
+        input_data = np.stack([type_indices, replication_indices], axis=1).astype(np.int64)
 
-        # Optional normalization to [-1, 1]
-        if cfg.FEATURE_NORMALIZATION and cfg.FEATURE_MAXS and cfg.FEATURE_MINS:
-            maxs = np.array(cfg.FEATURE_MAXS, dtype=np.float32)
-            mins = np.array(cfg.FEATURE_MINS, dtype=np.float32)
-            vals = input_data.values
-            vals = 2 * (vals - mins) / (maxs - mins) - 1
-            input_data = pd.DataFrame(vals, columns=feature_cols)
-
-        input_array = input_data.values.astype(np.float32)
         initial_paths = df["initial_filename"].values
         target_paths = df["target_filename"].values
 
-        return input_array, initial_paths, target_paths, recipes
+        return input_data, initial_paths, target_paths, recipes
 
     def __len__(self):
         return len(self.input_data)
 
     def __getitem__(self, idx):
-        input_feat = torch.tensor(self.input_data[idx])
+        type_idx = self.input_data[idx, 0]
+        rep_idx = self.input_data[idx, 1]
+        
+        type_onehot = torch.zeros(cfg.NUM_TYPES, dtype=torch.float32)
+        type_onehot[type_idx] = 1.0
+        
+        rep_onehot = torch.zeros(cfg.NUM_REPLICATIONS, dtype=torch.float32)
+        rep_onehot[rep_idx] = 1.0
+
+        input_feat = torch.cat([type_onehot, rep_onehot], dim=0)
 
         initial_path = os.path.join(self.initial_dir, self.initial_paths[idx])
         target_path = os.path.join(self.target_dir, self.target_paths[idx])
@@ -105,7 +87,6 @@ class CustomDataset(Dataset):
         initial_img = self.transform_initial(initial_img)
         target_img = self.transform_target(target_img)
 
-        # For training/validation, also return a mismatched (wrong) target
         if self.split in {"train", "val"}:
             num_samples = len(self.target_paths)
 
@@ -134,7 +115,6 @@ class CustomDataset(Dataset):
 
             return initial_img, input_feat, target_img, wrong_img
 
-        # For test, no wrong image is needed
         return initial_img, input_feat, target_img, target_img
 
 

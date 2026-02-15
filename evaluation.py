@@ -36,15 +36,13 @@ def load_generator_from_checkpoint(checkpoint_path, device):
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # Determine feature dimension from config
-    feature_dim = len(cfg.FEATURE_COLUMNS)
-    
-    # Create generator with built-in ImageEmbedding
+    # Create generator with embedding architecture
     generator = Generator(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
-        num_features=feature_dim,
+        num_types=cfg.NUM_TYPES,
+        num_replications=cfg.NUM_REPLICATIONS,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
@@ -103,6 +101,7 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
     total_psnr = 0.0
     total_ssim = 0.0
     total_clip = 0.0
+    total_rgb_diff = 0.0
     total_count = 0
     
     # Output directory for samples
@@ -134,10 +133,21 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
                 fake_images, target_image, clip_model, clip_preprocess, device
             )
             
+            # Calculate average per-pixel Euclidean distance in RGB space
+            # Denormalize from [-1, 1] to [0, 255] for RGB color space
+            fake_rgb = ((fake_images + 1) / 2) * 255.0  # [B, 3, H, W]
+            target_rgb = ((target_image + 1) / 2) * 255.0  # [B, 3, H, W]
+            # Per-pixel Euclidean distance: sqrt((R1-R2)^2 + (G1-G2)^2 + (B1-B2)^2)
+            pixel_diff_squared = (fake_rgb - target_rgb) ** 2  # [B, 3, H, W]
+            pixel_euclidean = torch.sqrt(pixel_diff_squared.sum(dim=1))  # [B, H, W]
+            # Average over all pixels and batch
+            rgb_diff = pixel_euclidean.mean().item()
+            
             total_l1 += l1 * batch_size_local
             total_psnr += psnr * batch_size_local
             total_ssim += ssim * batch_size_local
             total_clip += clip_score
+            total_rgb_diff += rgb_diff * batch_size_local
             total_count += batch_size_local
             
             # Save samples from first batch
@@ -170,6 +180,7 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
     avg_psnr = total_psnr / total_count
     avg_ssim = total_ssim / total_count
     avg_clip = total_clip / total_count
+    avg_rgb_diff = total_rgb_diff / total_count
     
     # Print results
     print("\n" + "="*60)
@@ -182,6 +193,7 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
     print(f"  PSNR:          {avg_psnr:.2f} dB")
     print(f"  SSIM:          {avg_ssim:.4f}")
     print(f"  CLIP Score:    {avg_clip:.4f}")
+    print(f"  Avg RGB Dist:  {avg_rgb_diff:.4f} (per-pixel Euclidean, 0-255 scale)")
     print("="*60)
     
     if save_samples:
@@ -194,6 +206,7 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
         'psnr': avg_psnr,
         'ssim': avg_ssim,
         'clip_score': avg_clip,
+        'avg_rgb_diff': avg_rgb_diff,
         'evaluation_time': elapsed_time,
     }
     
