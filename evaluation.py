@@ -41,8 +41,6 @@ def load_generator_from_checkpoint(checkpoint_path, device):
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
-        num_types=cfg.NUM_TYPES,
-        num_replications=cfg.NUM_REPLICATIONS,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     

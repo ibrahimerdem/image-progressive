@@ -2,54 +2,44 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+import config as cfg
 
 
 class FeatureEmbedding(nn.Module):
-    def __init__(self, num_types=50, num_replications=3, embed_dim=512):
+    def __init__(self, embed_dim=512):
         super().__init__()
-        self.num_types = num_types
-        self.num_replications = num_replications
         self.embed_dim = embed_dim
+
+        # Read feature configuration from config
+        self.feature_columns = getattr(cfg, 'FEATURE_COLUMNS', [])
+        self.num_features = len(self.feature_columns)
         
-        # Embedding tables for all types and replications
-        self.type_embedding = nn.Embedding(num_types, embed_dim)
-        self.replication_embedding = nn.Embedding(num_replications, embed_dim)
+        # MLP to project all normalized features to single embedding vector
+        # Input: [B, num_features] -> Output: [B, embed_dim]
+        self.projection = nn.Sequential(
+            nn.Linear(self.num_features, 256),
+            nn.SiLU(),
+            nn.Linear(256, embed_dim),
+        )
     
-    def forward(self, features: torch.Tensor):
-        # features: [B, 53] one-hot encoded (but we'll ignore it and return all embeddings)
-        B = features.shape[0]
+    def forward(self, features):
+        # features: [B, num_features] - normalized continuous values
+        # Project to single embedding vector: [B, num_features] -> [B, embed_dim]
+        # e.g., [B, 9] -> [B, 512]
+        embedded = self.projection(features)
         
-        # Create indices for all types: [0, 1, 2, ..., 49]
-        type_indices = torch.arange(self.num_types, device=features.device)  # [50]
-        # Expand for batch: [50] -> [B, 50]
-        type_indices = type_indices.unsqueeze(0).expand(B, -1)
-        # Embed: [B, 50] -> [B, 50, embed_dim]
-        type_emb = self.type_embedding(type_indices)  # [B, 50, embed_dim]
-        
-        # Create indices for all replications: [0, 1, 2]
-        rep_indices = torch.arange(self.num_replications, device=features.device)  # [3]
-        # Expand for batch: [3] -> [B, 3]
-        rep_indices = rep_indices.unsqueeze(0).expand(B, -1)
-        # Embed: [B, 3] -> [B, 3, embed_dim]
-        rep_emb = self.replication_embedding(rep_indices)  # [B, 3, embed_dim]
-        
-        # Concatenate along sequence dimension: [B, 50+3, embed_dim] = [B, 53, embed_dim]
-        combined = torch.cat([type_emb, rep_emb], dim=1)
-        
-        return combined  # [B, 53, embed_dim]
+        # Add sequence dimension for compatibility: [B, embed_dim] -> [B, 1, embed_dim]
+        return embedded.unsqueeze(1)
 
 
 class ImageEmbedding(nn.Module):
     def __init__(self, in_channels=3, embed_dim=512, image_size=128, pretrained=True):
         super().__init__()
         self.embed_dim = embed_dim
-        
-        # Load pre-trained ResNet18 and remove final avgpool + fc layers
+
         resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
-        # Remove avgpool and fc, keep conv layers: output [B, 512, 4, 4]
         self.encoder = nn.Sequential(*list(resnet.children())[:-2])
-        
-        # Project to embed_dim channels, keep 4x4 spatial
+    
         self.projection = nn.Conv2d(512, embed_dim, kernel_size=1)
     
     def forward(self, images):
@@ -91,8 +81,6 @@ class Generator(nn.Module):
                  channels = 3,
                  noise_dim = 100,
                  embed_dim = 512,
-                 num_types = 50,
-                 num_replications = 3,
                  initial_image=True):
         super(Generator, self).__init__()
         self.channels = channels
@@ -100,32 +88,20 @@ class Generator(nn.Module):
         self.embed_dim = embed_dim
         self.initial_image = initial_image
 
-        # Feature embedding: outputs [B, 53, embed_dim] (50 types + 3 replications)
-        self.feature_embedding = FeatureEmbedding(
-            num_types=num_types, 
-            num_replications=num_replications, 
-            embed_dim=embed_dim
-        )
+        self.feature_embedding = FeatureEmbedding(embed_dim=embed_dim)
         
         # Image embedding: encodes 128x128 input image to [B, 16, embed_dim]
         self.image_embedding = ImageEmbedding(in_channels=3, embed_dim=embed_dim, image_size=128)
         
-        # Multi-head attention to process combined sequence
-        # Input: [B, 85, embed_dim] (16 image + 53 features + 16 noise)
         self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=8, batch_first=True)
-        
-        # Layer norm for transformer
         self.norm = nn.LayerNorm(embed_dim)
-        
-        # Project noise to tokens: [B, noise_dim] -> [B, num_noise_tokens, embed_dim]
+
         self.num_noise_tokens = 16
         self.noise_proj = nn.Sequential(
             nn.Linear(noise_dim, self.num_noise_tokens * embed_dim),
             nn.ReLU(),
         )
-        
-        # Project combined sequence to spatial feature map
-        # We'll take mean pooled features and project to spatial
+
         self.to_spatial = nn.Sequential(
             nn.Linear(embed_dim, 1024 * 4 * 4),
             nn.ReLU(),
@@ -167,22 +143,16 @@ class Generator(nn.Module):
     def forward(self, noise, features, initial_image):
         B = noise.shape[0]
         
-        # Embed features: [B, 53] -> [B, 53, embed_dim]
-        feature_emb = self.feature_embedding(features)  # [B, 53, 512]
-
-        # Embed initial image: [B, 3, 128, 128] -> [B, 16, embed_dim]
-        image_emb = self.image_embedding(initial_image)  # [B, 16, 512]
-        
-        # Project noise to tokens: [B, noise_dim] -> [B, num_noise_tokens, embed_dim]
+        feature_emb = self.feature_embedding(features) 
+        image_emb = self.image_embedding(initial_image)  
         noise_flat = noise.view(B, -1)  # [B, noise_dim]
-        noise_tokens = self.noise_proj(noise_flat).view(B, self.num_noise_tokens, self.embed_dim)  # [B, 16, 512]
+        noise_tokens = self.noise_proj(noise_flat).view(B, self.num_noise_tokens, self.embed_dim)
         
-        # Concatenate all sequences: [B, 16+53+16, embed_dim] = [B, 85, 512]
+        # Concatenate all sequences: [B, 16+1+16, embed_dim] = [B, 33, 512]
         combined_seq = torch.cat([image_emb, feature_emb, noise_tokens], dim=1)
-        
-        # Apply multi-head attention
-        attn_out, _ = self.attention(combined_seq, combined_seq, combined_seq)  # [B, 85, 512]
-        attn_out = self.norm(attn_out + combined_seq)  # Residual connection
+
+        attn_out, _ = self.attention(combined_seq, combined_seq, combined_seq)
+        attn_out = self.norm(attn_out + combined_seq)
         
         # Mean pool over sequence dimension: [B, 512]
         pooled = attn_out.mean(dim=1)
@@ -194,8 +164,7 @@ class Generator(nn.Module):
         z = F.relu(self.bn1(self.deconv1(spatial)))  # [B, 512, 8, 8]
         z = F.relu(self.bn2(self.deconv2(z)))  # [B, 256, 16, 16]
         z = F.relu(self.bn3(self.deconv3(z)))  # [B, 128, 32, 32]
-        
-        # Apply self-attention at 32x32 resolution (saves memory)
+
         z = self.attn(z)  # [B, 128, 32, 32]
         
         z = F.relu(self.bn4(self.deconv4(z)))  # [B, 64, 64, 64]     
@@ -209,19 +178,13 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self,
                  channels=3,
-                 embed_dim=512,
-                 num_types=50,
-                 num_replications=3):
+                 embed_dim=512):
         super(Discriminator, self).__init__()
         self.channels = channels
         self.embed_dim = embed_dim
 
-        # Feature embedding: outputs [B, 53, embed_dim]
-        self.feature_embedding = FeatureEmbedding(
-            num_types=num_types, 
-            num_replications=num_replications, 
-            embed_dim=embed_dim
-        )
+        # Feature embedding: reads cfg.FEATURE_COLUMNS and cfg.DISCRETE_NUMS
+        self.feature_embedding = FeatureEmbedding(embed_dim=embed_dim)
         
         # Project sequence to spatial: [B, 53, embed_dim] -> mean pool -> [B, embed_dim] -> [B, embed_dim, 16, 16]
         self.feature_to_spatial = nn.Sequential(
@@ -259,11 +222,11 @@ class Discriminator(nn.Module):
     def forward(self, x, features):
         B = x.shape[0]
         
-        # Encode features to sequence: [B, 53] -> [B, 53, embed_dim]
+        # Encode features to vector: [B, 9] -> [B, 1, embed_dim]
         feature_seq = self.feature_embedding(features)
         
-        # Mean pool over sequence: [B, 53, embed_dim] -> [B, embed_dim]
-        feature_pooled = feature_seq.mean(dim=1)
+        # Squeeze sequence dimension: [B, 1, embed_dim] -> [B, embed_dim]
+        feature_pooled = feature_seq.squeeze(1)
         
         # Project to spatial: [B, embed_dim] -> [B, embed_dim, 16, 16]
         feature_spatial = self.feature_to_spatial(feature_pooled).view(B, self.embed_dim, 16, 16)

@@ -20,6 +20,29 @@ from utils.dataset import create_dataloaders
 import config as cfg
 
 
+def calculate_avg_rgb_distance(fake_images, real_images):
+    """
+    Calculate average RGB distance between generated and real images.
+    Images should be in range [-1, 1] and shape [B, C, H, W].
+    Returns average Euclidean distance in RGB space (0-255 scale).
+    """
+    # Convert from [-1, 1] to [0, 1]
+    fake_01 = (fake_images + 1.0) / 2.0
+    real_01 = (real_images + 1.0) / 2.0
+    
+    # Calculate mean RGB values per image: [B, C, H, W] -> [B, C]
+    fake_mean_rgb = fake_01.mean(dim=[2, 3])  # Average over spatial dimensions
+    real_mean_rgb = real_01.mean(dim=[2, 3])
+    
+    # Calculate Euclidean distance in RGB space
+    rgb_dist = torch.sqrt(((fake_mean_rgb - real_mean_rgb) ** 2).sum(dim=1))  # [B]
+    
+    # Scale to 0-255 range and return average
+    rgb_dist_255 = rgb_dist * 255.0
+    
+    return rgb_dist_255.mean().item()
+
+
 def train(
     generator,
     discriminator,
@@ -139,11 +162,12 @@ def train(
         avg_g_loss = epoch_g_loss / len(train_loader)
 
         if (val_loader is not None) and (cfg.VAL_EPOCH <= 1 or (epoch) % cfg.VAL_EPOCH == 0):
-            # --- Validation: reconstruction + CLIP score + PSNR/SSIM ---
+            # --- Validation: reconstruction + CLIP score + PSNR/SSIM + RGB distance ---
             val_l1_total = 0.0
             val_psnr_sum = 0.0
             val_ssim_sum = 0.0
             val_clip_sum = 0.0
+            val_rgb_dist_sum = 0.0
             val_count = 0
 
             generator.eval()
@@ -174,6 +198,10 @@ def train(
                     # CLIP similarity
                     clip_sum_batch, _ = compute_clip_metrics_batch(v_fake, v_images, clip_model, clip_preprocess, device)
                     val_clip_sum += clip_sum_batch
+                    
+                    # Average RGB distance
+                    rgb_dist = calculate_avg_rgb_distance(v_fake, v_images)
+                    val_rgb_dist_sum += rgb_dist * bs
 
                     # Save random sample pairs once per validation
                     if val_batch_idx == 0:
@@ -193,13 +221,14 @@ def train(
             avg_val_psnr = val_psnr_sum / max(val_count, 1)
             avg_val_ssim = val_ssim_sum / max(val_count, 1)
             avg_val_clip = val_clip_sum / max(val_count, 1)
+            avg_val_rgb_dist = val_rgb_dist_sum / max(val_count, 1)
 
             elapsed = time.time() - start_time
             print(
                 f"Epoch [{epoch}/{start_epoch + num_epochs}] - "
                 f"Train D: {avg_d_loss:.4f}, Train G: {avg_g_loss:.4f}, "
                 f"Val L1: {avg_val_l1:.4f}, Val CLIP: {avg_val_clip:.4f} "
-                f"(PSNR: {avg_val_psnr:.2f}, SSIM: {avg_val_ssim:.4f}) | "
+                f"(PSNR: {avg_val_psnr:.2f}, SSIM: {avg_val_ssim:.4f}, RGB_dist: {avg_val_rgb_dist:.2f}) | "
                 f"Time: {elapsed:.2f}s\n"
             )
 
@@ -212,6 +241,7 @@ def train(
                     "val_psnr": avg_val_psnr,
                     "val_ssim": avg_val_ssim,
                     "val_clip": avg_val_clip,
+                    "val_rgb_dist": avg_val_rgb_dist,
                 }
             )
         else:
@@ -286,16 +316,12 @@ def _ddp_train_worker(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
-        num_types=cfg.NUM_TYPES,
-        num_replications=cfg.NUM_REPLICATIONS,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
     discriminator = Discriminator(
         channels=cfg.CHANNELS,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
-        num_types=cfg.NUM_TYPES,
-        num_replications=cfg.NUM_REPLICATIONS,
     ).to(device)
 
     # Convert BatchNorm to SyncBatchNorm for DDP
@@ -430,6 +456,7 @@ def _ddp_train_worker(
             val_psnr_sum = 0.0
             val_ssim_sum = 0.0
             val_clip_sum = 0.0
+            val_rgb_dist_sum = 0.0
             val_count = 0
 
             with torch.no_grad():
@@ -453,6 +480,10 @@ def _ddp_train_worker(
 
                     clip_sum_batch, _ = compute_clip_metrics_batch(v_fake, v_images, clip_model, clip_preprocess, device)
                     val_clip_sum += clip_sum_batch
+                    
+                    # Average RGB distance
+                    rgb_dist = calculate_avg_rgb_distance(v_fake, v_images)
+                    val_rgb_dist_sum += rgb_dist * bs
 
                     if val_batch_idx == 0 and rank == 0:
                         save_random_sample_pairs(
@@ -471,7 +502,7 @@ def _ddp_train_worker(
             dist.barrier()
             
             val_tensor = torch.tensor(
-                [val_l1_total, val_psnr_sum, val_ssim_sum, val_clip_sum, val_count],
+                [val_l1_total, val_psnr_sum, val_ssim_sum, val_clip_sum, val_rgb_dist_sum, val_count],
                 device=device,
             )
             dist.all_reduce(val_tensor, op=dist.ReduceOp.SUM)
@@ -480,6 +511,7 @@ def _ddp_train_worker(
                 total_psnr,
                 total_ssim,
                 total_clip,
+                total_rgb_dist,
                 total_count,
             ) = val_tensor.tolist()
 
@@ -487,6 +519,7 @@ def _ddp_train_worker(
             avg_val_psnr = total_psnr / max(total_count, 1)
             avg_val_ssim = total_ssim / max(total_count, 1)
             avg_val_clip = total_clip / max(total_count, 1)
+            avg_val_rgb_dist = total_rgb_dist / max(total_count, 1)
 
             if rank == 0:
                 elapsed = time.time() - start_time
@@ -494,7 +527,7 @@ def _ddp_train_worker(
                     f"[DDP] Epoch [{epoch}/{num_epochs}] - "
                     f"Train D: {avg_d_loss:.4f}, Train G: {avg_g_loss:.4f}, "
                     f"Val L1: {avg_val_l1:.4f}, Val CLIP: {avg_val_clip:.4f} "
-                    f"(PSNR: {avg_val_psnr:.2f}, SSIM: {avg_val_ssim:.4f}) | "
+                    f"(PSNR: {avg_val_psnr:.2f}, SSIM: {avg_val_ssim:.4f}, RGB_dist: {avg_val_rgb_dist:.2f}) | "
                     f"Time: {elapsed:.2f}s"
                 )
 
@@ -506,6 +539,8 @@ def _ddp_train_worker(
                         "val_l1": avg_val_l1,
                         "val_psnr": avg_val_psnr,
                         "val_ssim": avg_val_ssim,
+                        "val_clip": avg_val_clip,
+                        "val_rgb_dist": avg_val_rgb_dist,
                         "val_clip": avg_val_clip,
                     }
                 )
@@ -650,18 +685,15 @@ def main() -> None:
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
-        num_types=cfg.NUM_TYPES,
-        num_replications=cfg.NUM_REPLICATIONS,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
     discriminator = Discriminator(
         channels=cfg.CHANNELS,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
-        num_types=cfg.NUM_TYPES,
-        num_replications=cfg.NUM_REPLICATIONS,
     ).to(device)
 
+    criterion = nn.BCELoss()
     print(
         f"Starting single-GPU training for {epochs} epochs on {device} "
         f"(retrain={retrain_flag}, checkpoint={checkpoint_path})"
