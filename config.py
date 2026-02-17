@@ -34,7 +34,7 @@ SD_ATTENTION_HEADS = 2
 SD_EMA_DECAY = 0.9995
 SD_GRAD_CLIP = 0.5
 SD_DDP_TIMEOUT_MINUTES = 30
-SD_VAE_CKPT = "checkpoints/vae_epoch_70.pth"
+SD_VAE_CKPT = "checkpoints/vae_epoch_100.pth"
 SD_FREEZE_VAE = False
 
 # ddp
