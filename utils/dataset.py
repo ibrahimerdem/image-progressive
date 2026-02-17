@@ -52,20 +52,53 @@ class CustomDataset(Dataset):
     def _load_data(self):
         df = pd.read_csv(self.csv_path)
         
-        maxs = np.array(cfg.FEATURE_MAXS, dtype=np.float32)
-        mins = np.array(cfg.FEATURE_MINS, dtype=np.float32)
+        # Separate continuous and categorical features
+        continuous_features = [f for f in self.feature_cols if f not in cfg.CATEGORICAL_FEATURES]
+        categorical_features = cfg.CATEGORICAL_FEATURES
+        
+        # Get continuous feature indices and their min/max values
+        continuous_mins = []
+        continuous_maxs = []
+        for feat in continuous_features:
+            idx = cfg.FEATURE_COLUMNS.index(feat)
+            continuous_mins.append(cfg.FEATURE_MINS[idx])
+            continuous_maxs.append(cfg.FEATURE_MAXS[idx])
+        
+        mins = np.array(continuous_mins, dtype=np.float32)
+        maxs = np.array(continuous_maxs, dtype=np.float32)
         
         input_data = []
         initial_paths = []
         target_paths = []
         
         for _, row in df.iterrows():
-            features = row[self.feature_cols].values.astype(np.float32)
-    
-            scaled_feats = (features - mins) / (maxs - mins)
+            # Process continuous features
+            continuous_vals = row[continuous_features].values.astype(np.float32)
+            scaled_feats = (continuous_vals - mins) / (maxs - mins)
             scaled_feats = np.clip(scaled_feats, 0, 1)
             
-            input_data.append(scaled_feats)
+            # Process categorical features with one-hot encoding
+            categorical_encoded = []
+            for cat_feat, cat_dim in zip(categorical_features, cfg.CATEGORICAL_DIMS):
+                cat_value = row[cat_feat]
+                # Create one-hot encoding
+                # We'll use a simple categorical mapping based on unique values
+                # Get all unique values from the entire dataset for this feature
+                unique_vals = sorted(df[cat_feat].unique())
+                cat_idx = unique_vals.index(cat_value)
+                one_hot = np.zeros(cat_dim, dtype=np.float32)
+                if cat_idx < cat_dim:
+                    one_hot[cat_idx] = 1.0
+                categorical_encoded.append(one_hot)
+            
+            # Concatenate continuous and categorical features
+            if categorical_encoded:
+                all_categorical = np.concatenate(categorical_encoded)
+                final_features = np.concatenate([scaled_feats, all_categorical])
+            else:
+                final_features = scaled_feats
+            
+            input_data.append(final_features)
             initial_paths.append(row['initial_filename'])
             target_paths.append(row['target_filename'])
         

@@ -51,10 +51,16 @@ class FeatureEmbedding(nn.Module):
 
 
 class ImageEmbedding(nn.Module):
-    def __init__(self, in_channels=3, embed_dim=512, image_size=128):
+    def __init__(self, in_channels=3, embed_dim=512, image_size=128, num_features=None):
         super().__init__()
+        # Use TOTAL_FEATURE_DIM if num_features not provided
+        if num_features is None:
+            num_features = cfg.TOTAL_FEATURE_DIM
+        self.num_features = num_features
+        self.embed_dim = embed_dim
+        
         # Input: [B, 3, 128, 128]
-        # Output: [B, embed_dim * 9] (to match feature embedding dimension)
+        # Output: [B, embed_dim * num_features] (to match feature embedding dimension)
         self.encoder = nn.Sequential(
             # 128x128 -> 64x64
             nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1),
@@ -80,18 +86,18 @@ class ImageEmbedding(nn.Module):
             nn.AdaptiveAvgPool2d(1),
         )
         
-        # Project to match feature embedding dimension (9 * 512 = 4608)
+        # Project to match feature embedding dimension (num_features * embed_dim)
         self.projection = nn.Sequential(
             nn.Linear(512, 2048),
             nn.SiLU(),
-            nn.Linear(2048, 9 * embed_dim),  # 4608
+            nn.Linear(2048, num_features * embed_dim),
         )
     
     def forward(self, images):
         # images: [B, 3, 128, 128]
         features = self.encoder(images)  # [B, 512, 1, 1]
         features = features.flatten(1)    # [B, 512]
-        embedding = self.projection(features)  # [B, 4608]
+        embedding = self.projection(features)  # [B, num_features * embed_dim]
         return embedding
 
 
@@ -365,16 +371,17 @@ class StableDiffusionConditioned(nn.Module):
         super().__init__()
         cond_dim = emb_dim * 2
         time_dim = cond_dim
-        feature_dim = 9 * 512
+        num_features = cfg.TOTAL_FEATURE_DIM  # Use total feature dim including one-hot encoded
+        feature_dim = num_features * 512
         self.use_initial_image = use_initial_image
         
-        self.feature_projection = FeatureEmbedding(num_features=9, embed_dim=512)
+        self.feature_projection = FeatureEmbedding(num_features=num_features, embed_dim=512)
         self.time_embedding = TimeEmbedding(time_dim)
         
         if use_initial_image:
-            self.image_projection = ImageEmbedding(in_channels=3, embed_dim=512, image_size=128)
-            # When using image, concatenate with features: 4608 + 4608 = 9216
-            feature_dim = 9 * 512 * 2
+            self.image_projection = ImageEmbedding(in_channels=3, embed_dim=512, image_size=128, num_features=num_features)
+            # When using image, concatenate with features: num_features*512 + num_features*512 = num_features*1024
+            feature_dim = num_features * 512 * 2
         
         self.unet = ImprovedUNet(
             latent_channels,  # 4 channels for latent space
