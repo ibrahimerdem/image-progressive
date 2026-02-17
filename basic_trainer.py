@@ -651,7 +651,6 @@ def main() -> None:
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
     print(f"Feature columns: {cfg.FEATURE_COLUMNS}")
-    print(f"Num types: {cfg.NUM_TYPES}, Num replications: {cfg.NUM_REPLICATIONS}")
     print(f"Batch size: {cfg.BATCH_SIZE_PER_GPU}")
     print(f"Initial image size: {cfg.IMG_WIDTH}x{cfg.IMG_HEIGHT}")
     print(f"Target image size: {cfg.TARGET_WIDTH}x{cfg.TARGET_HEIGHT}")

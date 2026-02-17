@@ -15,10 +15,13 @@ TARGET_WIDTH = 512
 TARGET_HEIGHT = 512
 CHANNELS = 3
 EMBEDDING_OUT_DIM = 512
-FEATURE_COLUMNS = ["type", "replication"]
-NUM_TYPES = 50
-NUM_REPLICATIONS = 3
-USE_EMBEDDING = True
+FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_raw", "cielab_a_raw", "cielab_b_raw", "bleaching", "duration", "concentration"]
+FEATURE_NORMALIZATION = True
+FEATURE_MINS = [5.6,15,0,16.87,-1.91,-16.75,1,1,1000]
+FEATURE_MAXS = [30,42,95,40,1.62,-0.5,4,7,7000]
+CATEGORICAL_FEATURES = ["coloring_type", "knitting"]
+CATEGORICAL_DIMS = [5, 6]
+TOTAL_FEATURE_DIM = len(FEATURE_COLUMNS) + sum(CATEGORICAL_DIMS)
 INITIAL_IMAGE = True
 
 # gan training defaults

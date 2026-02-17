@@ -11,18 +11,6 @@ import config as cfg
 
 
 class CustomDataset(Dataset):
-    """Dataset aligned with
-
-    data/
-        initial/
-        target/
-        training_features.csv
-        validation_features.csv
-        test_features.csv
-
-    CSV columns:
-        initial_filename,target_filename,feature_1,feature_2,...
-    """
 
     def __init__(self, split: str = "train"):
         assert split in {"train", "val", "test"}
@@ -62,23 +50,19 @@ class CustomDataset(Dataset):
     def _load_data(self):
         df = pd.read_csv(self.csv_path)
 
-        # Optional recipe column used only for negative sampling
         recipes = None
         if "recipe" in df.columns:
             recipes = df["recipe"].astype(np.int32).values
 
-        # Determine feature columns: everything except filenames (and recipe id)
         if cfg.FEATURE_COLUMNS:
             feature_cols = cfg.FEATURE_COLUMNS
         else:
             exclude_cols = {"initial_filename", "target_filename", "recipe"}
             feature_cols = [c for c in df.columns if c not in exclude_cols]
 
-        # Separate continuous and categorical features
         categorical_features = cfg.CATEGORICAL_FEATURES if hasattr(cfg, 'CATEGORICAL_FEATURES') else []
         continuous_cols = [c for c in feature_cols if c not in categorical_features]
-        
-        # Process continuous features
+
         continuous_data = df[continuous_cols].astype(np.float32)
         
         # Optional normalization to [-1, 1] for continuous features
@@ -147,7 +131,6 @@ class CustomDataset(Dataset):
         initial_img = self.transform_initial(initial_img)
         target_img = self.transform_target(target_img)
 
-        # For training/validation, also return a mismatched (wrong) target
         if self.split in {"train", "val"}:
             num_samples = len(self.target_paths)
 
@@ -176,7 +159,6 @@ class CustomDataset(Dataset):
 
             return initial_img, input_feat, target_img, wrong_img
 
-        # For test, no wrong image is needed
         return initial_img, input_feat, target_img, target_img
 
 
