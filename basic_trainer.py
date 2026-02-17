@@ -13,34 +13,12 @@ from utils.training import (
     MetricsLogger,
     load_clip_model,
     compute_clip_metrics_batch,
+    calculate_avg_rgb_distance,
     save_random_sample_pairs,
     load_checkpoint,
 )
 from utils.dataset import create_dataloaders
 import config as cfg
-
-
-def calculate_avg_rgb_distance(fake_images, real_images):
-    """
-    Calculate average RGB distance between generated and real images.
-    Images should be in range [-1, 1] and shape [B, C, H, W].
-    Returns average Euclidean distance in RGB space (0-255 scale).
-    """
-    # Convert from [-1, 1] to [0, 1]
-    fake_01 = (fake_images + 1.0) / 2.0
-    real_01 = (real_images + 1.0) / 2.0
-    
-    # Calculate mean RGB values per image: [B, C, H, W] -> [B, C]
-    fake_mean_rgb = fake_01.mean(dim=[2, 3])  # Average over spatial dimensions
-    real_mean_rgb = real_01.mean(dim=[2, 3])
-    
-    # Calculate Euclidean distance in RGB space
-    rgb_dist = torch.sqrt(((fake_mean_rgb - real_mean_rgb) ** 2).sum(dim=1))  # [B]
-    
-    # Scale to 0-255 range and return average
-    rgb_dist_255 = rgb_dist * 255.0
-    
-    return rgb_dist_255.mean().item()
 
 
 def train(
@@ -182,7 +160,7 @@ def train(
                     v_embeddings = v_input_feat.to(device)
                     bs = v_images.size(0)
 
-                    noise = torch.randn(bs, 128, 1, 1, device=device)
+                    noise = torch.randn(bs, cfg.NOISE_DIM, 1, 1, device=device)
                     v_fake = generator(noise, v_embeddings, v_input_image)
 
                     # Reconstruction L1
@@ -313,15 +291,15 @@ def _ddp_train_worker(
     )
 
     generator = Generator(
-        channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
+        num_features=cfg.TOTAL_FEATURE_DIM,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
     discriminator = Discriminator(
-        channels=cfg.CHANNELS,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
+        num_features=cfg.TOTAL_FEATURE_DIM,
     ).to(device)
 
     # Convert BatchNorm to SyncBatchNorm for DDP
@@ -682,14 +660,14 @@ def main() -> None:
     print("=" * 80)
 
     generator = Generator(
-        channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
+        num_features=cfg.TOTAL_FEATURE_DIM,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
     discriminator = Discriminator(
-        channels=cfg.CHANNELS,
+        num_features=cfg.TOTAL_FEATURE_DIM,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
     ).to(device)
 

@@ -270,6 +270,25 @@ def compute_clip_metrics_batch(fake_images, target_images, model, preprocess, de
     return sim_sum, batch_size
 
 
+def calculate_avg_rgb_distance(fake_images, real_images):
+
+    # Convert from [-1, 1] to [0, 1]
+    fake_01 = (fake_images + 1.0) / 2.0
+    real_01 = (real_images + 1.0) / 2.0
+    
+    # Calculate mean RGB values per image: [B, C, H, W] -> [B, C]
+    fake_mean_rgb = fake_01.mean(dim=[2, 3])  # Average over spatial dimensions
+    real_mean_rgb = real_01.mean(dim=[2, 3])
+    
+    # Calculate Euclidean distance in RGB space
+    rgb_dist = torch.sqrt(((fake_mean_rgb - real_mean_rgb) ** 2).sum(dim=1))  # [B]
+    
+    # Scale to 0-255 range and return average
+    rgb_dist_255 = rgb_dist * 255.0
+    
+    return rgb_dist_255.mean().item()
+
+
 def save_random_sample_pairs(
     initial_images,
     generated_images,

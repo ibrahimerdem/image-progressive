@@ -22,6 +22,7 @@ from utils.training import (
     calculate_ssim,
     load_clip_model,
     compute_clip_metrics_batch,
+    calculate_avg_rgb_distance,
 )
 from utils.dataset import create_dataloaders
 import config as cfg
@@ -38,9 +39,9 @@ def load_generator_from_checkpoint(checkpoint_path, device):
     
     # Create generator with embedding architecture
     generator = Generator(
-        channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
         embed_dim=cfg.EMBEDDING_OUT_DIM,
+        num_features=cfg.TOTAL_FEATURE_DIM,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
@@ -59,7 +60,40 @@ def load_generator_from_checkpoint(checkpoint_path, device):
     return generator
 
 
-def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_samples=True):
+def save_images_organized(images_dict, output_base_dir="outputs"):
+    """
+    Save images to organized folder structure.
+    
+    Args:
+        images_dict: Dict with keys 'generated', 'target', 'input' containing lists of PIL images
+        output_base_dir: Base output directory
+    """
+    # Create organized folder structure
+    generated_dir = os.path.join(output_base_dir, "generated")
+    target_dir = os.path.join(output_base_dir, "target")
+    input_dir = os.path.join(output_base_dir, "input")
+    
+    os.makedirs(generated_dir, exist_ok=True)
+    os.makedirs(target_dir, exist_ok=True)
+    os.makedirs(input_dir, exist_ok=True)
+    
+    # Save images
+    for idx, (gen_img, target_img, input_img) in enumerate(zip(
+        images_dict['generated'], 
+        images_dict['target'], 
+        images_dict['input']
+    )):
+        gen_img.save(os.path.join(generated_dir, f"sample_{idx:04d}.png"))
+        target_img.save(os.path.join(target_dir, f"sample_{idx:04d}.png"))
+        input_img.save(os.path.join(input_dir, f"sample_{idx:04d}.png"))
+    
+    print(f"\nSaved {len(images_dict['generated'])} images to:")
+    print(f"  Generated: {generated_dir}/")
+    print(f"  Target:    {target_dir}/")
+    print(f"  Input:     {input_dir}/")
+
+
+def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_samples=True, save_all=True):
     """
     Evaluate model performance on test dataset.
     
@@ -68,7 +102,8 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
         device: Device to run evaluation on
         batch_size: Batch size for evaluation
         num_workers: Number of dataloader workers
-        save_samples: Whether to save sample outputs
+        save_samples: Whether to save first batch sample outputs
+        save_all: Whether to save all images to organized folders
     
     Returns:
         Dictionary with evaluation metrics
@@ -102,9 +137,12 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
     total_rgb_diff = 0.0
     total_count = 0
     
+    # Storage for all images if save_all is True
+    all_images = {'generated': [], 'target': [], 'input': []} if save_all else None
+    
     # Output directory for samples
     output_dir = "outputs"
-    if save_samples:
+    if save_samples or save_all:
         os.makedirs(output_dir, exist_ok=True)
     
     generator.eval()
@@ -119,8 +157,10 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
             
             batch_size_local = target_image.size(0)
             
-            # Generate images
+            # Generate noise
             noise = torch.randn(batch_size_local, cfg.NOISE_DIM, 1, 1, device=device)
+            
+            # Generate images
             fake_images = generator(noise, input_feat, input_image)
             
             # Calculate metrics
@@ -130,27 +170,33 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
             clip_score, _ = compute_clip_metrics_batch(
                 fake_images, target_image, clip_model, clip_preprocess, device
             )
-            
-            # Calculate average per-pixel Euclidean distance in RGB space
-            # Denormalize from [-1, 1] to [0, 255] for RGB color space
-            fake_rgb = ((fake_images + 1) / 2) * 255.0  # [B, 3, H, W]
-            target_rgb = ((target_image + 1) / 2) * 255.0  # [B, 3, H, W]
-            # Per-pixel Euclidean distance: sqrt((R1-R2)^2 + (G1-G2)^2 + (B1-B2)^2)
-            pixel_diff_squared = (fake_rgb - target_rgb) ** 2  # [B, 3, H, W]
-            pixel_euclidean = torch.sqrt(pixel_diff_squared.sum(dim=1))  # [B, H, W]
-            # Average over all pixels and batch
-            rgb_diff = pixel_euclidean.mean().item()
+            rgb_dist = calculate_avg_rgb_distance(fake_images, target_image)
             
             total_l1 += l1 * batch_size_local
             total_psnr += psnr * batch_size_local
             total_ssim += ssim * batch_size_local
             total_clip += clip_score
-            total_rgb_diff += rgb_diff * batch_size_local
+            total_rgb_diff += rgb_dist * batch_size_local
             total_count += batch_size_local
             
+            # Save all images if requested
+            if save_all:
+                to_pil = transforms.ToPILImage()
+                for i in range(batch_size_local):
+                    # Denormalize images (from [-1, 1] to [0, 1])
+                    input_img = (input_image[i].cpu() + 1) / 2
+                    fake_img = (fake_images[i].cpu() + 1) / 2
+                    target_img = (target_image[i].cpu() + 1) / 2
+                    
+                    # Convert to PIL
+                    all_images['input'].append(to_pil(input_img))
+                    all_images['generated'].append(to_pil(fake_img))
+                    all_images['target'].append(to_pil(target_img))
+            
             # Save samples from first batch
-            if save_samples and batch_idx == 0:
+            elif save_samples and batch_idx == 0:
                 num_samples = min(8, batch_size_local)
+                to_pil = transforms.ToPILImage()
                 for i in range(num_samples):
                     # Denormalize images (from [-1, 1] to [0, 1])
                     input_img = (input_image[i].cpu() + 1) / 2
@@ -158,8 +204,6 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
                     target_img = (target_image[i].cpu() + 1) / 2
                     
                     # Convert to PIL and save
-                    to_pil = transforms.ToPILImage()
-                    
                     input_pil = to_pil(input_img)
                     fake_pil = to_pil(fake_img)
                     target_pil = to_pil(target_img)
@@ -172,6 +216,10 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
                 print(f"Processed {batch_idx + 1}/{len(test_loader)} batches...")
         
         elapsed_time = time.time() - start_time
+    
+    # Save all images to organized folders if requested
+    if save_all and all_images:
+        save_images_organized(all_images, output_dir)
     
     # Calculate average metrics
     avg_l1 = total_l1 / total_count
@@ -191,10 +239,10 @@ def evaluate_test_set(generator, device, batch_size=8, num_workers=4, save_sampl
     print(f"  PSNR:          {avg_psnr:.2f} dB")
     print(f"  SSIM:          {avg_ssim:.4f}")
     print(f"  CLIP Score:    {avg_clip:.4f}")
-    print(f"  Avg RGB Dist:  {avg_rgb_diff:.4f} (per-pixel Euclidean, 0-255 scale)")
+    print(f"  Avg RGB Dist:  {avg_rgb_diff:.4f} (mean RGB Euclidean, 0-255 scale)")
     print("="*60)
     
-    if save_samples:
+    if save_samples and not save_all:
         print(f"\nSample outputs saved to: {output_dir}/")
     
     # Save results to file
@@ -290,6 +338,7 @@ def single_inference(generator, device, input_image_path, features, output_path=
     
     with torch.no_grad():
         for i in range(num_samples):
+            # Generate noise
             noise = torch.randn(1, cfg.NOISE_DIM, 1, 1, device=device)
             fake_image = generator(noise, feature_tensor, input_tensor)
             generated_images.append(fake_image)
@@ -388,6 +437,11 @@ def main():
         action='store_true',
         help='Do not save sample outputs during test evaluation'
     )
+    parser.add_argument(
+        '--no_save_all',
+        action='store_true',
+        help='Do not save all images to organized folders (only save first 8 samples instead)'
+    )
     
     args = parser.parse_args()
     
@@ -410,7 +464,8 @@ def main():
             device,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            save_samples=not args.no_save_samples
+            save_samples=not args.no_save_samples,
+            save_all=not args.no_save_all
         )
     
     elif args.mode == 'inference':

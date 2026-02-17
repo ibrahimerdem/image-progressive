@@ -74,17 +74,59 @@ class CustomDataset(Dataset):
             exclude_cols = {"initial_filename", "target_filename", "recipe"}
             feature_cols = [c for c in df.columns if c not in exclude_cols]
 
-        input_data = df[feature_cols].astype(np.float32)
-
-        # Optional normalization to [-1, 1]
+        # Separate continuous and categorical features
+        categorical_features = cfg.CATEGORICAL_FEATURES if hasattr(cfg, 'CATEGORICAL_FEATURES') else []
+        continuous_cols = [c for c in feature_cols if c not in categorical_features]
+        
+        # Process continuous features
+        continuous_data = df[continuous_cols].astype(np.float32)
+        
+        # Optional normalization to [-1, 1] for continuous features
         if cfg.FEATURE_NORMALIZATION and cfg.FEATURE_MAXS and cfg.FEATURE_MINS:
-            maxs = np.array(cfg.FEATURE_MAXS, dtype=np.float32)
-            mins = np.array(cfg.FEATURE_MINS, dtype=np.float32)
-            vals = input_data.values
+            # Build mapping for continuous features only
+            continuous_mins = []
+            continuous_maxs = []
+            for col in continuous_cols:
+                idx = feature_cols.index(col)
+                min_val = cfg.FEATURE_MINS[idx]
+                max_val = cfg.FEATURE_MAXS[idx]
+                if min_val != "na" and max_val != "na":
+                    continuous_mins.append(float(min_val))
+                    continuous_maxs.append(float(max_val))
+                else:
+                    raise ValueError(f"Continuous feature {col} has 'na' in FEATURE_MINS/MAXS")
+            
+            maxs = np.array(continuous_maxs, dtype=np.float32)
+            mins = np.array(continuous_mins, dtype=np.float32)
+            vals = continuous_data.values
             vals = 2 * (vals - mins) / (maxs - mins) - 1
-            input_data = pd.DataFrame(vals, columns=feature_cols)
+            continuous_data = vals
+        else:
+            continuous_data = continuous_data.values
+        
+        # Process categorical features with one-hot encoding
+        categorical_data_list = []
+        if categorical_features:
+            for i, cat_col in enumerate(categorical_features):
+                # Get unique categories and create mapping
+                unique_cats = sorted(df[cat_col].unique())
+                cat_to_idx = {cat: idx for idx, cat in enumerate(unique_cats)}
+                
+                # Convert to indices
+                indices = df[cat_col].map(cat_to_idx).values
+                
+                # One-hot encode
+                num_categories = len(unique_cats)
+                one_hot = np.eye(num_categories, dtype=np.float32)[indices]
+                categorical_data_list.append(one_hot)
+        
+        # Combine continuous and categorical features
+        if categorical_data_list:
+            categorical_data = np.concatenate(categorical_data_list, axis=1)
+            input_array = np.concatenate([continuous_data, categorical_data], axis=1).astype(np.float32)
+        else:
+            input_array = continuous_data.astype(np.float32)
 
-        input_array = input_data.values.astype(np.float32)
         initial_paths = df["initial_filename"].values
         target_paths = df["target_filename"].values
 
