@@ -79,14 +79,21 @@ def load_sd_model_from_checkpoint(checkpoint_path, vae_checkpoint_path, device):
     
     # Load model weights (use EMA if available)
     if 'ema_state_dict' in checkpoint:
-        print("Loading EMA weights")
+        print("✓ Loading EMA weights (recommended for best quality)")
         sd_model.load_state_dict(checkpoint['ema_state_dict'])
     elif 'model_state_dict' in checkpoint:
+        print("⚠ Loading regular model weights (EMA not found)")
         sd_model.load_state_dict(checkpoint['model_state_dict'])
     else:
+        print("⚠ Loading weights from unknown format")
         sd_model.load_state_dict(checkpoint)
     
     sd_model.eval()
+    
+    # Put model in eval mode and disable dropout/batchnorm updates
+    for module in sd_model.modules():
+        if hasattr(module, 'training'):
+            module.training = False
  
     pipeline = StableDiffusionPipeline(
         model=sd_model,
@@ -107,11 +114,19 @@ def evaluate_test_set(
     batch_size=8,
     num_workers=2,
     save_samples=True,
-    num_inference_steps=50,
+    save_all=True,
+    num_inference_steps=200,  # Match training validation steps for better quality
 ):
 
     print("\n" + "="*60)
     print("EVALUATING SD MODEL ON TEST DATASET")
+    print("="*60)
+    print(f"Sampling Configuration:")
+    print(f"  Inference steps: {num_inference_steps}")
+    print(f"  Total timesteps: {cfg.SD_TIMESTEPS}")
+    print(f"  Step ratio: {cfg.SD_TIMESTEPS / num_inference_steps:.1f}x subsampling")
+    print(f"  Image size: {cfg.TARGET_WIDTH}x{cfg.TARGET_HEIGHT}")
+    print(f"  Initial image conditioning: {cfg.INITIAL_IMAGE}")
     print("="*60)
 
     _, _, test_loader = create_dataloaders(
@@ -138,12 +153,23 @@ def evaluate_test_set(
     total_clip = 0.0
     total_count = 0
     
+    # Storage for all images if save_all is True
+    all_images = {'generated': [], 'target': [], 'input': []} if save_all else None
+    
     # Output directory for samples
     output_dir = "outputs/sd"
-    if save_samples:
+    if save_samples or save_all:
         os.makedirs(output_dir, exist_ok=True)
+        if save_all:
+            os.makedirs(os.path.join(output_dir, "generated"), exist_ok=True)
+            os.makedirs(os.path.join(output_dir, "target"), exist_ok=True)
+            os.makedirs(os.path.join(output_dir, "input"), exist_ok=True)
     
     pipeline.model.eval()
+    
+    # Ensure deterministic behavior for reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     
     with torch.no_grad():
         start_time = time.time()
@@ -155,6 +181,7 @@ def evaluate_test_set(
             
             batch_size_local = target_image.size(0)
 
+            # Generate images using the same settings as training validation
             generated_images = pipeline.sample(
                 features=input_feat,
                 steps=num_inference_steps,
@@ -175,22 +202,31 @@ def evaluate_test_set(
             total_clip += clip_score
             total_count += batch_size_local
             
-            if save_samples and batch_idx == 0:
+            # Save all images if requested
+            if save_all:
+                to_pil = transforms.ToPILImage()
+                for i in range(batch_size_local):
+                    # Denormalize images (from [-1, 1] to [0, 1])
+                    input_img = torch.clamp((input_image[i].cpu() + 1) / 2, 0, 1)
+                    generated_img = torch.clamp((generated_images[i].cpu() + 1) / 2, 0, 1)
+                    target_img = torch.clamp((target_image[i].cpu() + 1) / 2, 0, 1)
+                    
+                    # Convert to PIL
+                    all_images['input'].append(to_pil(input_img))
+                    all_images['generated'].append(to_pil(generated_img))
+                    all_images['target'].append(to_pil(target_img))
+            
+            # Save samples from first batch
+            elif save_samples and batch_idx == 0:
                 num_samples = min(8, batch_size_local)
+                to_pil = transforms.ToPILImage()
                 for i in range(num_samples):
                     # Denormalize images (from [-1, 1] to [0, 1])
-                    input_img = (input_image[i].cpu() + 1) / 2
-                    generated_img = (generated_images[i].cpu() + 1) / 2
-                    target_img = (target_image[i].cpu() + 1) / 2
-                    
-                    # Clamp to [0, 1]
-                    input_img = torch.clamp(input_img, 0, 1)
-                    generated_img = torch.clamp(generated_img, 0, 1)
-                    target_img = torch.clamp(target_img, 0, 1)
+                    input_img = torch.clamp((input_image[i].cpu() + 1) / 2, 0, 1)
+                    generated_img = torch.clamp((generated_images[i].cpu() + 1) / 2, 0, 1)
+                    target_img = torch.clamp((target_image[i].cpu() + 1) / 2, 0, 1)
                     
                     # Convert to PIL and save
-                    to_pil = transforms.ToPILImage()
-                    
                     input_pil = to_pil(input_img)
                     generated_pil = to_pil(generated_img)
                     target_pil = to_pil(target_img)
@@ -203,6 +239,23 @@ def evaluate_test_set(
                 print(f"Processed {batch_idx + 1}/{len(test_loader)} batches...")
         
         elapsed_time = time.time() - start_time
+    
+    # Save all images to organized folders if requested
+    if save_all and all_images:
+        print(f"\nSaving {len(all_images['generated'])} images to organized folders...")
+        for idx, (gen_img, target_img, input_img) in enumerate(zip(
+            all_images['generated'], 
+            all_images['target'], 
+            all_images['input']
+        )):
+            gen_img.save(os.path.join(output_dir, "generated", f"sample_{idx:04d}.png"))
+            target_img.save(os.path.join(output_dir, "target", f"sample_{idx:04d}.png"))
+            input_img.save(os.path.join(output_dir, "input", f"sample_{idx:04d}.png"))
+        
+        print(f"Images saved to:")
+        print(f"  Generated: {os.path.join(output_dir, 'generated')}/")
+        print(f"  Target:    {os.path.join(output_dir, 'target')}/")
+        print(f"  Input:     {os.path.join(output_dir, 'input')}/")
 
     avg_l1 = total_l1 / total_count
     avg_psnr = total_psnr / total_count
@@ -224,7 +277,7 @@ def evaluate_test_set(
     print(f"  CLIP Score:    {avg_clip:.4f}")
     print("="*60)
     
-    if save_samples:
+    if save_samples and not save_all:
         print(f"\nSample outputs saved to: {output_dir}/")
     
     # Save results to file
@@ -286,13 +339,18 @@ def main():
     parser.add_argument(
         '--inference_steps',
         type=int,
-        default=50,
-        help='Number of diffusion steps for sampling'
+        default=200,  # Match SD_SAMPLE_STEPS from config for quality
+        help='Number of diffusion steps for sampling (default: 200, matching training validation)'
     )
     parser.add_argument(
         '--no_save_samples',
         action='store_true',
         help='Do not save sample outputs'
+    )
+    parser.add_argument(
+        '--no_save_all',
+        action='store_true',
+        help='Do not save all images to organized folders (only save first 8 samples instead)'
     )
     
     args = parser.parse_args()
@@ -320,6 +378,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         save_samples=not args.no_save_samples,
+        save_all=not args.no_save_all,
         num_inference_steps=args.inference_steps
     )
 
