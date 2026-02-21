@@ -20,6 +20,7 @@ from models.stable_diffusion import (
     ModelEMA,
     StableDiffusionConditioned,
     StableDiffusionPipeline,
+    PerceptualLoss,
 )
 from models.encoder import VAE_Encoder
 from models.decoder import VAE_Decoder
@@ -28,6 +29,7 @@ from utils.training import (
     MetricsLogger,
     calculate_psnr,
     calculate_ssim,
+    calculate_avg_rgb_distance,
     compute_clip_metrics_batch,
     load_clip_model,
     save_random_sample_pairs,
@@ -231,9 +233,9 @@ def _cleanup_ddp() -> None:
         dist.destroy_process_group()
 
 
-def _save_checkpoint(model, optimizer, epoch, save_dir, version, ema_model=None):
+def _save_checkpoint(model, optimizer, step, save_dir, version, ema_model=None):
     checkpoint = {
-        "epoch": epoch,
+        "step": step,
         "model_state_dict": model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
     }
@@ -242,7 +244,7 @@ def _save_checkpoint(model, optimizer, epoch, save_dir, version, ema_model=None)
     if ema_model is not None:
         checkpoint["ema_state_dict"] = ema_model.state_dict()
     
-    filename = os.path.join(save_dir, f"sd_{version}_epoch_{epoch:04d}.pth")
+    filename = os.path.join(save_dir, f"sd_{version}_step_{step:06d}.pth")
     torch.save(checkpoint, filename)
     return filename
 
@@ -253,7 +255,8 @@ def _load_checkpoint(model, optimizer, checkpoint_path):
     target.load_state_dict(checkpoint["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return checkpoint.get("epoch", 0)
+    # Return step, fallback to epoch for old checkpoints
+    return checkpoint.get("step", checkpoint.get("epoch", 0))
 
 
 def _run_validation(
@@ -272,6 +275,9 @@ def _run_validation(
     if val_loader is None or clip_model is None or clip_preprocess is None:
         return None
 
+    if rank == 0:
+        print(f"[SD] Starting validation at step/epoch {epoch}...")
+
     if hasattr(val_loader, "sampler") and isinstance(val_loader.sampler, DistributedSampler):
         val_loader.sampler.set_epoch(epoch)
 
@@ -283,62 +289,103 @@ def _run_validation(
     total_psnr = 0.0
     total_ssim = 0.0
     total_clip = 0.0
+    total_rgb_dist = 0.0
     clip_count = 0
     total_samples = 0
+    timestep_losses = {}
+    pred_stats = {}
 
     autocast_ctx = (lambda: autocast(device_type="cuda")) if device.type == "cuda" else (lambda: nullcontext())
+    
+    total_batches = len(val_loader) if hasattr(val_loader, '__len__') else "unknown"
 
     for idx, (initial_images, features, target_images, _) in enumerate(val_loader):
+        if rank == 0 and (idx % 20 == 0 or idx == 0):  # Print every 20th batch or first one
+            print(f"[SD] Validation batch {idx + 1}/{total_batches}...")
         
         initial_images = initial_images.to(device)
         features = features.to(device)
         targets = target_images.to(device)
 
-        with torch.no_grad():
-            with autocast_ctx():
-                val_steps = cfg.SD_SAMPLE_STEPS
-                
-                if cfg.INITIAL_IMAGE:
-                    samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
-                                            initial_images=initial_images)
-                else:
-                    samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
-                
-        batch_size = targets.size(0)
-
-        total_samples += batch_size
-        total_l1 += l1_loss_fn(samples, targets).item() * batch_size
-        total_psnr += calculate_psnr(samples, targets) * batch_size
-        total_ssim += calculate_ssim(samples, targets) * batch_size
-
-        clip_sum, clip_bs = compute_clip_metrics_batch(samples, targets, clip_model, clip_preprocess, device)
-        total_clip += clip_sum
-        clip_count += clip_bs
-
-        # Save sample generated images as triplets: initial-generated-truth (only on rank 0)
-        if idx == 0 and rank == 0:
-            save_random_sample_pairs(
-                initial_images,  
-                samples,         
-                targets,         
-                sample_dir,
-                epoch,
-                prefix="sd_val",
-                num_samples=batch_size,
-            )
+        # Only generate samples for first batch (for saving/visualization)
+        # For other batches, just compute metrics on targets directly
+        if idx == 0:
+            with torch.no_grad():
+                with autocast_ctx():
+                    val_steps = cfg.SD_SAMPLE_STEPS
+                    
+                    if cfg.INITIAL_IMAGE:
+                        samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
+                                                initial_images=initial_images)
+                    else:
+                        samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
             
-            # Measure denoising quality at different timesteps (first batch only)
-            if cfg.INITIAL_IMAGE:
-                timestep_losses, pred_stats = _measure_denoising_quality(
-                    model, diffusion, features, targets, device, vae_encoder,
-                    timesteps_to_test=[100, 200, 400, 600, 800],
-                    initial_images=initial_images
+            batch_size = targets.size(0)
+
+            total_samples += batch_size
+            total_l1 += l1_loss_fn(samples, targets).item() * batch_size
+            total_psnr += calculate_psnr(samples, targets) * batch_size
+            total_ssim += calculate_ssim(samples, targets) * batch_size
+            total_rgb_dist += calculate_avg_rgb_distance(samples, targets) * batch_size
+
+            clip_sum, clip_bs = compute_clip_metrics_batch(samples, targets, clip_model, clip_preprocess, device)
+            total_clip += clip_sum
+            clip_count += clip_bs
+
+            # Save sample generated images (only first batch)
+            if rank == 0:
+                print(f"[SD] Saving sample images from first batch...")
+                save_random_sample_pairs(
+                    initial_images,  
+                    samples,         
+                    targets,         
+                    sample_dir,
+                    epoch,
+                    prefix="sd_val",
+                    num_samples=batch_size,
                 )
-            else:
-                timestep_losses, pred_stats = _measure_denoising_quality(
-                    model, diffusion, features, targets, device, vae_encoder,
-                    timesteps_to_test=[100, 200, 400, 600, 800]
-                )
+                
+                print(f"[SD] Measuring denoising quality at different timesteps...")
+                # Measure denoising quality at different timesteps (first batch only)
+                if cfg.INITIAL_IMAGE:
+                    timestep_losses, pred_stats = _measure_denoising_quality(
+                        model, diffusion, features, targets, device, vae_encoder,
+                        timesteps_to_test=[100, 200, 400, 600, 800],
+                        initial_images=initial_images
+                    )
+                else:
+                    timestep_losses, pred_stats = _measure_denoising_quality(
+                        model, diffusion, features, targets, device, vae_encoder,
+                        timesteps_to_test=[100, 200, 400, 600, 800]
+                    )
+                print(f"[SD] Denoising quality measured.")
+        else:
+            # For remaining batches, just generate samples and compute metrics (no saving)
+            with torch.no_grad():
+                with autocast_ctx():
+                    val_steps = cfg.SD_SAMPLE_STEPS
+                    
+                    if cfg.INITIAL_IMAGE:
+                        samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
+                                                initial_images=initial_images)
+                    else:
+                        samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
+            
+            batch_size = targets.size(0)
+
+            total_samples += batch_size
+            total_l1 += l1_loss_fn(samples, targets).item() * batch_size
+            total_psnr += calculate_psnr(samples, targets) * batch_size
+            total_ssim += calculate_ssim(samples, targets) * batch_size
+            total_rgb_dist += calculate_avg_rgb_distance(samples, targets) * batch_size
+
+            clip_sum, clip_bs = compute_clip_metrics_batch(samples, targets, clip_model, clip_preprocess, device)
+            total_clip += clip_sum
+            clip_count += clip_bs
+
+
+    if rank == 0:
+        print(f"[SD] Validation complete, computing final metrics...")
 
     if total_samples == 0:
         return None
@@ -348,20 +395,19 @@ def _run_validation(
         "val_psnr": total_psnr / total_samples,
         "val_ssim": total_ssim / total_samples,
         "val_clip": total_clip / max(clip_count, 1),
+        "val_rgb_dist": total_rgb_dist / total_samples,
     }
     
-    # Add per-timestep losses and prediction stats
     if timestep_losses:
         for t, loss in timestep_losses.items():
             metrics[f"val_loss_t{t}"] = loss
-        # Add prediction variance for collapse detection
         avg_pred_std = sum(pred_stats[t]['std'] for t in pred_stats) / len(pred_stats)
         metrics["pred_variance"] = avg_pred_std
     
     return metrics
 
 
-def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
+def _ddp_worker(rank, world_size, total_steps, retrain, checkpoint_path, version):
     device = _setup_ddp(rank, world_size)
 
     train_loader, val_loader, _ = create_dataloaders(
@@ -419,18 +465,30 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     ema_helper.to(device)
     ema_pipeline = StableDiffusionPipeline(ema_helper.ema, diffusion, vae_encoder, vae_decoder) if rank == 0 else None
 
-    start_epoch = 0
+    perceptual_loss_fn = PerceptualLoss().to(device)
+    if rank == 0:
+        print(f"[SD] Perceptual loss enabled (weight={cfg.SD_PERCEPTUAL_WEIGHT}, L1={cfg.SD_L1_WEIGHT})")
+
+    start_step = 0
     if retrain and checkpoint_path:
         if os.path.exists(checkpoint_path):
-            start_epoch = _load_checkpoint(model, optimizer, checkpoint_path)
-            # Load EMA weights if available
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            if rank == 0:
+                print(f"[SD] Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            target = model.module if isinstance(model, DDP) else model
+            target.load_state_dict(checkpoint["model_state_dict"])
+            if optimizer is not None and "optimizer_state_dict" in checkpoint:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            start_step = checkpoint.get("step", checkpoint.get("epoch", 0) * len(train_loader))
             if "ema_state_dict" in checkpoint:
                 ema_helper.ema.load_state_dict(checkpoint["ema_state_dict"])
                 if rank == 0:
                     print(f"[SD] Loaded EMA weights from checkpoint")
             if rank == 0:
-                print(f"[SD] Resumed from checkpoint {checkpoint_path} starting at epoch {start_epoch + 1}")
+                print(f"[SD] Resumed from checkpoint {checkpoint_path} starting at step {start_step}")
+            # Ensure all ranks are synchronized after loading
+            if dist.is_initialized():
+                dist.barrier()
         elif rank == 0:
             print(f"[SD] Checkpoint {checkpoint_path} not found, starting from scratch")
     elif retrain and not checkpoint_path:
@@ -469,95 +527,140 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     if rank == 0:
         clip_model, clip_preprocess = load_clip_model(device)
 
-    for epoch in range(start_epoch + 1, start_epoch + epochs + 1):
-        if hasattr(train_loader, "sampler") and isinstance(train_loader.sampler, DistributedSampler):
-            train_loader.sampler.set_epoch(epoch)
+    global_step = start_step
+    epoch = 0
+    running_loss = 0.0
+    running_noise_loss = 0.0
+    running_perceptual_loss = 0.0
+    running_l1_loss = 0.0
+    log_steps = 0
+    
+    # Check if we're already at or past the target
+    if global_step >= total_steps:
+        if rank == 0:
+            print(f"[SD] ⚠️  WARNING: Starting step ({global_step}) >= total steps ({total_steps})!")
+            print(f"[SD] Nothing to train. Either:")
+            print(f"[SD]   1. Increase total_steps (currently {total_steps})")
+            print(f"[SD]   2. Or this checkpoint is already complete")
+        _cleanup_ddp()
+        return
+    
+    if rank == 0:
+        print(f"[SD] Will train from step {global_step} to {total_steps} ({total_steps - global_step} steps remaining)")
+    
+    model.train()
+    diffusion.train()
+    start_time = time.time()
+    
+    # Create infinite data iterator
+    train_iter = iter(train_loader)
+    
+    while global_step < total_steps:
+        # Get next batch, cycle through dataset if exhausted
+        try:
+            initial_images, features, target_images, _ = next(train_iter)
+        except StopIteration:
+            epoch += 1
+            if hasattr(train_loader, "sampler") and isinstance(train_loader.sampler, DistributedSampler):
+                train_loader.sampler.set_epoch(epoch)
+            train_iter = iter(train_loader)
+            initial_images, features, target_images, _ = next(train_iter)
+        
+        global_step += 1
+        
+        initial_images = initial_images.to(device)
+        features = features.to(device)
+        targets = target_images.to(device)
+        
+        # Debug: Print first batch info
+        if global_step == 1 and rank == 0:
+            print(f"[SD] Step {global_step} - Processing batch, features shape: {features.shape}")
+            if cfg.INITIAL_IMAGE:
+                print(f"[SD] Initial images shape: {initial_images.shape}")
 
-        epoch_loss = 0.0
-        steps = 0
-        model.train()
-        diffusion.train()
 
-        start_time = time.time()
-        for batch_idx, (initial_images, features, target_images, _) in enumerate(train_loader):
-            # Features are [B, 9] vector - 9 continuous features normalized [0-1]
-            initial_images = initial_images.to(device)
-            features = features.to(device)
-            targets = target_images.to(device)
-            
-            # Debug: Print first batch info
-            if batch_idx == 0 and rank == 0:
-                print(f"[SD] Epoch {epoch} - Processing batch {batch_idx}/{len(train_loader)}, features shape: {features.shape}")
-                if cfg.INITIAL_IMAGE:
-                    print(f"[SD] Initial images shape: {initial_images.shape}")
-
-            with amp_ctx():
-                # Pass initial images if config flag is enabled
-                if cfg.INITIAL_IMAGE:
-                    loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder,
-                                                initial_images=initial_images)
-                else:
-                    loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder)
-                loss = loss_dict['loss']
-                loss_metrics = loss_dict.get('metrics', {})
-
-            optimizer.zero_grad()
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                if cfg.SD_GRAD_CLIP and cfg.SD_GRAD_CLIP > 0:
-                    scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SD_GRAD_CLIP)
-                else:
-                    scaler.unscale_(optimizer)
-                    grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
-                scaler.step(optimizer)
-                scaler.update()
+        with amp_ctx():
+            if cfg.INITIAL_IMAGE:
+                loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder,
+                                            initial_images=initial_images, vae_decoder=vae_decoder,
+                                            perceptual_loss_fn=perceptual_loss_fn)
             else:
-                loss.backward()
-                if cfg.SD_GRAD_CLIP and cfg.SD_GRAD_CLIP > 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SD_GRAD_CLIP)
-                else:
-                    grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
-                optimizer.step()
+                loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder,
+                                            vae_decoder=vae_decoder, perceptual_loss_fn=perceptual_loss_fn)
+            loss = loss_dict['loss']
+            loss_metrics = loss_dict.get('metrics', {})
 
-            ema_helper.update(model)
-            epoch_loss += loss.item()
-            steps += 1
+        optimizer.zero_grad()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if cfg.SD_GRAD_CLIP and cfg.SD_GRAD_CLIP > 0:
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SD_GRAD_CLIP)
+            else:
+                scaler.unscale_(optimizer)
+                grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if cfg.SD_GRAD_CLIP and cfg.SD_GRAD_CLIP > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SD_GRAD_CLIP)
+            else:
+                grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+            optimizer.step()
 
-            if (batch_idx + 1) % cfg.SD_LOG_INTERVAL == 0 and rank == 0:
-                print(
-                    f"[SD] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
-                    f"Loss: {epoch_loss / steps:.4f} | Grad Norm: {grad_norm:.4f}"
-                )
+        ema_helper.update(model)
+        running_loss += loss.item()
+        running_noise_loss += loss_metrics.get('noise_loss', 0.0)
+        running_perceptual_loss += loss_metrics.get('perceptual_loss', 0.0)
+        running_l1_loss += loss_metrics.get('l1_loss', 0.0)
+        log_steps += 1
+
+        # Log progress at intervals
+        if global_step % cfg.SD_LOG_INTERVAL == 0 and rank == 0:
+            avg_total = running_loss / log_steps
+            avg_noise = running_noise_loss / log_steps
+            avg_perc = running_perceptual_loss / log_steps if running_perceptual_loss > 0 else 0
+            avg_l1 = running_l1_loss / log_steps if running_l1_loss > 0 else 0
+            
+            loss_str = f"Loss: {avg_total:.4f} (N:{avg_noise:.4f}"
+            if avg_perc > 0:
+                loss_str += f", P:{avg_perc:.4f}"
+            if avg_l1 > 0:
+                loss_str += f", L1:{avg_l1:.4f}"
+            loss_str += ")"
+            
+            print(
+                f"[SD] Step {global_step}/{total_steps} "
+                f"{loss_str} | Grad Norm: {grad_norm:.4f}"
+            )
+
         
-        # End of batch loop - log completion
-        if rank == 0:
-            print(f"[SD] Epoch {epoch} - Completed all {len(train_loader)} batches in {time.time() - start_time:.2f}s")
-
-        loss_tensor = torch.tensor([epoch_loss, steps], device=device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        total_steps = max(int(loss_tensor[1].item()), 1)
-        avg_loss = (loss_tensor[0] / total_steps).item()
-
-        if rank == 0:
-            print(f"[SD] Rank {rank} finished all_reduce for epoch {epoch}")
-        
-        # Keep all ranks in sync before validation to avoid collective timeouts
-        if dist.is_initialized():
-            if rank == 0:
-                print(f"[SD] Rank {rank} entering first barrier before validation")
-            dist.barrier()
-            if rank == 0:
-                print(f"[SD] Rank {rank} passed first barrier")
-
-        val_metrics = None
+        # Validation at intervals - ALL ranks must participate in barriers
         should_validate = (
-            rank == 0
-            and val_loader is not None
-            and (cfg.SD_VAL_EPOCH <= 1 or epoch % cfg.SD_VAL_EPOCH == 0)
+            val_loader is not None
+            and global_step % cfg.SD_VAL_INTERVAL == 0
         )
+        
         if should_validate:
-            print(f"[SD] Rank {rank} starting validation")
+            # Sync running metrics across all ranks
+            loss_tensor = torch.tensor([running_loss, running_noise_loss, running_perceptual_loss, running_l1_loss, log_steps], device=device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            sync_steps = max(int(loss_tensor[4].item()), 1)
+            avg_loss = (loss_tensor[0] / sync_steps).item()
+            avg_noise_loss = (loss_tensor[1] / sync_steps).item()
+            avg_perceptual_loss = (loss_tensor[2] / sync_steps).item() if loss_tensor[2] > 0 else 0
+            avg_l1_loss = (loss_tensor[3] / sync_steps).item() if loss_tensor[3] > 0 else 0
+            
+            # Keep all ranks in sync before validation
+            if dist.is_initialized():
+                if rank == 0:
+                    print(f"[SD] Rank {rank} entering barrier before validation at step {global_step}")
+                dist.barrier()
+            
+            if rank == 0:
+                print(f"[SD] Rank {rank} starting validation at step {global_step}")
+            
             # Use EMA model for validation on rank 0, raw model on other ranks
             val_model = ema_helper.ema if rank == 0 else model
             val_pipeline = ema_pipeline if rank == 0 else pipeline
@@ -571,79 +674,84 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 clip_model,
                 clip_preprocess,
                 sample_dir,
-                epoch,
+                global_step,
                 vae_encoder,
                 rank,
             )
 
-        if dist.is_initialized():
-            dist.barrier()
+            if dist.is_initialized():
+                dist.barrier()
 
-        if rank == 0:
-            elapsed = time.time() - start_time
-            if val_metrics:
-                # Print main metrics
-                print(
-                    f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | "
-                    f"Val L1: {val_metrics['val_l1']:.4f}, PSNR: {val_metrics['val_psnr']:.2f}, "
-                    f"SSIM: {val_metrics['val_ssim']:.4f}, CLIP: {val_metrics['val_clip']:.4f} | "
-                    f"Time: {elapsed:.2f}s"
-                )
-                
-                # Print per-timestep denoising losses
-                timestep_keys = [k for k in val_metrics.keys() if k.startswith('val_loss_t')]
-                if timestep_keys:
-                    print(f"[SD] Denoising quality by timestep:")
-                    for key in sorted(timestep_keys, key=lambda x: int(x.split('t')[1])):
-                        t = int(key.split('t')[1])
-                        loss = val_metrics[key]
-                        quality = "✓ Good" if loss < 0.05 else "⚠ Learning" if loss < 0.1 else "✗ Poor"
-                        print(f"     t={t:3d}: loss={loss:.4f} {quality}")
+            if rank == 0:
+                elapsed = time.time() - start_time
+                if val_metrics:
+                    print(
+                        f"[SD] Step {global_step} Loss: {avg_loss:.4f} | "
+                        f"Val L1: {val_metrics['val_l1']:.4f}, PSNR: {val_metrics['val_psnr']:.2f}, "
+                        f"SSIM: {val_metrics['val_ssim']:.4f}, CLIP: {val_metrics['val_clip']:.4f}, "
+                        f"RGB Dist: {val_metrics['val_rgb_dist']:.2f} | Time: {elapsed:.2f}s"
+                    )
                     
-                    # Always print prediction variance for collapse detection
-                    pred_var = val_metrics.get('pred_variance', 0)
-                    if pred_var < 0.1:
-                        var_status = "⚠️ MODE COLLAPSE!"
-                    elif pred_var < 0.3:
-                        var_status = "⚠ Low (risky)"
-                    else:
-                        var_status = "✓ Healthy"
-                    print(f"[SD] Pred Variance: {pred_var:.4f} {var_status}")
+                    timestep_keys = [k for k in val_metrics.keys() if k.startswith('val_loss_t')]
+                    if timestep_keys:
+                        print(f"[SD] Denoising quality by timestep:")
+                        for key in sorted(timestep_keys, key=lambda x: int(x.split('t')[1])):
+                            t = int(key.split('t')[1])
+                            loss = val_metrics[key]
+                            quality = "✓ Good" if loss < 0.05 else "⚠ Learning" if loss < 0.1 else "✗ Poor"
+                            print(f"     t={t:3d}: loss={loss:.4f} {quality}")
+                        
+                        pred_var = val_metrics.get('pred_variance', 0)
+                        if pred_var < 0.1:
+                            var_status = "⚠️ MODE COLLAPSE!"
+                        elif pred_var < 0.3:
+                            var_status = "⚠ Low (risky)"
+                        else:
+                            var_status = "✓ Healthy"
+                        print(f"[SD] Pred Variance: {pred_var:.4f} {var_status}")
+                    
+                    log_dict = {
+                        "step": global_step,
+                        "train_loss": avg_loss,
+                        "train_noise_loss": avg_noise_loss,
+                        "train_perceptual_loss": avg_perceptual_loss,
+                        "train_l1_loss": avg_l1_loss,
+                        "val_l1": val_metrics["val_l1"],
+                        "val_psnr": val_metrics["val_psnr"],
+                        "val_ssim": val_metrics["val_ssim"],
+                        "val_clip": val_metrics["val_clip"],
+                        "val_rgb_dist": val_metrics["val_rgb_dist"],
+                    }
+                    for key in timestep_keys:
+                        log_dict[key] = val_metrics[key]
+                    
+                    metrics_logger.log(log_dict)
                 
-                # Log all metrics including per-timestep losses
-                log_dict = {
-                    "epoch": epoch,
-                    "train_loss": avg_loss,
-                    "val_l1": val_metrics["val_l1"],
-                    "val_psnr": val_metrics["val_psnr"],
-                    "val_ssim": val_metrics["val_ssim"],
-                    "val_clip": val_metrics["val_clip"],
-                }
-                # Add timestep losses
-                for key in timestep_keys:
-                    log_dict[key] = val_metrics[key]
-                
-                metrics_logger.log(log_dict)
-                
-            else:
-                print(f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | Time: {elapsed:.2f}s")
-                metrics_logger.log({"epoch": epoch, "train_loss": avg_loss})
+            # Reset running metrics after logging
+            running_loss = 0.0
+            running_noise_loss = 0.0
+            running_perceptual_loss = 0.0
+            running_l1_loss = 0.0
+            log_steps = 0
+            start_time = time.time()
+        
+        # Save checkpoint at intervals
+        if rank == 0 and global_step % cfg.SD_SAVE_INTERVAL == 0:
+            checkpoint_path = _save_checkpoint(model, optimizer, global_step, save_dir, version, ema_model=ema_helper.ema)
+            print(f"[SD] Checkpoint saved at step {global_step}: {checkpoint_path}")
 
-            if should_validate:
-                checkpoint_path = _save_checkpoint(model, optimizer, epoch, save_dir, version, ema_model=ema_helper.ema if rank == 0 else None)
-                print(f"[SD] Checkpoint saved: {checkpoint_path}")
 
     _cleanup_ddp()
 
 
-def train_distributed(epochs, retrain, checkpoint_path, version):
+def train_distributed(total_steps, retrain, checkpoint_path, version):
     device_ids = getattr(cfg, "DEVICE_IDS", None)
     if not device_ids or len(device_ids) < 2:
         raise RuntimeError("Stable diffusion training requires at least two devices listed in DEVICE_IDS")
 
     mp.spawn(
         _ddp_worker,
-        args=(len(device_ids), epochs, retrain, checkpoint_path, version),
+        args=(len(device_ids), total_steps, retrain, checkpoint_path, version),
         nprocs=len(device_ids),
         join=True,
     )
@@ -651,19 +759,19 @@ def train_distributed(epochs, retrain, checkpoint_path, version):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train stable diffusion conditioned on features and an optional initial image")
-    parser.add_argument("--epochs", type=int, required=True)
+    parser.add_argument("--steps", type=int, default=None, help="Total training steps (default: from config)")
     parser.add_argument("--retrain", type=int, default=0)
     parser.add_argument("--checkpoint", type=str, default="")
     args = parser.parse_args()
 
     retrain_flag = bool(args.retrain)
     checkpoint_path = args.checkpoint or None
-    # Note: retrain=1 means RESUME training, retrain=0 means start fresh
-    # Checkpoint path is optional - if not provided, auto-detects latest
+    total_steps = args.steps if args.steps is not None else cfg.SD_TOTAL_STEPS
 
     print(f"Launching stable diffusion DDP training on devices {cfg.DEVICE_IDS}")
+    print(f"Total training steps: {total_steps}")
     train_distributed(
-        epochs=args.epochs,
+        total_steps=total_steps,
         retrain=retrain_flag,
         checkpoint_path=checkpoint_path,
         version="ddp",

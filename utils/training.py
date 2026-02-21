@@ -112,6 +112,21 @@ def calculate_ssim(img1, img2):
     
     return np.mean(ssim_values)
 
+
+def calculate_avg_rgb_distance(img1, img2):
+    fake_01 = (img1 + 1.0) / 2.0
+    real_01 = (img2 + 1.0) / 2.0
+    
+    fake_mean_rgb = fake_01.mean(dim=[2, 3])
+    real_mean_rgb = real_01.mean(dim=[2, 3])
+    
+    rgb_dist = torch.sqrt(((fake_mean_rgb - real_mean_rgb) ** 2).sum(dim=1))
+    
+    rgb_dist_255 = rgb_dist * 255.0
+    
+    return rgb_dist_255.mean().item()
+
+
 def visualize_results(
     initial_images,
     generated_images,
@@ -284,7 +299,7 @@ def save_random_sample_pairs(
     generated_subset = generated_images[indices]
     target_subset = target_images[indices]
 
-    save_path = os.path.join(sample_dir, f"{prefix}_epoch_{epoch:04d}.png")
+    save_path = os.path.join(sample_dir, f"{prefix}_step_{epoch:04d}.png")
     visualize_results(initials_subset, generated_subset, target_subset, num_samples=num, save_path=save_path)
 
 
@@ -308,7 +323,7 @@ def save_diffusion_intermediates(intermediates, sample_dir, epoch, sample_idx=0)
         axes[idx].axis('off')
     
     plt.tight_layout()
-    save_path = os.path.join(sample_dir, f"intermediates_epoch_{epoch:04d}.png")
+    save_path = os.path.join(sample_dir, f"intermediates_step_{epoch:04d}.png")
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
 

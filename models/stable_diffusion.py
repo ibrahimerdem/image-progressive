@@ -4,8 +4,48 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import models
+from torchvision.models import VGG16_Weights
 
 import config as cfg
+
+
+class PerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        vgg = models.vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
+        self.slice1 = nn.Sequential(*list(vgg[:4]))
+        self.slice2 = nn.Sequential(*list(vgg[4:9]))
+        self.slice3 = nn.Sequential(*list(vgg[9:16]))
+        
+        for param in self.parameters():
+            param.requires_grad = False
+        
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+    
+    def normalize(self, x):
+        x = (x + 1) / 2
+        return (x - self.mean) / self.std
+    
+    def forward(self, pred, target):
+        pred = self.normalize(pred)
+        target = self.normalize(target)
+        
+        pred_f1 = self.slice1(pred)
+        pred_f2 = self.slice2(pred_f1)
+        pred_f3 = self.slice3(pred_f2)
+        
+        target_f1 = self.slice1(target)
+        target_f2 = self.slice2(target_f1)
+        target_f3 = self.slice3(target_f2)
+        
+        loss = (
+            F.l1_loss(pred_f1, target_f1) +
+            F.l1_loss(pred_f2, target_f2) +
+            F.l1_loss(pred_f3, target_f3)
+        )
+        return loss
 
 
 def get_timestep_embedding(timesteps, dim):
@@ -149,7 +189,7 @@ class ResidualBlock(nn.Module):
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act = nn.SiLU()
         self.time_film = nn.Linear(time_dim, out_channels * 2)
-        self.cross_attn = CrossAttention(out_channels, feature_dim, heads=8, chunk_size=1024)
+        self.cross_attn = CrossAttention(out_channels, feature_dim, heads=cfg.SD_ATTENTION_HEADS, chunk_size=1024)
         self.attn_norm = nn.GroupNorm(8, out_channels)
         if in_channels != out_channels:
             self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
@@ -224,7 +264,9 @@ class ImprovedUNet(nn.Module):
         self.inc = ResidualBlock(in_channels, base_channels, time_dim, feature_dim)
         self.down1 = DownBlock(base_channels, base_channels * 2, time_dim, feature_dim, attn=True)
         self.down2 = DownBlock(base_channels * 2, base_channels * 4, time_dim, feature_dim, attn=True)
+        self.down3 = DownBlock(base_channels * 4, base_channels * 4, time_dim, feature_dim, attn=True)
         self.mid = ResidualBlock(base_channels * 4, base_channels * 4, time_dim, feature_dim)
+        self.up4 = UpBlock(base_channels * 8, base_channels * 4, time_dim, feature_dim, attn=True)
         self.up3 = UpBlock(base_channels * 8, base_channels * 2, time_dim, feature_dim, attn=True)
         self.up2 = UpBlock(base_channels * 4, base_channels, time_dim, feature_dim, attn=True)
         self.up1 = UpBlock(base_channels * 2, base_channels, time_dim, feature_dim, attn=False)
@@ -234,8 +276,10 @@ class ImprovedUNet(nn.Module):
         h1 = self.inc(x, time_emb, feature_emb)
         d2, skip1 = self.down1(h1, time_emb, feature_emb)
         d3, skip2 = self.down2(d2, time_emb, feature_emb)
-        middle = self.mid(d3, time_emb, feature_emb)
-        u3 = self.up3(middle, skip2, time_emb, feature_emb)
+        d4, skip3 = self.down3(d3, time_emb, feature_emb)
+        middle = self.mid(d4, time_emb, feature_emb)
+        u4 = self.up4(middle, skip3, time_emb, feature_emb)
+        u3 = self.up3(u4, skip2, time_emb, feature_emb)
         u2 = self.up2(u3, skip1, time_emb, feature_emb)
         u1 = self.up1(u2, h1, time_emb, feature_emb)
         return self.out_conv(u1)
@@ -244,7 +288,7 @@ class ImprovedUNet(nn.Module):
 class GaussianDiffusion(nn.Module):
     def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02):
         super().__init__()
-        betas = torch.linspace(beta_start, beta_end, timesteps)
+        betas = self._cosine_beta_schedule(timesteps, s=0.008)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]], dim=0)
@@ -253,6 +297,14 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer("alphas_cumprod", alphas_cumprod)
         self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
         self.timesteps = timesteps
+    
+    def _cosine_beta_schedule(self, timesteps, s=0.008):
+        steps = timesteps + 1
+        x = torch.linspace(0, timesteps, steps)
+        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clip(betas, 0.0001, 0.9999)
 
     def _extract(self, arr, timesteps, shape):
         out = arr.gather(0, timesteps).view(-1, *([1] * (len(shape) - 1)))
@@ -277,11 +329,11 @@ class GaussianDiffusion(nn.Module):
         features,
         vae_encoder=None,
         initial_images=None,
+        vae_decoder=None,
+        perceptual_loss_fn=None,
     ):
-
         if vae_encoder is not None:
             with torch.no_grad():
-                # VAE encoder expects noise for reparameterization
                 noise_for_vae = torch.randn(
                     x_start.size(0), 4, 
                     x_start.size(2) // 8, x_start.size(3) // 8,
@@ -296,8 +348,31 @@ class GaussianDiffusion(nn.Module):
         noise = torch.randn_like(x_start_latent)
         x_t = self.q_sample(x_start_latent, t, noise)
         pred_noise = model(x_t, t, features, initial_images)
+        
         noise_loss = F.mse_loss(pred_noise, noise)
-        return {'loss': noise_loss, 'metrics': {'noise_loss': noise_loss.item()}}
+        
+        total_loss = noise_loss
+        metrics = {'noise_loss': noise_loss.item()}
+        
+        if perceptual_loss_fn is not None and vae_decoder is not None:
+            sqrt_alpha_bar = torch.sqrt(self._extract(self.alphas_cumprod, t, x_start_latent.shape))
+            sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - self._extract(self.alphas_cumprod, t, x_start_latent.shape))
+            pred_x0 = (x_t - sqrt_one_minus_alpha_bar * pred_noise) / torch.clamp(sqrt_alpha_bar, min=1e-8)
+            pred_x0 = torch.clamp(pred_x0, -20.0, 20.0)
+            
+            with torch.no_grad():
+                target_decoded = vae_decoder(x_start_latent)
+            pred_decoded = vae_decoder(pred_x0)
+            
+            perceptual_loss = perceptual_loss_fn(pred_decoded, target_decoded)
+            l1_loss = F.l1_loss(pred_decoded, target_decoded)
+            
+            total_loss = noise_loss + cfg.SD_PERCEPTUAL_WEIGHT * perceptual_loss + cfg.SD_L1_WEIGHT * l1_loss
+            
+            metrics['perceptual_loss'] = perceptual_loss.item()
+            metrics['l1_loss'] = l1_loss.item()
+        
+        return {'loss': total_loss, 'metrics': metrics}
 
     def sample(
         self,
@@ -306,7 +381,7 @@ class GaussianDiffusion(nn.Module):
         steps=None,
         save_intermediates=False,
         eta=0.0,
-        latent_shape=None,  # (B, C, H, W) for latent space
+        latent_shape=None,
         initial_images=None,
     ):
         steps = steps or self.timesteps
@@ -328,6 +403,7 @@ class GaussianDiffusion(nn.Module):
             t = torch.full((shape[0],), timestep, dtype=torch.long, device=img.device)
             with torch.no_grad() if not model.training else torch.enable_grad():
                 epsilon = model(img, t, features, initial_images)
+            
             alpha_bar_t = self._extract(self.alphas_cumprod, t, img.shape)
             if step_idx < len(timestep_schedule) - 1:
                 t_prev = timestep_schedule[step_idx + 1]
@@ -335,31 +411,27 @@ class GaussianDiffusion(nn.Module):
                                                torch.full_like(t, t_prev), img.shape)
             else:
                 alpha_bar_prev = torch.ones_like(alpha_bar_t)
+            
             sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
             sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
             sqrt_alpha_bar_t = torch.clamp(sqrt_alpha_bar_t, min=1e-8)
             pred_x0 = (img - sqrt_one_minus_alpha_bar_t * epsilon) / sqrt_alpha_bar_t
 
-            # Clamp predicted x0: use wider range for latents, tight range for images
             if latent_shape is not None:
-                # Latent space: use much wider range (VAE latents can be large)
                 pred_x0 = torch.clamp(pred_x0, -20.0, 20.0)
             else:
-                # Image space: standard pixel range
                 pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
 
-            variance = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)
-            variance = torch.clamp(variance, min=0.0, max=1.0)
             sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
-            sqrt_one_minus_alpha_bar_prev_minus_var = torch.sqrt(torch.clamp(1.0 - alpha_bar_prev - eta**2 * variance, min=0))
-            dir_xt = sqrt_one_minus_alpha_bar_prev_minus_var * epsilon
+            sqrt_one_minus_alpha_bar_prev = torch.sqrt(1.0 - alpha_bar_prev)
+            
+            dir_xt = sqrt_one_minus_alpha_bar_prev * epsilon
             x_prev = sqrt_alpha_bar_prev * pred_x0 + dir_xt
             img = x_prev
+            
             if save_intermediates and step_idx % 10 == 0:
-                # Save intermediates without clamping (decoder will handle it)
                 intermediates.append((timestep.item(), img.clone()))
         
-        # Final output: don't clamp latents, let decoder handle it
         final = img if latent_shape is not None else torch.clamp(img, -1.0, 1.0)
         if save_intermediates:
             return final, intermediates

@@ -115,7 +115,7 @@ def evaluate_test_set(
     num_workers=2,
     save_samples=True,
     save_all=True,
-    num_inference_steps=200,  # Match training validation steps for better quality
+    num_inference_steps=200,
 ):
 
     print("\n" + "="*60)
@@ -339,8 +339,8 @@ def main():
     parser.add_argument(
         '--inference_steps',
         type=int,
-        default=200,  # Match SD_SAMPLE_STEPS from config for quality
-        help='Number of diffusion steps for sampling (default: 200, matching training validation)'
+        default=cfg.SD_SAMPLE_STEPS,
+        help=f'Number of diffusion steps for sampling (default: {cfg.SD_SAMPLE_STEPS} from config)'
     )
     parser.add_argument(
         '--no_save_samples',
