@@ -26,6 +26,7 @@ from models.decoder import VAE_Decoder
 from utils.dataset import create_dataloaders
 from utils.training import (
     MetricsLogger,
+    calculate_avg_rgb_distance,
     calculate_psnr,
     calculate_ssim,
     compute_clip_metrics_batch,
@@ -283,10 +284,9 @@ def _run_validation(
     total_psnr = 0.0
     total_ssim = 0.0
     total_clip = 0.0
+    total_rgb_dist = 0.0
     clip_count = 0
     total_samples = 0
-
-    autocast_ctx = (lambda: autocast(device_type="cuda")) if device.type == "cuda" else (lambda: nullcontext())
 
     for idx, (initial_images, features, target_images, _) in enumerate(val_loader):
         
@@ -295,14 +295,13 @@ def _run_validation(
         targets = target_images.to(device)
 
         with torch.no_grad():
-            with autocast_ctx():
-                val_steps = cfg.SD_SAMPLE_STEPS
-                
-                if cfg.INITIAL_IMAGE:
-                    samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
-                                            initial_images=initial_images)
-                else:
-                    samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
+            val_steps = cfg.SD_SAMPLE_STEPS
+            
+            if cfg.INITIAL_IMAGE:
+                samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
+                                        initial_images=initial_images)
+            else:
+                samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
                 
         batch_size = targets.size(0)
 
@@ -314,6 +313,7 @@ def _run_validation(
         clip_sum, clip_bs = compute_clip_metrics_batch(samples, targets, clip_model, clip_preprocess, device)
         total_clip += clip_sum
         clip_count += clip_bs
+        total_rgb_dist += calculate_avg_rgb_distance(samples, targets) * batch_size
 
         # Save sample generated images as triplets: initial-generated-truth (only on rank 0)
         if idx == 0 and rank == 0:
@@ -348,6 +348,7 @@ def _run_validation(
         "val_psnr": total_psnr / total_samples,
         "val_ssim": total_ssim / total_samples,
         "val_clip": total_clip / max(clip_count, 1),
+        "val_rgb_dist": total_rgb_dist / total_samples,
     }
     
     # Add per-timestep losses and prediction stats
@@ -586,7 +587,8 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 print(
                     f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | "
                     f"Val L1: {val_metrics['val_l1']:.4f}, PSNR: {val_metrics['val_psnr']:.2f}, "
-                    f"SSIM: {val_metrics['val_ssim']:.4f}, CLIP: {val_metrics['val_clip']:.4f} | "
+                    f"SSIM: {val_metrics['val_ssim']:.4f}, CLIP: {val_metrics['val_clip']:.4f}, "
+                    f"RGB Dist: {val_metrics['val_rgb_dist']:.4f} | "
                     f"Time: {elapsed:.2f}s"
                 )
                 
@@ -618,6 +620,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                     "val_psnr": val_metrics["val_psnr"],
                     "val_ssim": val_metrics["val_ssim"],
                     "val_clip": val_metrics["val_clip"],
+                    "val_rgb_dist": val_metrics["val_rgb_dist"],
                 }
                 # Add timestep losses
                 for key in timestep_keys:
