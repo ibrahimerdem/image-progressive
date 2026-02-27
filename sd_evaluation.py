@@ -159,7 +159,7 @@ def evaluate_test_set(
                 features=input_feat,
                 steps=num_inference_steps,
                 save_intermediates=False,
-                initial_images=input_image
+                initial_images=input_image,
             )
 
             l1 = l1_loss(generated_images, target_image).item()

@@ -275,7 +275,6 @@ class GaussianDiffusion(nn.Module):
 
         if vae_encoder is not None:
             with torch.no_grad():
-                # VAE encoder expects noise for reparameterization
                 noise_for_vae = torch.randn(
                     x_start.size(0), 4, 
                     x_start.size(2) // 8, x_start.size(3) // 8,
@@ -284,14 +283,34 @@ class GaussianDiffusion(nn.Module):
                 x_start_latent = vae_encoder(x_start, noise_for_vae)
         else:
             x_start_latent = x_start
-        
+
         batch_size = x_start_latent.size(0)
         t = torch.randint(0, self.timesteps, (batch_size,), device=x_start_latent.device)
         noise = torch.randn_like(x_start_latent)
         x_t = self.q_sample(x_start_latent, t, noise)
         pred_noise = model(x_t, t, features, initial_images)
         noise_loss = F.mse_loss(pred_noise, noise)
-        return {'loss': noise_loss, 'metrics': {'noise_loss': noise_loss.item()}}
+
+        # pred_x0 loss: penalize reconstruction error in latent space, no decoder needed
+        # Weighted by SNR so it matters most at low-noise timesteps
+        x0_loss = torch.tensor(0.0, device=x_start_latent.device)
+        if cfg.SD_X0_LOSS_WEIGHT > 0:
+            sqrt_alpha_bar = torch.sqrt(self._extract(self.alphas_cumprod, t, x_start_latent.shape))
+            sqrt_one_minus = torch.sqrt(1.0 - self._extract(self.alphas_cumprod, t, x_start_latent.shape))
+            pred_x0 = (x_t - sqrt_one_minus * pred_noise) / sqrt_alpha_bar.clamp(min=1e-8)
+            pred_x0 = pred_x0.clamp(-20.0, 20.0)
+            # SNR weight: higher weight at low noise (high alpha_bar)
+            snr_weight = sqrt_alpha_bar.squeeze() ** 2
+            x0_loss = (snr_weight * F.l1_loss(pred_x0, x_start_latent, reduction='none').mean(dim=[1, 2, 3])).mean()
+
+        total_loss = noise_loss + cfg.SD_X0_LOSS_WEIGHT * x0_loss
+        return {
+            'loss': total_loss,
+            'metrics': {
+                'noise_loss': noise_loss.item(),
+                'x0_loss': x0_loss.item(),
+            }
+        }
 
     def sample(
         self,
@@ -300,7 +319,7 @@ class GaussianDiffusion(nn.Module):
         steps=None,
         save_intermediates=False,
         eta=0.0,
-        latent_shape=None,  # (B, C, H, W) for latent space
+        latent_shape=None,
         initial_images=None,
     ):
         steps = steps or self.timesteps
@@ -317,43 +336,42 @@ class GaussianDiffusion(nn.Module):
             timestep_schedule = torch.flip(timestep_schedule, [0])
         else:
             timestep_schedule = torch.arange(self.timesteps - 1, -1, -1, dtype=torch.long)
-        
+
         for step_idx, timestep in enumerate(timestep_schedule):
             t = torch.full((shape[0],), timestep, dtype=torch.long, device=img.device)
-            with torch.no_grad() if not model.training else torch.enable_grad():
+
+            with torch.no_grad():
                 epsilon = model(img, t, features, initial_images)
+
             alpha_bar_t = self._extract(self.alphas_cumprod, t, img.shape)
             if step_idx < len(timestep_schedule) - 1:
                 t_prev = timestep_schedule[step_idx + 1]
-                alpha_bar_prev = self._extract(self.alphas_cumprod, 
+                alpha_bar_prev = self._extract(self.alphas_cumprod,
                                                torch.full_like(t, t_prev), img.shape)
             else:
                 alpha_bar_prev = torch.ones_like(alpha_bar_t)
-            sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
+
+            sqrt_alpha_bar_t = torch.clamp(torch.sqrt(alpha_bar_t), min=1e-8)
             sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
-            sqrt_alpha_bar_t = torch.clamp(sqrt_alpha_bar_t, min=1e-8)
             pred_x0 = (img - sqrt_one_minus_alpha_bar_t * epsilon) / sqrt_alpha_bar_t
 
-            # Clamp predicted x0: use wider range for latents, tight range for images
             if latent_shape is not None:
-                # Latent space: use much wider range (VAE latents can be large)
                 pred_x0 = torch.clamp(pred_x0, -20.0, 20.0)
             else:
-                # Image space: standard pixel range
                 pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
 
             variance = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)
             variance = torch.clamp(variance, min=0.0, max=1.0)
             sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
-            sqrt_one_minus_alpha_bar_prev_minus_var = torch.sqrt(torch.clamp(1.0 - alpha_bar_prev - eta**2 * variance, min=0))
+            sqrt_one_minus_alpha_bar_prev_minus_var = torch.sqrt(
+                torch.clamp(1.0 - alpha_bar_prev - eta**2 * variance, min=0))
             dir_xt = sqrt_one_minus_alpha_bar_prev_minus_var * epsilon
             x_prev = sqrt_alpha_bar_prev * pred_x0 + dir_xt
-            img = x_prev
+            img = x_prev.detach()
+
             if save_intermediates and step_idx % 10 == 0:
-                # Save intermediates without clamping (decoder will handle it)
                 intermediates.append((timestep.item(), img.clone()))
-        
-        # Final output: don't clamp latents, let decoder handle it
+
         final = img if latent_shape is not None else torch.clamp(img, -1.0, 1.0)
         if save_intermediates:
             return final, intermediates
@@ -417,40 +435,33 @@ class StableDiffusionPipeline:
 
     def sample(self, features, steps=None, save_intermediates=False,
                initial_images=None):
-       
+
         if self.vae_encoder is not None and self.vae_decoder is not None:
-            # Latent space: 4 channels, H/8, W/8
             batch_size = features.size(0)
             latent_h = cfg.TARGET_HEIGHT // 8
             latent_w = cfg.TARGET_WIDTH // 8
             latent_shape = (batch_size, 4, latent_h, latent_w)
 
             result = self.schedule.sample(
-                self.model, features, steps, 
+                self.model, features, steps,
                 save_intermediates=save_intermediates,
                 latent_shape=latent_shape,
-                initial_images=initial_images
+                initial_images=initial_images,
             )
-            
+
             if save_intermediates and isinstance(result, tuple):
                 latents, intermediates = result
-                images = self.vae_decoder(latents)
-                images = torch.clamp(images, -1.0, 1.0)
+                images = torch.clamp(self.vae_decoder(latents), -1.0, 1.0)
                 decoded_intermediates = []
                 for t, latent in intermediates:
-                    img = self.vae_decoder(latent)
-                    img = torch.clamp(img, -1.0, 1.0)
-                    decoded_intermediates.append((t, img))
+                    decoded_intermediates.append((t, torch.clamp(self.vae_decoder(latent), -1.0, 1.0)))
                 return images, decoded_intermediates
             else:
-                latents = result
-                images = self.vae_decoder(latents)
-                images = torch.clamp(images, -1.0, 1.0)
-                return images
+                return torch.clamp(self.vae_decoder(result), -1.0, 1.0)
         else:
-            return self.schedule.sample(self.model, features, steps, 
-                                       save_intermediates=save_intermediates,
-                                       initial_images=initial_images)
+            return self.schedule.sample(self.model, features, steps,
+                                        save_intermediates=save_intermediates,
+                                        initial_images=initial_images)
 
 
 class ModelEMA:

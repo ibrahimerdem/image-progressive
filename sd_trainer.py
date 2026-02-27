@@ -32,7 +32,6 @@ from utils.training import (
     compute_clip_metrics_batch,
     load_clip_model,
     save_random_sample_pairs,
-    save_diffusion_intermediates,
 )
 
 
@@ -296,7 +295,7 @@ def _run_validation(
 
         with torch.no_grad():
             val_steps = cfg.SD_SAMPLE_STEPS
-            
+
             if cfg.INITIAL_IMAGE:
                 samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
                                         initial_images=initial_images)
@@ -323,7 +322,7 @@ def _run_validation(
                 targets,         
                 sample_dir,
                 epoch,
-                prefix="sd_val",
+                prefix="sd_x0_aggressive",
                 num_samples=batch_size,
             )
             
@@ -493,7 +492,6 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                     print(f"[SD] Initial images shape: {initial_images.shape}")
 
             with amp_ctx():
-                # Pass initial images if config flag is enabled
                 if cfg.INITIAL_IMAGE:
                     loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder,
                                                 initial_images=initial_images)
@@ -526,9 +524,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             steps += 1
 
             if (batch_idx + 1) % cfg.SD_LOG_INTERVAL == 0 and rank == 0:
+                x0_loss_val = loss_metrics.get('x0_loss', 0.0)
                 print(
                     f"[SD] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
-                    f"Loss: {epoch_loss / steps:.4f} | Grad Norm: {grad_norm:.4f}"
+                    f"Loss: {epoch_loss / steps:.4f} | X0: {x0_loss_val:.4f} | Grad Norm: {grad_norm:.4f}"
                 )
         
         # End of batch loop - log completion
@@ -669,7 +668,7 @@ def main() -> None:
         epochs=args.epochs,
         retrain=retrain_flag,
         checkpoint_path=checkpoint_path,
-        version="ddp",
+        version="ddp_x0_aggressive",
     )
 
 
