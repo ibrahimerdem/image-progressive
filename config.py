@@ -22,11 +22,6 @@ FEATURE_MINS = [5.6,15,0,16.87,-1.91,-16.75,1,1,1000]
 FEATURE_MAXS = [30,42,95,40,1.62,-0.5,4,7,7000]
 FEATURE_SEQUENCE_LENGTH = 16  # 0 = single vector [D], >0 = sequence [N, D] for cross-attention
 INITIAL_IMAGE = False
-ENCODER_PATH = "checkpoints/encoder_epoch_50.pth"
-FREEZE_ENCODER = True
-# Stable diffusion initial image encoder options
-SD_INITIAL_ENCODER_CKPT = "checkpoints/vae_epoch_10.pth"  # Path to pretrained VAE encoder
-SD_FREEZE_INITIAL_ENCODER = False
 
 # Model / training defaults
 NOISE_DIM = 128
@@ -38,11 +33,11 @@ L2_FACTOR = 150.0
 VAL_EPOCH = 5 
 
 # VAE defaults (balanced for memory and capacity)
-VAE_BASE_CHANNELS = 64  # Compromise: not too small (32) or large (128)
-VAE_LATENT_DIM = 256     # Sufficient for learning
-VAE_HIDDEN_DIM = 512     # Better feature encoding
-VAE_LR = 0.0001          # Conservative learning rate
-VAE_KL_WEIGHT = 0.00001  # Small KL weight to avoid posterior collapse
+VAE_BASE_CHANNELS = 64  
+VAE_LATENT_DIM = 256    
+VAE_HIDDEN_DIM = 512     
+VAE_LR = 0.0001        
+VAE_KL_WEIGHT = 0.0001  
 
 # Stable diffusion defaults
 SD_LR = 0.00005         # Lower learning rate to prevent NaN
