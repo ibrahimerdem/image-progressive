@@ -15,6 +15,7 @@ from models.stable_diffusion import (
 from models.encoder import VAE_Encoder
 from models.decoder import VAE_Decoder
 from utils.training import (
+    calculate_avg_rgb_distance,
     calculate_psnr,
     calculate_ssim,
     load_clip_model,
@@ -107,7 +108,7 @@ def evaluate_test_set(
     batch_size=8,
     num_workers=2,
     save_samples=True,
-    num_inference_steps=50,
+    num_inference_steps=cfg.SD_SAMPLE_STEPS,
 ):
 
     print("\n" + "="*60)
@@ -136,12 +137,18 @@ def evaluate_test_set(
     total_psnr = 0.0
     total_ssim = 0.0
     total_clip = 0.0
+    total_rgb_dist = 0.0
     total_count = 0
     
-    # Output directory for samples
+    # Output directories
     output_dir = "outputs/sd"
+    generated_dir = os.path.join(output_dir, "generated")
+    target_dir_out = os.path.join(output_dir, "target")
+    input_dir_out = os.path.join(output_dir, "input")
     if save_samples:
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(generated_dir, exist_ok=True)
+        os.makedirs(target_dir_out, exist_ok=True)
+        os.makedirs(input_dir_out, exist_ok=True)
     
     pipeline.model.eval()
     
@@ -168,36 +175,27 @@ def evaluate_test_set(
             clip_score, _ = compute_clip_metrics_batch(
                 generated_images, target_image, clip_model, clip_preprocess, device
             )
+            rgb_dist = calculate_avg_rgb_distance(generated_images, target_image)
             
             total_l1 += l1 * batch_size_local
             total_psnr += psnr * batch_size_local
             total_ssim += ssim * batch_size_local
             total_clip += clip_score
+            total_rgb_dist += rgb_dist * batch_size_local
             total_count += batch_size_local
             
-            if save_samples and batch_idx == 0:
-                num_samples = min(8, batch_size_local)
-                for i in range(num_samples):
-                    # Denormalize images (from [-1, 1] to [0, 1])
-                    input_img = (input_image[i].cpu() + 1) / 2
-                    generated_img = (generated_images[i].cpu() + 1) / 2
-                    target_img = (target_image[i].cpu() + 1) / 2
-                    
-                    # Clamp to [0, 1]
-                    input_img = torch.clamp(input_img, 0, 1)
-                    generated_img = torch.clamp(generated_img, 0, 1)
-                    target_img = torch.clamp(target_img, 0, 1)
-                    
-                    # Convert to PIL and save
-                    to_pil = transforms.ToPILImage()
-                    
-                    input_pil = to_pil(input_img)
-                    generated_pil = to_pil(generated_img)
-                    target_pil = to_pil(target_img)
-                    
-                    input_pil.save(os.path.join(output_dir, f"sample_{i}_input.png"))
-                    generated_pil.save(os.path.join(output_dir, f"sample_{i}_generated.png"))
-                    target_pil.save(os.path.join(output_dir, f"sample_{i}_target.png"))
+            if save_samples:
+                to_pil = transforms.ToPILImage()
+                for i in range(batch_size_local):
+                    global_idx = (batch_idx * batch_size) + i
+
+                    gen_img   = torch.clamp((generated_images[i].cpu() + 1) / 2, 0, 1)
+                    tgt_img   = torch.clamp((target_image[i].cpu()     + 1) / 2, 0, 1)
+                    inp_img   = torch.clamp((input_image[i].cpu()      + 1) / 2, 0, 1)
+
+                    to_pil(gen_img).save(os.path.join(generated_dir, f"{global_idx:05d}.png"))
+                    to_pil(tgt_img).save(os.path.join(target_dir_out, f"{global_idx:05d}.png"))
+                    to_pil(inp_img).save(os.path.join(input_dir_out,  f"{global_idx:05d}.png"))
             
             if (batch_idx + 1) % 5 == 0:
                 print(f"Processed {batch_idx + 1}/{len(test_loader)} batches...")
@@ -208,6 +206,7 @@ def evaluate_test_set(
     avg_psnr = total_psnr / total_count
     avg_ssim = total_ssim / total_count
     avg_clip = total_clip / total_count
+    avg_rgb_dist = total_rgb_dist / total_count
     
     # Print results
     print("\n" + "="*60)
@@ -222,10 +221,13 @@ def evaluate_test_set(
     print(f"  PSNR:          {avg_psnr:.2f} dB")
     print(f"  SSIM:          {avg_ssim:.4f}")
     print(f"  CLIP Score:    {avg_clip:.4f}")
+    print(f"  RGB Distance:  {avg_rgb_dist:.4f}")
     print("="*60)
     
     if save_samples:
-        print(f"\nSample outputs saved to: {output_dir}/")
+        print(f"\nGenerated images saved to: {generated_dir}/")
+        print(f"Target images saved to:    {target_dir_out}/")
+        print(f"Input images saved to:     {input_dir_out}/")
     
     # Save results to file
     results = {
@@ -235,6 +237,7 @@ def evaluate_test_set(
         'psnr': avg_psnr,
         'ssim': avg_ssim,
         'clip_score': avg_clip,
+        'rgb_distance': avg_rgb_dist,
         'evaluation_time': elapsed_time,
         'time_per_sample': elapsed_time / total_count,
     }
@@ -266,30 +269,6 @@ def main():
         help='Path to VAE checkpoint (default: from config.SD_VAE_CKPT)'
     )
     parser.add_argument(
-        '--device',
-        type=str,
-        default='cuda:0',
-        help='Device to use (e.g., cuda:0, cpu)'
-    )
-    parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=4,
-        help='Batch size for test evaluation (smaller due to diffusion steps)'
-    )
-    parser.add_argument(
-        '--num_workers',
-        type=int,
-        default=2,
-        help='Number of dataloader workers'
-    )
-    parser.add_argument(
-        '--inference_steps',
-        type=int,
-        default=50,
-        help='Number of diffusion steps for sampling'
-    )
-    parser.add_argument(
         '--no_save_samples',
         action='store_true',
         help='Do not save sample outputs'
@@ -298,13 +277,12 @@ def main():
     args = parser.parse_args()
     
     # Setup device
-    if args.device.startswith('cuda') and not torch.cuda.is_available():
-        print("CUDA not available, using CPU")
-        device = torch.device('cpu')
-    else:
-        device = torch.device(args.device)
+    device_str = f"cuda:{cfg.DEVICE_IDS[0]}" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_str)
     
     print(f"Using device: {device}")
+    print(f"Batch size:   {cfg.BATCH_SIZE_PER_GPU} (from config)")
+    print(f"Inference steps: {cfg.SD_SAMPLE_STEPS} (from config)")
     
     # Load model
     pipeline, sd_model, schedule = load_sd_model_from_checkpoint(
@@ -317,10 +295,10 @@ def main():
     evaluate_test_set(
         pipeline,
         device,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
+        batch_size=cfg.BATCH_SIZE_PER_GPU,
+        num_workers=cfg.NUM_WORKERS,
         save_samples=not args.no_save_samples,
-        num_inference_steps=args.inference_steps
+        num_inference_steps=cfg.SD_SAMPLE_STEPS
     )
 
 

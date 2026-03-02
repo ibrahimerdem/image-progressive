@@ -322,7 +322,7 @@ def _run_validation(
                 targets,         
                 sample_dir,
                 epoch,
-                prefix="sd_x0_aggressive",
+                prefix="sd_x0_large",
                 num_samples=batch_size,
             )
             
@@ -464,7 +464,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         os.makedirs(log_dir, exist_ok=True)
         os.makedirs(sample_dir, exist_ok=True)
 
-    metrics_logger = MetricsLogger(log_dir, f"stable_diffusion_{version}_log.csv") if rank == 0 else None
+    metrics_logger = MetricsLogger(log_dir, f"diffusion_{version}_log.csv") if rank == 0 else None
     clip_model = clip_preprocess = None
     if rank == 0:
         clip_model, clip_preprocess = load_clip_model(device)
@@ -668,7 +668,7 @@ def main() -> None:
         epochs=args.epochs,
         retrain=retrain_flag,
         checkpoint_path=checkpoint_path,
-        version="ddp_x0_aggressive",
+        version="ddp_x0_large",
     )
 
 
