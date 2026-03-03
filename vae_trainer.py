@@ -1,5 +1,6 @@
 import argparse
 import os
+import csv
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -13,30 +14,51 @@ from models.encoder import VAE_Encoder
 from models.decoder import VAE_Decoder
 
 
-def setup_ddp(rank, world_size):
+def setup_ddp(rank: int, world_size: int) -> None:
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12356'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
 
-def cleanup_ddp():
+def cleanup_ddp() -> None:
     dist.destroy_process_group()
 
 
-def train_worker(rank, world_size, args):
+def encode_with_kl(encoder_module, x, noise):
+    """
+    Run encoder Sequential layers manually to extract mean and log_variance
+    before reparameterization, so KL is computed correctly.
+    Returns (latent, kl_loss).
+    """
+    import torch.nn.functional as F
+    for module in encoder_module:
+        if getattr(module, 'stride', None) == (2, 2):
+            x = F.pad(x, (0, 1, 0, 1))
+        x = module(x)
+    # x is now (B, 8, H/8, W/8) — mean and log_variance concatenated
+    mean, log_variance = torch.chunk(x, 2, dim=1)
+    log_variance = torch.clamp(log_variance, -30, 20)
+    stdev = (log_variance.exp()).sqrt()
+    latent = (mean + stdev * noise) * 0.18215
+    # Correct KL: -0.5 * sum(1 + log_var - mean^2 - exp(log_var))
+    kl_loss = -0.5 * torch.mean(1 + log_variance - mean.pow(2) - log_variance.exp())
+    return latent, kl_loss
+
+
+def train_worker(rank: int, world_size: int, args) -> None:
     setup_ddp(rank, world_size)
     device = torch.device(f"cuda:{rank}")
-    
+
     if rank == 0:
         print(f"Initializing VAE models on rank {rank}...")
-    
+
     vae_encoder = VAE_Encoder().to(device)
     vae_decoder = VAE_Decoder().to(device)
-    
+
     vae_encoder = DDP(vae_encoder, device_ids=[rank])
     vae_decoder = DDP(vae_decoder, device_ids=[rank])
-    
+
     train_loader, val_loader, _ = create_dataloaders(
         batch_size=cfg.BATCH_SIZE_PER_GPU,
         num_workers=cfg.NUM_WORKERS,
@@ -45,144 +67,186 @@ def train_worker(rank, world_size, args):
         rank=rank,
         world_size=world_size,
     )
-    
+
     optimizer = torch.optim.AdamW(
         list(vae_encoder.parameters()) + list(vae_decoder.parameters()),
         lr=cfg.VAE_LR
     )
     scaler = GradScaler('cuda')
-    
+
+    # Setup CSV logger on rank 0
+    log_path = "checkpoints/logs/vae_cropped_training_log.csv"
+    if rank == 0:
+        os.makedirs("checkpoints/logs", exist_ok=True)
+        log_file = open(log_path, 'w', newline='')
+        log_writer = csv.writer(log_file)
+        log_writer.writerow(["epoch", "train_loss", "train_l1", "train_kl",
+                              "val_tgt_kb", "val_rec_kb", "val_tgt_std", "val_rec_std"])
+        log_file.flush()
+
     start_epoch = 0
-    if args.retrain and args.checkpoint:
-        if rank == 0 and os.path.exists(args.checkpoint):
+    if args.retrain and args.checkpoint and os.path.exists(args.checkpoint):
+        if rank == 0:
             print(f"Loading checkpoint from {args.checkpoint}...")
-            checkpoint = torch.load(args.checkpoint, map_location=device)
-            vae_encoder.module.load_state_dict(checkpoint['encoder'])
-            vae_decoder.module.load_state_dict(checkpoint['decoder'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            start_epoch = checkpoint['epoch'] + 1
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        vae_encoder.module.load_state_dict(checkpoint['encoder'])
+        vae_decoder.module.load_state_dict(checkpoint['decoder'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = checkpoint['epoch'] + 1
+        if rank == 0:
             print(f"Resumed from epoch {start_epoch}")
-    
+
     if rank == 0:
         print("Starting VAE training...")
-        print(f"Training from epoch {start_epoch} to {args.epochs}")
-        print(f"Train batches: {len(train_loader)}")
-    
+
     for epoch in range(start_epoch, args.epochs):
         vae_encoder.train()
         vae_decoder.train()
-        
-        if rank == 0:
-            print(f"Starting epoch {epoch+1}...")
-        
         train_loader.sampler.set_epoch(epoch)
-        
-        if rank == 0:
-            print(f"Sampler set for epoch {epoch+1}, starting iteration...")
-        
+
         epoch_loss = 0.0
-        epoch_recon_loss = 0.0
-        epoch_kl_loss = 0.0
+        epoch_l1 = 0.0
+        epoch_kl = 0.0
         num_batches = 0
-        
-        for batch_idx, (initial_img, _, target_img, _) in enumerate(train_loader):
-            if rank == 0 and batch_idx == 0:
-                print(f"First batch loaded for epoch {epoch+1}")
-            
+
+        for batch_idx, (_, __, target_img, ___) in enumerate(train_loader):
             target_img = target_img.to(device)
             batch_size = target_img.shape[0]
-            
+
             optimizer.zero_grad()
-            
+
             with autocast('cuda'):
-                noise = torch.randn(batch_size, 4, cfg.TARGET_HEIGHT // 8, cfg.TARGET_WIDTH // 8, device=device)
-                latents = vae_encoder(target_img, noise)
-                
+                noise = torch.randn(
+                    batch_size, 4,
+                    cfg.TARGET_HEIGHT // 8, cfg.TARGET_WIDTH // 8,
+                    device=device
+                )
+                # Fix 1: extract mean/logvar for correct KL
+                latents, kl_loss = encode_with_kl(vae_encoder.module, target_img, noise)
                 reconstructed = vae_decoder(latents)
-                
-                recon_loss = F.mse_loss(reconstructed, target_img)
-                
-                kl_loss = -0.5 * torch.mean(1 + torch.log(latents.var(dim=[2, 3]) + 1e-8) - latents.mean(dim=[2, 3]).pow(2) - latents.var(dim=[2, 3]))
-                
-                loss = recon_loss + cfg.VAE_KL_WEIGHT * kl_loss
-            
+
+                # Fix 2: L1 instead of MSE — preserves edges, avoids blur
+                l1_loss = F.l1_loss(reconstructed, target_img)
+
+                loss = l1_loss + cfg.VAE_KL_WEIGHT * kl_loss
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            
+
             epoch_loss += loss.item()
-            epoch_recon_loss += recon_loss.item()
-            epoch_kl_loss += kl_loss.item()
+            epoch_l1 += l1_loss.item()
+            epoch_kl += kl_loss.item()
             num_batches += 1
-            
+
             if rank == 0 and batch_idx % 100 == 0:
-                print(f"Epoch [{epoch+1}/{args.epochs}], Batch [{batch_idx}/{len(train_loader)}], "
-                      f"Loss: {loss.item():.4f}, Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f}")
-        
+                print(
+                    f"Epoch [{epoch+1}/{args.epochs}] Batch [{batch_idx}/{len(train_loader)}] "
+                    f"Loss: {loss.item():.4f}  L1: {l1_loss.item():.4f}  KL: {kl_loss.item():.4f}"
+                )
+
         if rank == 0:
             avg_loss = epoch_loss / num_batches
-            avg_recon = epoch_recon_loss / num_batches
-            avg_kl = epoch_kl_loss / num_batches
-            print(f"Epoch [{epoch+1}/{args.epochs}] completed. Avg Loss: {avg_loss:.4f}, "
-                  f"Avg Recon: {avg_recon:.4f}, Avg KL: {avg_kl:.4f}")
-        
+            avg_l1   = epoch_l1   / num_batches
+            avg_kl   = epoch_kl   / num_batches
+            print(
+                f"Epoch [{epoch+1}/{args.epochs}] "
+                f"Loss: {avg_loss:.4f}  L1: {avg_l1:.4f}  KL: {avg_kl:.6f}"
+            )
+
+        # Validation on rank 0 only
+        val_tgt_kb = val_rec_kb = val_tgt_std = val_rec_std = 0.0
         if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
-            print(f"Running validation at epoch {epoch+1}...")
+            import io as _io
+            import math as _math
+            import numpy as _np
+            from torchvision.transforms.functional import to_pil_image
+
             vae_encoder.eval()
             vae_decoder.eval()
-            
-            val_loss = 0.0
-            val_recon_loss = 0.0
             val_batches = 0
-            
+
             with torch.no_grad():
-                for batch_idx, (initial_img, input_feat, target_img, _) in enumerate(val_loader):
+                for _, __, target_img, ___ in val_loader:
                     target_img = target_img.to(device)
-                    batch_size = target_img.shape[0]
-                    
-                    noise = torch.randn(batch_size, 4, cfg.TARGET_HEIGHT // 8, cfg.TARGET_WIDTH // 8, device=device)
-                    latents = vae_encoder(target_img, noise)
-                    reconstructed = vae_decoder(latents)
-                    
-                    recon_loss = F.mse_loss(reconstructed, target_img)
-                    val_loss += recon_loss.item()
-                    val_recon_loss += recon_loss.item()
-                    val_batches += 1
-                    
-                    if batch_idx >= cfg.SD_VAL_STEPS:
+                    B = target_img.size(0)
+
+                    noise = torch.zeros(
+                        B, 4,
+                        cfg.TARGET_HEIGHT // 8, cfg.TARGET_WIDTH // 8,
+                        device=device
+                    )
+                    latents, _ = encode_with_kl(vae_encoder.module, target_img, noise)
+                    reconstructed = torch.clamp(vae_decoder(latents), -1.0, 1.0)
+
+                    # Convert [-1,1] → [0,1] → PIL → PNG bytes in memory
+                    tgt_01 = (target_img.cpu() + 1) / 2
+                    rec_01 = (reconstructed.cpu() + 1) / 2
+
+                    for i in range(B):
+                        tgt_arr = _np.array(to_pil_image(tgt_01[i].clamp(0,1)))
+                        rec_arr = _np.array(to_pil_image(rec_01[i].clamp(0,1)))
+
+                        buf_t = _io.BytesIO()
+                        buf_r = _io.BytesIO()
+                        to_pil_image(tgt_01[i].clamp(0,1)).save(buf_t, format='PNG')
+                        to_pil_image(rec_01[i].clamp(0,1)).save(buf_r, format='PNG')
+
+                        val_tgt_kb  += len(buf_t.getvalue()) / 1024
+                        val_rec_kb  += len(buf_r.getvalue()) / 1024
+                        val_tgt_std += float(tgt_arr.std())
+                        val_rec_std += float(rec_arr.std())
+                        val_batches += 1
+
+                    if val_batches >= 32:
                         break
-            
-            avg_val_loss = val_loss / val_batches
-            print(f"Validation Loss at epoch {epoch+1}: {avg_val_loss:.4f}")
-        
+
+            val_tgt_kb  /= val_batches
+            val_rec_kb  /= val_batches
+            val_tgt_std /= val_batches
+            val_rec_std /= val_batches
+
+            print(f"[Val] Epoch {epoch+1}  "
+                  f"target={val_tgt_kb:.0f}KB std={val_tgt_std:.1f} | "
+                  f"recon={val_rec_kb:.0f}KB std={val_rec_std:.1f}")
+
+        if rank == 0:
+            log_writer.writerow([
+                epoch + 1, avg_loss, avg_l1, avg_kl,
+                val_tgt_kb, val_rec_kb, val_tgt_std, val_rec_std,
+            ])
+            log_file.flush()
+
+        # Save checkpoint every VAL_EPOCH epochs
         if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
-            checkpoint_dir = "checkpoints"
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            checkpoint_path = os.path.join(checkpoint_dir, f"vae_epoch_{epoch+1}.pth")
-            
+            os.makedirs("checkpoints", exist_ok=True)
+            ckpt_path = f"checkpoints/vae_cropped_epoch_{epoch+1}.pth"
             torch.save({
                 'epoch': epoch,
                 'encoder': vae_encoder.module.state_dict(),
                 'decoder': vae_decoder.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'loss': avg_loss,
-            }, checkpoint_path)
-            print(f"VAE checkpoint saved to {checkpoint_path}")
-    
+            }, ckpt_path)
+            print(f"Checkpoint saved: {ckpt_path}")
+
+        dist.barrier()
+
+    if rank == 0:
+        log_file.close()
+
     cleanup_ddp()
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Train VAE encoder-decoder")
     parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--retrain", type=int, default=0)
     parser.add_argument("--checkpoint", type=str, default="")
     args = parser.parse_args()
-    
+
     print(f"Launching VAE training on devices {cfg.DEVICE_IDS}")
-    
-    world_size = cfg.WORLD_SIZE
-    mp.spawn(train_worker, args=(world_size, args), nprocs=world_size, join=True)
+    mp.spawn(train_worker, args=(cfg.WORLD_SIZE, args), nprocs=cfg.WORLD_SIZE, join=True)
 
 
 if __name__ == "__main__":
