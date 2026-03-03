@@ -75,7 +75,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
     scaler = GradScaler('cuda')
 
     # Setup CSV logger on rank 0
-    log_path = "checkpoints/logs/vae_cropped_training_log.csv"
+    log_path = "checkpoints/logs/vae_training_log.csv"
     if rank == 0:
         os.makedirs("checkpoints/logs", exist_ok=True)
         log_file = open(log_path, 'w', newline='')
@@ -220,7 +220,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
         # Save checkpoint every VAL_EPOCH epochs
         if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
             os.makedirs("checkpoints", exist_ok=True)
-            ckpt_path = f"checkpoints/vae_cropped_epoch_{epoch+1}.pth"
+            ckpt_path = f"checkpoints/vae_epoch_{epoch+1}.pth"
             torch.save({
                 'epoch': epoch,
                 'encoder': vae_encoder.module.state_dict(),
