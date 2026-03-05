@@ -1,5 +1,8 @@
 import os
 
+RUN_NAME = "diffusion"
+VERSION_NAME = "perceptual_vae_x0loss"
+
 # Files
 DATA_DIR = "data"
 INITIAL_DIR = os.path.join(DATA_DIR, "initial")
@@ -27,14 +30,14 @@ SD_SAMPLE_STEPS = 50
 SD_EMB_DIM = 768
 SD_BASE_CHANNELS = 192
 SD_VAL_STEPS = 50
-SD_VAL_EPOCH = 50
+SD_VAL_EPOCH = 10
 SD_SAMPLE_BATCH = 2
 SD_LOG_INTERVAL = 100   
 SD_ATTENTION_HEADS = 4
 SD_EMA_DECAY = 0.9995
 SD_GRAD_CLIP = 0.5
 SD_DDP_TIMEOUT_MINUTES = 30
-SD_VAE_CKPT = "checkpoints/vae_epoch_70.pth"
+SD_VAE_CKPT = "checkpoints/vae_epoch_15.pth"
 SD_FREEZE_VAE = False
 SD_COLOR_GUIDANCE_SCALE = 50.0
 SD_X0_LOSS_WEIGHT = 0.5

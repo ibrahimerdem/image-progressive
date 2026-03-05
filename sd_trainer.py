@@ -322,7 +322,7 @@ def _run_validation(
                 targets,         
                 sample_dir,
                 epoch,
-                prefix="sd_x0_large",
+                prefix=f"sd_{cfg.VERSION_NAME.lower()}",
                 num_samples=batch_size,
             )
             
@@ -668,7 +668,7 @@ def main() -> None:
         epochs=args.epochs,
         retrain=retrain_flag,
         checkpoint_path=checkpoint_path,
-        version="ddp_x0_large",
+        version=cfg.VERSION_NAME,
     )
 
 
