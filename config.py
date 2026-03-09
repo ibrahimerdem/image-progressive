@@ -1,7 +1,7 @@
 import os
 
 RUN_NAME = "diffusion"
-VERSION_NAME = "newer_normal"
+VERSION_NAME = "normal_custom"
 
 # Files
 DATA_DIR = "data"
