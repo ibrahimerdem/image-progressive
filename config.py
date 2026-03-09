@@ -1,7 +1,7 @@
 import os
 
 RUN_NAME = "diffusion"
-VERSION_NAME = "normal_vae_x0loss"
+VERSION_NAME = "newer_normal"
 
 # Files
 DATA_DIR = "data"
@@ -37,7 +37,7 @@ SD_ATTENTION_HEADS = 4
 SD_EMA_DECAY = 0.9995
 SD_GRAD_CLIP = 0.5
 SD_DDP_TIMEOUT_MINUTES = 30
-SD_VAE_CKPT = "checkpoints/vae_newer_epoch_50.pth"
+SD_VAE_CKPT = "checkpoints/vae_epoch_115.pth"
 SD_FREEZE_VAE = False
 SD_COLOR_GUIDANCE_SCALE = 50.0
 SD_X0_LOSS_WEIGHT = 0.5

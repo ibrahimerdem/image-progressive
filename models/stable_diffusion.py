@@ -4,7 +4,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as tvm
 
 import config as cfg
 
@@ -40,10 +39,12 @@ class FeatureEmbedding(nn.Module):
     def __init__(self, num_features: int = 9, embed_dim: int = 512):
         super().__init__()
         self.num_features = num_features
+        self.embed_dim = embed_dim
+        hidden = max(num_features * 256, embed_dim * 4)
         self.projection = nn.Sequential(
-            nn.Linear(num_features, num_features * 256),
+            nn.Linear(num_features, hidden),
             nn.SiLU(),
-            nn.Linear(num_features * 256, num_features * embed_dim),
+            nn.Linear(hidden, num_features * embed_dim),
         )
     
     def forward(self, features: torch.Tensor) -> torch.Tensor:
@@ -52,30 +53,46 @@ class FeatureEmbedding(nn.Module):
 
 
 class ImageEmbedding(nn.Module):
-    """Encodes initial image (128×128) via frozen ResNet-50 → projection to 9×embed_dim."""
-    def __init__(self, embed_dim: int = 512):
+    def __init__(self, in_channels: int = 3, embed_dim: int = 512, image_size: int = 128):
         super().__init__()
-        backbone = tvm.resnet50(weights=tvm.ResNet50_Weights.DEFAULT)
-        # Keep everything up to (and including) avgpool → output [B, 2048]
-        self.encoder = nn.Sequential(*list(backbone.children())[:-1])
-        for p in self.encoder.parameters():
-            p.requires_grad = False
+        # Input: [B, 3, 128, 128]
+        # Output: [B, 9 * embed_dim]  (matches FeatureEmbedding output dim)
+        self.encoder = nn.Sequential(
+            # 128×128 → 64×64
+            nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.SiLU(),
+            # 64×64 → 32×32
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.SiLU(),
+            # 32×32 → 16×16
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.SiLU(),
+            # 16×16 → 8×8
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 512),
+            nn.SiLU(),
+            # 8×8 → 4×4
+            nn.Conv2d(512, 512, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 512),
+            nn.SiLU(),
+            # 4×4 → 1×1
+            nn.AdaptiveAvgPool2d(1),
+        )
 
         self.projection = nn.Sequential(
-            nn.Linear(2048, 2048),
+            nn.Linear(512, 2048),
             nn.SiLU(),
-            nn.Linear(2048, 9 * embed_dim),   # match FeatureEmbedding output size
+            nn.Linear(2048, 9 * embed_dim),
         )
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        # images: [B, 3, 128, 128]  (already normalized [-1,1] → rescale to ImageNet range)
-        x = images * 0.5 + 0.5                           # [-1,1] → [0,1]
-        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
-        std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
-        x = (x - mean) / std                             # ImageNet normalisation
-        with torch.no_grad():
-            feat = self.encoder(x).flatten(1)            # [B, 2048]
-        return self.projection(feat)                     # [B, 9 * embed_dim]
+        # images: [B, 3, H, W]
+        features = self.encoder(images)   # [B, 512, 1, 1]
+        features = features.flatten(1)    # [B, 512]
+        return self.projection(features)  # [B, 9 * embed_dim]
 
 
 class CrossAttention(nn.Module):
@@ -249,13 +266,13 @@ class GaussianDiffusion(nn.Module):
 
     def p_loss(
         self,
-        model: nn.Module,
-        x_start: torch.Tensor,
-        features: torch.Tensor,
+        model,
+        x_start,
+        features,
         vae_encoder=None,
-        initial_images: Optional[torch.Tensor] = None,
-    ) -> dict:
-        # If VAE encoder provided, encode images to latent space
+        initial_images=None,
+    ):
+
         if vae_encoder is not None:
             with torch.no_grad():
                 # VAE encoder expects noise for reparameterization
@@ -264,7 +281,6 @@ class GaussianDiffusion(nn.Module):
                     x_start.size(2) // 8, x_start.size(3) // 8,
                     device=x_start.device
                 )
-                # VAE encoder already scales by 0.18215 internally
                 x_start_latent = vae_encoder(x_start, noise_for_vae)
         else:
             x_start_latent = x_start
@@ -274,86 +290,99 @@ class GaussianDiffusion(nn.Module):
         noise = torch.randn_like(x_start_latent)
         x_t = self.q_sample(x_start_latent, t, noise)
         pred_noise = model(x_t, t, features, initial_images)
-        noise_loss = F.l1_loss(pred_noise, noise)
-
-        # x0 auxiliary loss — SNR-weighted L1 in latent space
-        x0_loss = torch.tensor(0.0, device=x_start_latent.device)
-        if cfg.SD_X0_LOSS_WEIGHT > 0:
-            sqrt_alpha_bar = torch.sqrt(self._extract(self.alphas_cumprod, t, x_start_latent.shape))
-            sqrt_one_minus = torch.sqrt(1.0 - self._extract(self.alphas_cumprod, t, x_start_latent.shape))
-            pred_x0 = (x_t - sqrt_one_minus * pred_noise) / sqrt_alpha_bar.clamp(min=1e-8)
-            pred_x0 = pred_x0.clamp(-5.0, 5.0)
-            snr_weight = sqrt_alpha_bar.squeeze() ** 2
-            x0_loss = (snr_weight * F.l1_loss(pred_x0, x_start_latent, reduction='none').mean(dim=[1, 2, 3])).mean()
-
-        total_loss = noise_loss + cfg.SD_X0_LOSS_WEIGHT * x0_loss
-        return {
-            'loss': total_loss,
-            'metrics': {
-                'noise_loss': noise_loss.item(),
-                'x0_loss': x0_loss.item(),
-            }
-        }
+        noise_loss = F.mse_loss(pred_noise, noise)
+        return {'loss': noise_loss, 'metrics': {'noise_loss': noise_loss.item()}}
 
     def sample(
         self,
-        model: nn.Module,
-        features: torch.Tensor,
-        steps: Optional[int] = None,
-        save_intermediates: bool = False,
-        eta: float = 0.0,
-        latent_shape: tuple = None,  # (B, C, H, W) for latent space
-        initial_images: Optional[torch.Tensor] = None,
+        model,
+        features,
+        steps=None,
+        save_intermediates=False,
+        latent_shape=None,  # (B, C, H, W) for latent space
+        initial_images=None,
     ):
+        """DDPM ancestral sampler (Algorithm 2 in Ho et al. 2020).
+
+        The reverse step is:
+            x_{t-1} = 1/sqrt(alpha_t) * (x_t - beta_t/sqrt(1-alphabar_t) * eps_theta)
+                      + sqrt(beta_tilde_t) * z,   z ~ N(0,I)  for t > 0
+
+        where the posterior variance is:
+            beta_tilde_t = (1 - alphabar_{t-1}) / (1 - alphabar_t) * beta_t
+
+        When steps < timesteps a uniform sub-sequence is used (strided DDPM).
+        In that case beta_tilde_t is computed from the *sub-sequence* alphas so
+        the variance correctly reflects the larger effective step size.
+        """
         steps = steps or self.timesteps
         if latent_shape is None:
-            # Default to RGB image space (backward compatibility)
             shape = (features.size(0), cfg.CHANNELS, cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH)
         else:
             shape = latent_shape
+
         img = torch.randn(shape, device=features.device)
         intermediates = []
+
+        # Build descending timestep schedule (T-1 → 0)
         if steps < self.timesteps:
-            c = self.timesteps // steps
-            timestep_schedule = torch.arange(0, self.timesteps, c, dtype=torch.long)
-            timestep_schedule = torch.flip(timestep_schedule, [0])
+            # Uniform stride: pick `steps` evenly spaced indices spanning [0, T-1].
+            # torch.linspace guarantees endpoints are exactly 0 and T-1.
+            indices = torch.linspace(0, self.timesteps - 1, steps).round().long().clamp(0, self.timesteps - 1)
+            indices = torch.unique(indices)                    # remove duplicates from rounding
+            timestep_schedule = torch.flip(indices, [0])      # descending: T-1 → 0
         else:
             timestep_schedule = torch.arange(self.timesteps - 1, -1, -1, dtype=torch.long)
+
         for step_idx, timestep in enumerate(timestep_schedule):
             t = torch.full((shape[0],), timestep, dtype=torch.long, device=img.device)
-            with torch.no_grad() if not model.training else torch.enable_grad():
-                epsilon = model(img, t, features, initial_images)
-            alpha_bar_t = self._extract(self.alphas_cumprod, t, img.shape)
-            if step_idx < len(timestep_schedule) - 1:
-                t_prev = timestep_schedule[step_idx + 1]
-                alpha_bar_prev = self._extract(self.alphas_cumprod, 
-                                               torch.full_like(t, t_prev), img.shape)
-            else:
-                alpha_bar_prev = torch.ones_like(alpha_bar_t)
-            sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t)
-            sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t)
-            sqrt_alpha_bar_t = torch.clamp(sqrt_alpha_bar_t, min=1e-8)
-            pred_x0 = (img - sqrt_one_minus_alpha_bar_t * epsilon) / sqrt_alpha_bar_t
-            # Clamp predicted x0: use wider range for latents, tight range for images
-            if latent_shape is not None:
-                pred_x0 = torch.clamp(pred_x0, -5.0, 5.0)
-            else:
-                pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
 
-            # DDPM posterior mean + variance
-            posterior_variance = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)
-            posterior_variance = torch.clamp(posterior_variance, min=1e-20)
-            dir_xt = torch.sqrt(torch.clamp(1.0 - alpha_bar_prev - posterior_variance, min=0.0)) * epsilon
-            x_prev = torch.sqrt(alpha_bar_prev) * pred_x0 + dir_xt
-            # Add stochastic noise at all steps except the last
-            if timestep > 0:
-                x_prev = x_prev + torch.sqrt(posterior_variance) * torch.randn_like(img)
-            img = x_prev
+            with torch.no_grad():
+                epsilon = model(img, t, features, initial_images)
+
+            # --- alpha_bar at current and previous timestep in the schedule ---
+            alpha_bar_t = self._extract(self.alphas_cumprod, t, img.shape)
+
+            is_last = (step_idx == len(timestep_schedule) - 1)
+            if not is_last:
+                t_prev = timestep_schedule[step_idx + 1]
+                alpha_bar_prev = self._extract(
+                    self.alphas_cumprod,
+                    torch.full_like(t, t_prev),
+                    img.shape,
+                )
+            else:
+                # t == 0: no noise added, use alpha_bar=1 (clean signal)
+                alpha_bar_prev = torch.ones_like(alpha_bar_t)
+
+            # --- effective single-step alpha for this schedule stride ---
+            # When steps < timesteps, each "step" covers multiple real timesteps.
+            # The correct effective alpha_t for the stride is:
+            #   alpha_eff = alpha_bar_t / alpha_bar_prev
+            # This reduces to the true alpha_t when stride == 1.
+            alpha_eff  = alpha_bar_t / alpha_bar_prev.clamp(min=1e-8)
+            beta_eff   = 1.0 - alpha_eff
+
+            # posterior variance: beta_tilde = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * beta_eff
+            beta_tilde = (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t).clamp(min=1e-8) * beta_eff
+            beta_tilde = beta_tilde.clamp(min=0.0)
+
+            # --- DDPM posterior mean ---
+            # mu_theta = 1/sqrt(alpha_eff) * (x_t - beta_eff/sqrt(1-alpha_bar_t) * eps)
+            coeff = beta_eff / (1.0 - alpha_bar_t).clamp(min=1e-8).sqrt()
+            mean  = (img - coeff * epsilon) / alpha_eff.clamp(min=1e-8).sqrt()
+
+            # --- stochastic term (zero at final step t==0) ---
+            if not is_last:
+                noise = torch.randn_like(img)
+                img   = mean + beta_tilde.sqrt() * noise
+            else:
+                img   = mean
+
             if save_intermediates and step_idx % 10 == 0:
-                # Save intermediates without clamping (decoder will handle it)
                 intermediates.append((timestep.item(), img.clone()))
-        
-        # Final output: don't clamp latents, let decoder handle it
+
+        # Latents: let the decoder handle range; images: clamp to [-1, 1]
         final = img if latent_shape is not None else torch.clamp(img, -1.0, 1.0)
         if save_intermediates:
             return final, intermediates
@@ -363,25 +392,25 @@ class GaussianDiffusion(nn.Module):
 class StableDiffusionConditioned(nn.Module):
     def __init__(self, latent_channels=4, emb_dim=512, base_channels=64, use_initial_image=False):
         super().__init__()
-        cond_dim = emb_dim * 2
-        time_dim = cond_dim
-        feature_dim = 9 * 512
+        num_features = len(cfg.FEATURE_COLUMNS)  # 9
+        time_dim     = emb_dim * 2
+        feature_dim  = num_features * emb_dim    # e.g. 9*768 = 6912
         self.use_initial_image = use_initial_image
-        
-        self.feature_projection = FeatureEmbedding(num_features=9, embed_dim=512)
+
+        self.feature_projection = FeatureEmbedding(num_features=num_features, embed_dim=emb_dim)
         self.time_embedding = TimeEmbedding(time_dim)
-        
-        # Optional: Image embedding for initial image conditioning
+
+        # Optional: image conditioning — output matches feature_dim, then concat
         if use_initial_image:
-            self.image_projection = ImageEmbedding(embed_dim=512)
-            # When using image, concatenate with features: 4608 + 4608 = 9216
-            feature_dim = 9 * 512 * 2
-        
-        # UNet works in latent space (4 channels) not RGB space (3 channels)
+            self.image_projection = ImageEmbedding(embed_dim=emb_dim)
+            # concat([feature_emb, image_emb]) → 2 * feature_dim
+            feature_dim = num_features * emb_dim * 2
+
+        # UNet works in latent space (4 channels)
         self.unet = ImprovedUNet(
-            latent_channels,  # 4 channels for latent space
-            base_channels=base_channels, 
-            time_dim=time_dim, 
+            latent_channels,
+            base_channels=base_channels,
+            time_dim=time_dim,
             feature_dim=feature_dim,
         )
         self.time_scale = nn.Parameter(torch.tensor(1.0))
@@ -396,15 +425,13 @@ class StableDiffusionConditioned(nn.Module):
         features: torch.Tensor,
         initial_images: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        time_emb = self.time_embedding(timesteps) * self.time_scale
-        feature_emb = self.feature_projection(features) * self.feature_scale  # [B, 4608]
-        
-        # Optionally concatenate initial image embedding
+        time_emb    = self.time_embedding(timesteps) * self.time_scale          # [B, time_dim]
+        feature_emb = self.feature_projection(features) * self.feature_scale    # [B, num_features * emb_dim]
+
         if self.use_initial_image and initial_images is not None:
-            image_emb = self.image_projection(initial_images) * self.image_scale  # [B, 4608]
-            # Concatenate: [B, 4608] + [B, 4608] = [B, 9216]
-            feature_emb = torch.cat([feature_emb, image_emb], dim=1)
-        
+            image_emb   = self.image_projection(initial_images) * self.image_scale  # [B, num_features * emb_dim]
+            feature_emb = torch.cat([feature_emb, image_emb], dim=1)               # [B, 2 * num_features * emb_dim]
+
         feature_emb = feature_emb.unsqueeze(1)  # [B, 1, feature_dim]
         output = self.unet(noisy_latent, time_emb, feature_emb)
         return output

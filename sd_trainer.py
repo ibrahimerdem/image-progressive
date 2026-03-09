@@ -276,7 +276,7 @@ def _run_validation(
         val_loader.sampler.set_epoch(epoch)
 
     model.eval()
-    diffusion.eval()
+    # GaussianDiffusion has no trainable params — no mode switch needed
     l1_loss_fn = nn.L1Loss(reduction="mean")
 
     total_l1 = 0.0
@@ -391,18 +391,23 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     
     # Load pretrained VAE encoder and decoder (frozen)
     vae_encoder, vae_decoder = _load_vae(cfg.SD_VAE_CKPT, device)
-    
+
     # Model works in latent space (4 channels) not RGB space
     # Enable initial image conditioning if config flag is set
-    base_model = StableDiffusionConditioned(latent_channels=4,
-                                            emb_dim=cfg.SD_EMB_DIM,
-                                            base_channels=cfg.SD_BASE_CHANNELS,
-                                            use_initial_image=cfg.INITIAL_IMAGE)
-    
+    num_features = len(cfg.FEATURE_COLUMNS)
+    base_model = StableDiffusionConditioned(
+        latent_channels=4,
+        emb_dim=cfg.SD_EMB_DIM,
+        base_channels=cfg.SD_BASE_CHANNELS,
+        use_initial_image=cfg.INITIAL_IMAGE,
+    )
+
+    feature_dim = num_features * cfg.SD_EMB_DIM
     if cfg.INITIAL_IMAGE:
-        print(f"[SD] Initial image conditioning ENABLED (feature_dim will be 9216)")
+        print(f"[SD] Initial image conditioning ENABLED "
+              f"(feature_dim={feature_dim} → concat → {feature_dim * 2})")
     else:
-        print(f"[SD] Initial image conditioning DISABLED (feature_dim will be 4608)")
+        print(f"[SD] Initial image conditioning DISABLED (feature_dim={feature_dim})")
 
     diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
@@ -419,50 +424,50 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     ema_helper.to(device)
     ema_pipeline = StableDiffusionPipeline(ema_helper.ema, diffusion, vae_encoder, vae_decoder) if rank == 0 else None
 
+    # ------------------------------------------------------------------ #
+    # Directory setup — must happen BEFORE checkpoint auto-detection      #
+    # ------------------------------------------------------------------ #
+    save_dir   = os.path.join("checkpoints", "sd")
+    log_dir    = os.path.join(save_dir, "logs")
+    sample_dir = os.path.join(save_dir, "samples")
+    if rank == 0:
+        os.makedirs(save_dir,   exist_ok=True)
+        os.makedirs(log_dir,    exist_ok=True)
+        os.makedirs(sample_dir, exist_ok=True)
+
     start_epoch = 0
     if retrain and checkpoint_path:
         if os.path.exists(checkpoint_path):
             start_epoch = _load_checkpoint(model, optimizer, checkpoint_path)
             # Load EMA weights if available
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            if "ema_state_dict" in checkpoint:
-                ema_helper.ema.load_state_dict(checkpoint["ema_state_dict"])
+            ckpt = torch.load(checkpoint_path, map_location="cpu")
+            if "ema_state_dict" in ckpt:
+                ema_helper.ema.load_state_dict(ckpt["ema_state_dict"])
                 if rank == 0:
                     print(f"[SD] Loaded EMA weights from checkpoint")
             if rank == 0:
-                print(f"[SD] Resumed from checkpoint {checkpoint_path} starting at epoch {start_epoch + 1}")
+                print(f"[SD] Resumed from {checkpoint_path} at epoch {start_epoch + 1}")
         elif rank == 0:
             print(f"[SD] Checkpoint {checkpoint_path} not found, starting from scratch")
     elif retrain and not checkpoint_path:
         # Auto-detect latest checkpoint
         if os.path.exists(save_dir):
-            checkpoints = [f for f in os.listdir(save_dir) if f.startswith("sd_") and f.endswith(".pth")]
-            if checkpoints:
-                # Sort by epoch number
-                checkpoints.sort(key=lambda x: int(x.split("_")[-1].replace(".pth", "")))
-                latest_ckpt = os.path.join(save_dir, checkpoints[-1])
+            ckpts = [f for f in os.listdir(save_dir) if f.startswith("sd_") and f.endswith(".pth")]
+            if ckpts:
+                ckpts.sort(key=lambda x: int(x.split("_")[-1].replace(".pth", "")))
+                latest_ckpt = os.path.join(save_dir, ckpts[-1])
                 start_epoch = _load_checkpoint(model, optimizer, latest_ckpt)
-                # Load EMA weights if available
-                checkpoint = torch.load(latest_ckpt, map_location="cpu")
-                if "ema_state_dict" in checkpoint:
-                    ema_helper.ema.load_state_dict(checkpoint["ema_state_dict"])
+                ckpt = torch.load(latest_ckpt, map_location="cpu")
+                if "ema_state_dict" in ckpt:
+                    ema_helper.ema.load_state_dict(ckpt["ema_state_dict"])
                     if rank == 0:
                         print(f"[SD] Loaded EMA weights from checkpoint")
                 if rank == 0:
-                    print(f"[SD] Auto-resumed from {latest_ckpt} starting at epoch {start_epoch + 1}")
+                    print(f"[SD] Auto-resumed from {latest_ckpt} at epoch {start_epoch + 1}")
             elif rank == 0:
                 print(f"[SD] No checkpoints found in {save_dir}, starting from scratch")
         elif rank == 0:
             print(f"[SD] No checkpoint directory found, starting from scratch")
-
-    save_dir = os.path.join("checkpoints", "sd")
-    log_dir = os.path.join(save_dir, "logs")
-    sample_dir = os.path.join(save_dir, "samples")
-
-    if rank == 0:
-        os.makedirs(save_dir, exist_ok=True)
-        os.makedirs(log_dir, exist_ok=True)
-        os.makedirs(sample_dir, exist_ok=True)
 
     metrics_logger = MetricsLogger(log_dir, f"diffusion_{version}_log.csv") if rank == 0 else None
     clip_model = clip_preprocess = None
@@ -476,31 +481,33 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         epoch_loss = 0.0
         steps = 0
         model.train()
-        diffusion.train()
+        # GaussianDiffusion has no trainable params / dropout — no need to set train mode
 
         start_time = time.time()
         for batch_idx, (initial_images, features, target_images, _) in enumerate(train_loader):
-            # Features are [B, 9] vector - 9 continuous features normalized [0-1]
             initial_images = initial_images.to(device)
-            features = features.to(device)
-            targets = target_images.to(device)
-            
+            features       = features.to(device)
+            targets        = target_images.to(device)
+
             # Debug: Print first batch info
             if batch_idx == 0 and rank == 0:
-                print(f"[SD] Epoch {epoch} - Processing batch {batch_idx}/{len(train_loader)}, features shape: {features.shape}")
+                print(f"[SD] Epoch {epoch} - batch 0/{len(train_loader)} "
+                      f"features: {features.shape}, targets: {targets.shape}")
                 if cfg.INITIAL_IMAGE:
-                    print(f"[SD] Initial images shape: {initial_images.shape}")
-
-            with amp_ctx():
-                if cfg.INITIAL_IMAGE:
-                    loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder,
-                                                initial_images=initial_images)
-                else:
-                    loss_dict = diffusion.p_loss(model, targets, features, vae_encoder=vae_encoder)
-                loss = loss_dict['loss']
-                loss_metrics = loss_dict.get('metrics', {})
+                    print(f"[SD] Initial images: {initial_images.shape}")
 
             optimizer.zero_grad()
+            with amp_ctx():
+                if cfg.INITIAL_IMAGE:
+                    loss_dict = diffusion.p_loss(model, targets, features,
+                                                 vae_encoder=vae_encoder,
+                                                 initial_images=initial_images)
+                else:
+                    loss_dict = diffusion.p_loss(model, targets, features,
+                                                 vae_encoder=vae_encoder)
+                loss         = loss_dict['loss']
+                loss_metrics = loss_dict.get('metrics', {})
+
             if scaler is not None:
                 scaler.scale(loss).backward()
                 if cfg.SD_GRAD_CLIP and cfg.SD_GRAD_CLIP > 0:
@@ -508,7 +515,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SD_GRAD_CLIP)
                 else:
                     scaler.unscale_(optimizer)
-                    grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+                    grad_norm = sum(
+                        p.grad.data.norm(2).item() ** 2
+                        for p in model.parameters() if p.grad is not None
+                    ) ** 0.5
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -516,7 +526,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 if cfg.SD_GRAD_CLIP and cfg.SD_GRAD_CLIP > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.SD_GRAD_CLIP)
                 else:
-                    grad_norm = sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5
+                    grad_norm = sum(
+                        p.grad.data.norm(2).item() ** 2
+                        for p in model.parameters() if p.grad is not None
+                    ) ** 0.5
                 optimizer.step()
 
             ema_helper.update(model)
@@ -524,10 +537,12 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             steps += 1
 
             if (batch_idx + 1) % cfg.SD_LOG_INTERVAL == 0 and rank == 0:
-                x0_loss_val = loss_metrics.get('x0_loss', 0.0)
+                noise_loss_val = loss_metrics.get('noise_loss', loss.item())
                 print(
                     f"[SD] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
-                    f"Loss: {epoch_loss / steps:.4f} | X0: {x0_loss_val:.4f} | Grad Norm: {grad_norm:.4f}"
+                    f"Loss: {epoch_loss / steps:.4f} | "
+                    f"Noise: {noise_loss_val:.4f} | "
+                    f"Grad Norm: {grad_norm:.4f}"
                 )
         
         # End of batch loop - log completion
@@ -632,8 +647,11 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 metrics_logger.log({"epoch": epoch, "train_loss": avg_loss})
 
             if should_validate:
-                checkpoint_path = _save_checkpoint(model, optimizer, epoch, save_dir, version, ema_model=ema_helper.ema if rank == 0 else None)
-                print(f"[SD] Checkpoint saved: {checkpoint_path}")
+                saved_path = _save_checkpoint(
+                    model, optimizer, epoch, save_dir, version,
+                    ema_model=ema_helper.ema,
+                )
+                print(f"[SD] Checkpoint saved: {saved_path}")
 
     _cleanup_ddp()
 
