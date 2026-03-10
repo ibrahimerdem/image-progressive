@@ -1,7 +1,7 @@
 import os
 
 RUN_NAME = "diffusion"
-VERSION_NAME = "normal_custom"
+VERSION_NAME = "custom_perceptual"
 
 # Files
 DATA_DIR = "data"
@@ -41,6 +41,7 @@ SD_VAE_CKPT = "checkpoints/vae_epoch_115.pth"
 SD_FREEZE_VAE = False
 SD_COLOR_GUIDANCE_SCALE = 50.0
 SD_X0_LOSS_WEIGHT = 0.5
+SD_PERCEPTUAL_WEIGHT = 0.3
 
 # ddp
 DEVICE_IDS = [0, 1]

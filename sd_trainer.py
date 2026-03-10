@@ -242,7 +242,7 @@ def _save_checkpoint(model, optimizer, epoch, save_dir, version, ema_model=None)
     if ema_model is not None:
         checkpoint["ema_state_dict"] = ema_model.state_dict()
     
-    filename = os.path.join(save_dir, f"sd_{version}_epoch_{epoch:04d}.pth")
+    filename = os.path.join(save_dir, f"diffusion_{version}_epoch_{epoch:04d}.pth")
     torch.save(checkpoint, filename)
     return filename
 
@@ -427,7 +427,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     # ------------------------------------------------------------------ #
     # Directory setup — must happen BEFORE checkpoint auto-detection      #
     # ------------------------------------------------------------------ #
-    save_dir   = os.path.join("checkpoints", "sd")
+    save_dir   = os.path.join("checkpoints", "diffusion")
     log_dir    = os.path.join(save_dir, "logs")
     sample_dir = os.path.join(save_dir, "samples")
     if rank == 0:
@@ -501,10 +501,12 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 if cfg.INITIAL_IMAGE:
                     loss_dict = diffusion.p_loss(model, targets, features,
                                                  vae_encoder=vae_encoder,
+                                                 vae_decoder=vae_decoder,
                                                  initial_images=initial_images)
                 else:
                     loss_dict = diffusion.p_loss(model, targets, features,
-                                                 vae_encoder=vae_encoder)
+                                                 vae_encoder=vae_encoder,
+                                                 vae_decoder=vae_decoder)
                 loss         = loss_dict['loss']
                 loss_metrics = loss_dict.get('metrics', {})
 
@@ -537,11 +539,13 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             steps += 1
 
             if (batch_idx + 1) % cfg.SD_LOG_INTERVAL == 0 and rank == 0:
-                noise_loss_val = loss_metrics.get('noise_loss', loss.item())
+                noise_loss_val     = loss_metrics.get('noise_loss', loss.item())
+                perceptual_loss_val = loss_metrics.get('perceptual_loss', 0.0)
                 print(
                     f"[SD] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
                     f"Loss: {epoch_loss / steps:.4f} | "
                     f"Noise: {noise_loss_val:.4f} | "
+                    f"Percep: {perceptual_loss_val:.4f} | "
                     f"Grad Norm: {grad_norm:.4f}"
                 )
         

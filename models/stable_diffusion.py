@@ -135,7 +135,7 @@ class CrossAttention(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, context_dim: int):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.norm1 = nn.GroupNorm(8, out_channels)
@@ -143,7 +143,8 @@ class ResidualBlock(nn.Module):
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act = nn.SiLU()
         self.time_film = nn.Linear(time_dim, out_channels * 2)
-        self.cross_attn = CrossAttention(out_channels, feature_dim, heads=8, chunk_size=1024)
+        # context_dim = emb_dim (per-token dimension, not the full flat dim)
+        self.cross_attn = CrossAttention(out_channels, context_dim, heads=8, chunk_size=1024)
         self.attn_norm = nn.GroupNorm(8, out_channels)
         if in_channels != out_channels:
             self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
@@ -180,59 +181,117 @@ class AttentionBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, context_dim: int, attn: bool):
         super().__init__()
-        self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim)
+        self.res1 = ResidualBlock(in_channels,  out_channels, time_dim, context_dim)
+        self.res2 = ResidualBlock(out_channels, out_channels, time_dim, context_dim)
         self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
         self.downsample = nn.AvgPool2d(2)
 
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor):
-        h = self.res(x, time_emb, feature_emb)
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, context: torch.Tensor):
+        h = self.res1(x, time_emb, context)
+        h = self.res2(h, time_emb, context)
         if self.attn is not None:
             h = self.attn(h)
         return self.downsample(h), h
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, time_dim: int, feature_dim: int, attn: bool):
+    def __init__(self, in_channels: int, out_channels: int, time_dim: int, context_dim: int, attn: bool):
         super().__init__()
-        self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim)
+        self.res1 = ResidualBlock(in_channels,  out_channels, time_dim, context_dim)
+        self.res2 = ResidualBlock(out_channels, out_channels, time_dim, context_dim)
         self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor):
+    def forward(self, x: torch.Tensor, skip: torch.Tensor, time_emb: torch.Tensor, context: torch.Tensor):
         if x.shape[-2:] != skip.shape[-2:]:
             x = self.upsample(x)
         h = torch.cat([x, skip], dim=1)
-        h = self.res(h, time_emb, feature_emb)
+        h = self.res1(h, time_emb, context)
+        h = self.res2(h, time_emb, context)
         if self.attn is not None:
             h = self.attn(h)
         return h
 
 
 class ImprovedUNet(nn.Module):
-    def __init__(self, in_channels: int, base_channels: int, time_dim: int, feature_dim: int):
+    def __init__(self, in_channels: int, base_channels: int, time_dim: int, context_dim: int):
         super().__init__()
-        self.time_dim = time_dim
-        self.feature_dim = feature_dim
-        self.inc = ResidualBlock(in_channels, base_channels, time_dim, feature_dim)
-        self.down1 = DownBlock(base_channels, base_channels * 2, time_dim, feature_dim, attn=False)
-        self.down2 = DownBlock(base_channels * 2, base_channels * 4, time_dim, feature_dim, attn=True)
-        self.mid = ResidualBlock(base_channels * 4, base_channels * 4, time_dim, feature_dim)
-        self.up3 = UpBlock(base_channels * 8, base_channels * 2, time_dim, feature_dim, attn=True)
-        self.up2 = UpBlock(base_channels * 4, base_channels, time_dim, feature_dim, attn=False)
-        self.up1 = UpBlock(base_channels * 2, base_channels, time_dim, feature_dim, attn=False)
-        self.out_conv = nn.Conv2d(base_channels, in_channels, kernel_size=1)
+        C  = base_channels          # 192
+        C2 = base_channels * 2      # 384
+        C4 = base_channels * 4      # 768
+        self.time_dim    = time_dim
+        self.context_dim = context_dim
 
-    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, feature_emb: torch.Tensor) -> torch.Tensor:
-        h1 = self.inc(x, time_emb, feature_emb)
-        d2, skip1 = self.down1(h1, time_emb, feature_emb)
-        d3, skip2 = self.down2(d2, time_emb, feature_emb)
-        middle = self.mid(d3, time_emb, feature_emb)
-        u3 = self.up3(middle, skip2, time_emb, feature_emb)
-        u2 = self.up2(u3, skip1, time_emb, feature_emb)
-        u1 = self.up1(u2, h1, time_emb, feature_emb)
-        return self.out_conv(u1)
+        # ---- encoder ----
+        # 64×64
+        self.inc   = ResidualBlock(in_channels, C, time_dim, context_dim)
+        # 64×64 → 32×32  (self-attn added at this resolution)
+        self.down1 = DownBlock(C,  C2, time_dim, context_dim, attn=True)
+        # 32×32 → 16×16
+        self.down2 = DownBlock(C2, C4, time_dim, context_dim, attn=True)
+
+        # ---- bottleneck: ResBlock → SelfAttn → ResBlock ----
+        self.mid1 = ResidualBlock(C4, C4, time_dim, context_dim)
+        self.mid_attn = AttentionBlock(C4, cfg.SD_ATTENTION_HEADS)
+        self.mid2 = ResidualBlock(C4, C4, time_dim, context_dim)
+
+        # ---- decoder ----
+        # 16×16 → 32×32
+        self.up3 = UpBlock(C4 + C4, C2, time_dim, context_dim, attn=True)
+        # 32×32 → 64×64
+        self.up2 = UpBlock(C2 + C2, C,  time_dim, context_dim, attn=True)
+        # 64×64 (concat with inc output)
+        self.up1 = UpBlock(C  + C,  C,  time_dim, context_dim, attn=False)
+
+        self.out_conv = nn.Conv2d(C, in_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # x: [B, 4, 64, 64]  (latent space at 512/8)
+        h0 = self.inc(x, time_emb, context)                      # [B, C,  64, 64]
+        d1, skip1 = self.down1(h0, time_emb, context)            # [B, C2, 32, 32]
+        d2, skip2 = self.down2(d1, time_emb, context)            # [B, C4, 16, 16]
+
+        m = self.mid1(d2, time_emb, context)
+        m = self.mid_attn(m)
+        m = self.mid2(m, time_emb, context)
+
+        u3 = self.up3(m,  skip2, time_emb, context)              # [B, C2, 32, 32]
+        u2 = self.up2(u3, skip1, time_emb, context)              # [B, C,  64, 64]
+        u1 = self.up1(u2, h0,    time_emb, context)              # [B, C,  64, 64]
+        return self.out_conv(u1)                                  # [B, 4,  64, 64]
+
+
+class VGGPerceptualLoss(nn.Module):
+    """Perceptual loss using VGG-16 relu2_2 and relu3_3 feature layers.
+
+    Input images must be in [-1, 1]. Internally converts to ImageNet space.
+    The VGG backbone is always frozen.
+    """
+    def __init__(self):
+        super().__init__()
+        import torchvision.models as tvm
+        vgg = tvm.vgg16(weights=tvm.VGG16_Weights.IMAGENET1K_V1).features
+        # relu2_2 = index 9,  relu3_3 = index 16
+        self.slice1 = nn.Sequential(*list(vgg.children())[:10])   # up to relu2_2
+        self.slice2 = nn.Sequential(*list(vgg.children())[10:17]) # relu2_2 → relu3_3
+        for param in self.parameters():
+            param.requires_grad = False
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def _preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, 3, H, W] in [-1, 1] → ImageNet normalised
+        x = (x + 1.0) * 0.5            # [0, 1]
+        return (x - self.mean) / self.std
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        p = self._preprocess(pred)
+        t = self._preprocess(target)
+        f1_p = self.slice1(p);  f1_t = self.slice1(t)
+        f2_p = self.slice2(f1_p); f2_t = self.slice2(f1_t)
+        return F.mse_loss(f1_p, f1_t) + F.mse_loss(f2_p, f2_t)
 
 
 class GaussianDiffusion(nn.Module):
@@ -247,6 +306,15 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer("alphas_cumprod", alphas_cumprod)
         self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
         self.timesteps = timesteps
+        # Lazy: built on first p_loss call if SD_PERCEPTUAL_WEIGHT > 0
+        self._perceptual: Optional[VGGPerceptualLoss] = None
+
+    def _get_perceptual(self, device) -> Optional["VGGPerceptualLoss"]:
+        if cfg.SD_PERCEPTUAL_WEIGHT <= 0:
+            return None
+        if self._perceptual is None:
+            self._perceptual = VGGPerceptualLoss().to(device)
+        return self._perceptual
 
     def _extract(self, arr, timesteps, shape):
         out = arr.gather(0, timesteps).view(-1, *([1] * (len(shape) - 1)))
@@ -270,28 +338,53 @@ class GaussianDiffusion(nn.Module):
         x_start,
         features,
         vae_encoder=None,
+        vae_decoder=None,
         initial_images=None,
     ):
+        device = x_start.device
 
         if vae_encoder is not None:
             with torch.no_grad():
-                # VAE encoder expects noise for reparameterization
                 noise_for_vae = torch.randn(
-                    x_start.size(0), 4, 
+                    x_start.size(0), 4,
                     x_start.size(2) // 8, x_start.size(3) // 8,
-                    device=x_start.device
+                    device=device,
                 )
                 x_start_latent = vae_encoder(x_start, noise_for_vae)
         else:
             x_start_latent = x_start
-        
+
         batch_size = x_start_latent.size(0)
-        t = torch.randint(0, self.timesteps, (batch_size,), device=x_start_latent.device)
+        t = torch.randint(0, self.timesteps, (batch_size,), device=device)
         noise = torch.randn_like(x_start_latent)
         x_t = self.q_sample(x_start_latent, t, noise)
         pred_noise = model(x_t, t, features, initial_images)
         noise_loss = F.mse_loss(pred_noise, noise)
-        return {'loss': noise_loss, 'metrics': {'noise_loss': noise_loss.item()}}
+
+        perceptual_loss = torch.tensor(0.0, device=device)
+        perceptual_fn = self._get_perceptual(device)
+        if perceptual_fn is not None and vae_decoder is not None:
+            # Reconstruct pred_x0 from (x_t, pred_noise)
+            sqrt_alpha_bar = torch.sqrt(self._extract(self.alphas_cumprod, t, x_t.shape))
+            sqrt_one_minus = torch.sqrt(1.0 - self._extract(self.alphas_cumprod, t, x_t.shape))
+            pred_x0_latent = (x_t - sqrt_one_minus * pred_noise.detach()) / sqrt_alpha_bar.clamp(min=1e-8)
+
+            with torch.no_grad():
+                pred_img  = vae_decoder(pred_x0_latent)   # [B, 3, H, W] in [-1, 1]
+                pred_img  = torch.clamp(pred_img, -1.0, 1.0)
+                # x_start is the original pixel image passed before VAE encoding
+                tgt_img   = x_start.detach()
+
+            perceptual_loss = perceptual_fn(pred_img, tgt_img)
+
+        total_loss = noise_loss + cfg.SD_PERCEPTUAL_WEIGHT * perceptual_loss
+        return {
+            'loss': total_loss,
+            'metrics': {
+                'noise_loss':      noise_loss.item(),
+                'perceptual_loss': perceptual_loss.item(),
+            },
+        }
 
     def sample(
         self,
@@ -392,28 +485,28 @@ class GaussianDiffusion(nn.Module):
 class StableDiffusionConditioned(nn.Module):
     def __init__(self, latent_channels=4, emb_dim=512, base_channels=64, use_initial_image=False):
         super().__init__()
-        num_features = len(cfg.FEATURE_COLUMNS)  # 9
-        time_dim     = emb_dim * 2
-        feature_dim  = num_features * emb_dim    # e.g. 9*768 = 6912
+        num_features = len(cfg.FEATURE_COLUMNS)   # 9
+        time_dim     = emb_dim * 2                # 1536
+        self.emb_dim          = emb_dim
+        self.num_features     = num_features
         self.use_initial_image = use_initial_image
 
         self.feature_projection = FeatureEmbedding(num_features=num_features, embed_dim=emb_dim)
-        self.time_embedding = TimeEmbedding(time_dim)
+        self.time_embedding     = TimeEmbedding(time_dim)
 
-        # Optional: image conditioning — output matches feature_dim, then concat
+        # Image conditioning: output also [B, num_features * emb_dim] → same token layout
         if use_initial_image:
             self.image_projection = ImageEmbedding(embed_dim=emb_dim)
-            # concat([feature_emb, image_emb]) → 2 * feature_dim
-            feature_dim = num_features * emb_dim * 2
 
-        # UNet works in latent space (4 channels)
+        # Cross-attention context_dim = emb_dim (per-token)
+        # Feature tokens: num_features when no image, num_features*2 when image is concatenated
         self.unet = ImprovedUNet(
             latent_channels,
             base_channels=base_channels,
             time_dim=time_dim,
-            feature_dim=feature_dim,
+            context_dim=emb_dim,        # ← per-token dimension
         )
-        self.time_scale = nn.Parameter(torch.tensor(1.0))
+        self.time_scale    = nn.Parameter(torch.tensor(1.0))
         self.feature_scale = nn.Parameter(torch.tensor(3.0))
         if use_initial_image:
             self.image_scale = nn.Parameter(torch.tensor(1.0))
@@ -425,15 +518,22 @@ class StableDiffusionConditioned(nn.Module):
         features: torch.Tensor,
         initial_images: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        B = noisy_latent.size(0)
         time_emb    = self.time_embedding(timesteps) * self.time_scale          # [B, time_dim]
-        feature_emb = self.feature_projection(features) * self.feature_scale    # [B, num_features * emb_dim]
+
+        # Feature embedding → [B, num_features * emb_dim] → [B, num_features, emb_dim]
+        feat_flat   = self.feature_projection(features) * self.feature_scale    # [B, N*emb_dim]
+        context     = feat_flat.view(B, self.num_features, self.emb_dim)        # [B, N, emb_dim]
 
         if self.use_initial_image and initial_images is not None:
-            image_emb   = self.image_projection(initial_images) * self.image_scale  # [B, num_features * emb_dim]
-            feature_emb = torch.cat([feature_emb, image_emb], dim=1)               # [B, 2 * num_features * emb_dim]
+            # Image embedding → [B, num_features * emb_dim] → [B, num_features, emb_dim]
+            img_flat    = self.image_projection(initial_images) * self.image_scale  # [B, N*emb_dim]
+            img_tokens  = img_flat.view(B, self.num_features, self.emb_dim)         # [B, N, emb_dim]
+            # Concatenate along token dimension → [B, 2N, emb_dim]
+            context = torch.cat([context, img_tokens], dim=1)
 
-        feature_emb = feature_emb.unsqueeze(1)  # [B, 1, feature_dim]
-        output = self.unet(noisy_latent, time_emb, feature_emb)
+        # context: [B, N_tokens, emb_dim]  — cross-attn sees N_tokens rich key-value pairs
+        output = self.unet(noisy_latent, time_emb, context)
         return output
 
 
