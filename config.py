@@ -1,7 +1,7 @@
 import os
 
 RUN_NAME = "diffusion"
-VERSION_NAME = "custom_perceptual"
+VERSION_NAME = "custom_newperceptual"
 
 # Files
 DATA_DIR = "data"
@@ -35,13 +35,13 @@ SD_SAMPLE_BATCH = 2
 SD_LOG_INTERVAL = 100   
 SD_ATTENTION_HEADS = 4
 SD_EMA_DECAY = 0.9995
-SD_GRAD_CLIP = 0.5
+SD_GRAD_CLIP = 1.0
 SD_DDP_TIMEOUT_MINUTES = 30
-SD_VAE_CKPT = "checkpoints/vae_epoch_115.pth"
+SD_VAE_CKPT = "checkpoints/diffusion/d_vae_epoch_70.pth"
 SD_FREEZE_VAE = False
 SD_COLOR_GUIDANCE_SCALE = 50.0
 SD_X0_LOSS_WEIGHT = 0.5
-SD_PERCEPTUAL_WEIGHT = 0.3
+SD_PERCEPTUAL_WEIGHT = 0.05
 
 # ddp
 DEVICE_IDS = [0, 1]
