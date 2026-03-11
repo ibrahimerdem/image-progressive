@@ -10,6 +10,7 @@ from torch.amp import autocast, GradScaler
 
 import config as cfg
 from utils.dataset import create_dataloaders
+from utils.training import calculate_psnr, calculate_ssim
 from models.encoder import VAE_Encoder
 from models.decoder import VAE_Decoder
 
@@ -75,13 +76,14 @@ def train_worker(rank: int, world_size: int, args) -> None:
     scaler = GradScaler('cuda')
 
     # Setup CSV logger on rank 0
-    log_path = "checkpoints/logs/vae_training_log.csv"
+    log_path = "checkpoints/diffusion/logs/d_vae_training_log.csv"
     if rank == 0:
-        os.makedirs("checkpoints/logs", exist_ok=True)
+        os.makedirs("checkpoints/diffusion/logs", exist_ok=True)
         log_file = open(log_path, 'w', newline='')
         log_writer = csv.writer(log_file)
         log_writer.writerow(["epoch", "train_loss", "train_l1", "train_kl",
-                              "val_tgt_kb", "val_rec_kb", "val_tgt_std", "val_rec_std"])
+                              "val_tgt_kb", "val_rec_kb", "val_tgt_std", "val_rec_std",
+                              "val_psnr", "val_ssim"])
         log_file.flush()
 
     start_epoch = 0
@@ -156,6 +158,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
 
         # Validation on rank 0 only
         val_tgt_kb = val_rec_kb = val_tgt_std = val_rec_std = 0.0
+        val_psnr = val_ssim = 0.0
         if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
             import io as _io
             import math as _math
@@ -165,6 +168,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
             vae_encoder.eval()
             vae_decoder.eval()
             val_batches = 0
+            val_num_batches = 0
 
             with torch.no_grad():
                 for _, __, target_img, ___ in val_loader:
@@ -198,6 +202,10 @@ def train_worker(rank: int, world_size: int, args) -> None:
                         val_rec_std += float(rec_arr.std())
                         val_batches += 1
 
+                    val_psnr += calculate_psnr(reconstructed, target_img)
+                    val_ssim += calculate_ssim(reconstructed, target_img)
+                    val_num_batches += 1
+
                     if val_batches >= 32:
                         break
 
@@ -205,22 +213,26 @@ def train_worker(rank: int, world_size: int, args) -> None:
             val_rec_kb  /= val_batches
             val_tgt_std /= val_batches
             val_rec_std /= val_batches
+            val_psnr    /= max(val_num_batches, 1)
+            val_ssim    /= max(val_num_batches, 1)
 
             print(f"[Val] Epoch {epoch+1}  "
                   f"target={val_tgt_kb:.0f}KB std={val_tgt_std:.1f} | "
-                  f"recon={val_rec_kb:.0f}KB std={val_rec_std:.1f}")
+                  f"recon={val_rec_kb:.0f}KB std={val_rec_std:.1f} | "
+                  f"PSNR={val_psnr:.2f}dB SSIM={val_ssim:.4f}")
 
         if rank == 0:
             log_writer.writerow([
                 epoch + 1, avg_loss, avg_l1, avg_kl,
                 val_tgt_kb, val_rec_kb, val_tgt_std, val_rec_std,
+                round(val_psnr, 4), round(val_ssim, 6),
             ])
             log_file.flush()
 
         # Save checkpoint every VAL_EPOCH epochs
         if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
-            os.makedirs("checkpoints", exist_ok=True)
-            ckpt_path = f"checkpoints/vae_epoch_{epoch+1}.pth"
+            os.makedirs("checkpoints/diffusion", exist_ok=True)
+            ckpt_path = f"checkpoints/diffusion/d_vae_epoch_{epoch+1}.pth"
             torch.save({
                 'epoch': epoch,
                 'encoder': vae_encoder.module.state_dict(),
