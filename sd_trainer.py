@@ -539,11 +539,11 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             steps += 1
 
             if (batch_idx + 1) % cfg.SD_LOG_INTERVAL == 0 and rank == 0:
-                noise_loss_val     = loss_metrics.get('noise_loss', loss.item())
+                noise_loss_val      = loss_metrics.get('noise_loss', loss.item())
                 perceptual_loss_val = loss_metrics.get('perceptual_loss', 0.0)
                 print(
                     f"[SD] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
-                    f"Loss: {epoch_loss / steps:.4f} | "
+                    f"Loss: {loss.item():.4f} | "
                     f"Noise: {noise_loss_val:.4f} | "
                     f"Percep: {perceptual_loss_val:.4f} | "
                     f"Grad Norm: {grad_norm:.4f}"

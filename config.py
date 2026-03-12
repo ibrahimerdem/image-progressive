@@ -41,7 +41,6 @@ SD_VAE_CKPT = "checkpoints/diffusion/d_vae_epoch_70.pth"
 SD_FREEZE_VAE = False
 SD_COLOR_GUIDANCE_SCALE = 50.0
 SD_X0_LOSS_WEIGHT = 0.5
-SD_PERCEPTUAL_WEIGHT = 0.05
 
 # ddp
 DEVICE_IDS = [0, 1]

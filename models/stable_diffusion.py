@@ -263,37 +263,6 @@ class ImprovedUNet(nn.Module):
         return self.out_conv(u1)                                  # [B, 4,  64, 64]
 
 
-class VGGPerceptualLoss(nn.Module):
-    """Perceptual loss using VGG-16 relu2_2 and relu3_3 feature layers.
-
-    Input images must be in [-1, 1]. Internally converts to ImageNet space.
-    The VGG backbone is always frozen.
-    """
-    def __init__(self):
-        super().__init__()
-        import torchvision.models as tvm
-        vgg = tvm.vgg16(weights=tvm.VGG16_Weights.IMAGENET1K_V1).features
-        # relu2_2 = index 9,  relu3_3 = index 16
-        self.slice1 = nn.Sequential(*list(vgg.children())[:10])   # up to relu2_2
-        self.slice2 = nn.Sequential(*list(vgg.children())[10:17]) # relu2_2 → relu3_3
-        for param in self.parameters():
-            param.requires_grad = False
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
-    def _preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, 3, H, W] in [-1, 1] → ImageNet normalised
-        x = (x + 1.0) * 0.5            # [0, 1]
-        return (x - self.mean) / self.std
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        p = self._preprocess(pred)
-        t = self._preprocess(target)
-        f1_p = self.slice1(p);  f1_t = self.slice1(t)
-        f2_p = self.slice2(f1_p); f2_t = self.slice2(f1_t)
-        return F.mse_loss(f1_p, f1_t) + F.mse_loss(f2_p, f2_t)
-
-
 class GaussianDiffusion(nn.Module):
     def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02):
         super().__init__()
@@ -306,15 +275,6 @@ class GaussianDiffusion(nn.Module):
         self.register_buffer("alphas_cumprod", alphas_cumprod)
         self.register_buffer("alphas_cumprod_prev", alphas_cumprod_prev)
         self.timesteps = timesteps
-        # Lazy: built on first p_loss call if SD_PERCEPTUAL_WEIGHT > 0
-        self._perceptual: Optional[VGGPerceptualLoss] = None
-
-    def _get_perceptual(self, device) -> Optional["VGGPerceptualLoss"]:
-        if cfg.SD_PERCEPTUAL_WEIGHT <= 0:
-            return None
-        if self._perceptual is None:
-            self._perceptual = VGGPerceptualLoss().to(device)
-        return self._perceptual
 
     def _extract(self, arr, timesteps, shape):
         out = arr.gather(0, timesteps).view(-1, *([1] * (len(shape) - 1)))
@@ -361,28 +321,10 @@ class GaussianDiffusion(nn.Module):
         pred_noise = model(x_t, t, features, initial_images)
         noise_loss = F.mse_loss(pred_noise, noise)
 
-        perceptual_loss = torch.tensor(0.0, device=device)
-        perceptual_fn = self._get_perceptual(device)
-        if perceptual_fn is not None and vae_decoder is not None:
-            # Reconstruct pred_x0 from (x_t, pred_noise)
-            sqrt_alpha_bar = torch.sqrt(self._extract(self.alphas_cumprod, t, x_t.shape))
-            sqrt_one_minus = torch.sqrt(1.0 - self._extract(self.alphas_cumprod, t, x_t.shape))
-            pred_x0_latent = (x_t - sqrt_one_minus * pred_noise.detach()) / sqrt_alpha_bar.clamp(min=1e-8)
-
-            with torch.no_grad():
-                pred_img  = vae_decoder(pred_x0_latent)   # [B, 3, H, W] in [-1, 1]
-                pred_img  = torch.clamp(pred_img, -1.0, 1.0)
-                # x_start is the original pixel image passed before VAE encoding
-                tgt_img   = x_start.detach()
-
-            perceptual_loss = perceptual_fn(pred_img, tgt_img)
-
-        total_loss = noise_loss + cfg.SD_PERCEPTUAL_WEIGHT * perceptual_loss
         return {
-            'loss': total_loss,
+            'loss': noise_loss,
             'metrics': {
-                'noise_loss':      noise_loss.item(),
-                'perceptual_loss': perceptual_loss.item(),
+                'noise_loss': noise_loss.item(),
             },
         }
 
