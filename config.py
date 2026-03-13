@@ -1,7 +1,7 @@
 import os
 
 RUN_NAME = "diffusion"
-VERSION_NAME = "custom_newperceptual"
+VERSION_NAME = "custom_temperature"
 
 # Files
 DATA_DIR = "data"
@@ -32,6 +32,7 @@ SD_BASE_CHANNELS = 192
 SD_VAL_STEPS = 50
 SD_VAL_EPOCH = 10
 SD_SAMPLE_BATCH = 2
+SD_SAMPLE_TEMPERATURE = 1.2
 SD_LOG_INTERVAL = 100   
 SD_ATTENTION_HEADS = 4
 SD_EMA_DECAY = 0.9995

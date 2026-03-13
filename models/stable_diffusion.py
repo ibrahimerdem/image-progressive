@@ -334,21 +334,14 @@ class GaussianDiffusion(nn.Module):
         features,
         steps=None,
         save_intermediates=False,
-        latent_shape=None,  # (B, C, H, W) for latent space
+        latent_shape=None,
         initial_images=None,
+        temperature=1.0,
     ):
         """DDPM ancestral sampler (Algorithm 2 in Ho et al. 2020).
 
-        The reverse step is:
-            x_{t-1} = 1/sqrt(alpha_t) * (x_t - beta_t/sqrt(1-alphabar_t) * eps_theta)
-                      + sqrt(beta_tilde_t) * z,   z ~ N(0,I)  for t > 0
-
-        where the posterior variance is:
-            beta_tilde_t = (1 - alphabar_{t-1}) / (1 - alphabar_t) * beta_t
-
-        When steps < timesteps a uniform sub-sequence is used (strided DDPM).
-        In that case beta_tilde_t is computed from the *sub-sequence* alphas so
-        the variance correctly reflects the larger effective step size.
+        temperature > 1.0 increases stochastic noise at each step, producing
+        sharper/noisier outputs. temperature=0.0 gives fully deterministic DDIM.
         """
         steps = steps or self.timesteps
         if latent_shape is None:
@@ -410,7 +403,7 @@ class GaussianDiffusion(nn.Module):
             # --- stochastic term (zero at final step t==0) ---
             if not is_last:
                 noise = torch.randn_like(img)
-                img   = mean + beta_tilde.sqrt() * noise
+                img   = mean + beta_tilde.sqrt() * noise * temperature
             else:
                 img   = mean
 
@@ -488,48 +481,36 @@ class StableDiffusionPipeline:
         self.vae_decoder = vae_decoder
 
     def sample(self, features: torch.Tensor, steps: Optional[int] = None, save_intermediates: bool = False,
-               initial_images: Optional[torch.Tensor] = None):
-        # Sample in latent space if VAE is provided
+               initial_images: Optional[torch.Tensor] = None, temperature: float = 1.0):
         if self.vae_encoder is not None and self.vae_decoder is not None:
-            # Latent space: 4 channels, H/8, W/8
             batch_size = features.size(0)
             latent_h = cfg.TARGET_HEIGHT // 8
             latent_w = cfg.TARGET_WIDTH // 8
             latent_shape = (batch_size, 4, latent_h, latent_w)
-            
-            # Generate latents
+
             result = self.schedule.sample(
-                self.model, features, steps, 
+                self.model, features, steps,
                 save_intermediates=save_intermediates,
                 latent_shape=latent_shape,
-                initial_images=initial_images
+                initial_images=initial_images,
+                temperature=temperature,
             )
-            
+
             if save_intermediates and isinstance(result, tuple):
                 latents, intermediates = result
-                # Decode final latents to images
-                images = self.vae_decoder(latents)
-                # Clamp decoded images to reasonable range for visualization
-                images = torch.clamp(images, -1.0, 1.0)
-                # Also decode intermediates
-                decoded_intermediates = []
-                for t, latent in intermediates:
-                    img = self.vae_decoder(latent)
-                    img = torch.clamp(img, -1.0, 1.0)
-                    decoded_intermediates.append((t, img))
+                images = torch.clamp(self.vae_decoder(latents), -1.0, 1.0)
+                decoded_intermediates = [
+                    (t, torch.clamp(self.vae_decoder(latent), -1.0, 1.0))
+                    for t, latent in intermediates
+                ]
                 return images, decoded_intermediates
             else:
-                latents = result
-                # Decode latents to images
-                images = self.vae_decoder(latents)
-                # Clamp decoded images to reasonable range for visualization
-                images = torch.clamp(images, -1.0, 1.0)
-                return images
+                return torch.clamp(self.vae_decoder(result), -1.0, 1.0)
         else:
-            # Original behavior: sample directly in image space
-            return self.schedule.sample(self.model, features, steps, 
-                                       save_intermediates=save_intermediates,
-                                       initial_images=initial_images)
+            return self.schedule.sample(self.model, features, steps,
+                                        save_intermediates=save_intermediates,
+                                        initial_images=initial_images,
+                                        temperature=temperature)
 
 
 class ModelEMA:

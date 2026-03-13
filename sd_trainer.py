@@ -298,9 +298,11 @@ def _run_validation(
 
             if cfg.INITIAL_IMAGE:
                 samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
-                                        initial_images=initial_images)
+                                          initial_images=initial_images,
+                                          temperature=cfg.SD_SAMPLE_TEMPERATURE)
             else:
-                samples = pipeline.sample(features, steps=val_steps, save_intermediates=False)
+                samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
+                                          temperature=cfg.SD_SAMPLE_TEMPERATURE)
                 
         batch_size = targets.size(0)
 

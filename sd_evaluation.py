@@ -167,6 +167,7 @@ def evaluate_test_set(
                 steps=num_inference_steps,
                 save_intermediates=False,
                 initial_images=input_image,
+                temperature=cfg.SD_SAMPLE_TEMPERATURE,
             )
 
             l1 = l1_loss(generated_images, target_image).item()
