@@ -231,17 +231,13 @@ class ImprovedUNet(nn.Module):
         self.down1 = DownBlock(C,  C2, time_dim, context_dim, attn=True)
         # 32×32 → 16×16
         self.down2 = DownBlock(C2, C4, time_dim, context_dim, attn=True)
-        # 16×16 → 8×8
-        self.down3 = DownBlock(C4, C4, time_dim, context_dim, attn=True)
 
-        # ---- bottleneck: ResBlock → SelfAttn → ResBlock (at 8×8) ----
+        # ---- bottleneck: ResBlock → SelfAttn → ResBlock ----
         self.mid1 = ResidualBlock(C4, C4, time_dim, context_dim)
         self.mid_attn = AttentionBlock(C4, cfg.SD_ATTENTION_HEADS)
         self.mid2 = ResidualBlock(C4, C4, time_dim, context_dim)
 
         # ---- decoder ----
-        # 8×8 → 16×16
-        self.up4 = UpBlock(C4 + C4, C4, time_dim, context_dim, attn=True)
         # 16×16 → 32×32
         self.up3 = UpBlock(C4 + C4, C2, time_dim, context_dim, attn=True)
         # 32×32 → 64×64
@@ -256,14 +252,12 @@ class ImprovedUNet(nn.Module):
         h0 = self.inc(x, time_emb, context)                      # [B, C,  64, 64]
         d1, skip1 = self.down1(h0, time_emb, context)            # [B, C2, 32, 32]
         d2, skip2 = self.down2(d1, time_emb, context)            # [B, C4, 16, 16]
-        d3, skip3 = self.down3(d2, time_emb, context)            # [B, C4,  8,  8]
 
-        m = self.mid1(d3, time_emb, context)
+        m = self.mid1(d2, time_emb, context)
         m = self.mid_attn(m)
         m = self.mid2(m, time_emb, context)
 
-        u4 = self.up4(m,  skip3, time_emb, context)              # [B, C4, 16, 16]
-        u3 = self.up3(u4, skip2, time_emb, context)              # [B, C2, 32, 32]
+        u3 = self.up3(m,  skip2, time_emb, context)              # [B, C2, 32, 32]
         u2 = self.up2(u3, skip1, time_emb, context)              # [B, C,  64, 64]
         u1 = self.up1(u2, h0,    time_emb, context)              # [B, C,  64, 64]
         return self.out_conv(u1)                                  # [B, 4,  64, 64]
