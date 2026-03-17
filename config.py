@@ -1,7 +1,7 @@
 import os
 
 RUN_NAME = "diffusion"
-VERSION_NAME = "custom_temperature_extraunet"
+VERSION_NAME = "custom_temperature"
 
 # Files
 DATA_DIR = "data"
@@ -21,9 +21,6 @@ FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_ra
 FEATURE_NORMALIZATION = True
 FEATURE_MINS = [5.6,15,0,16.87,-1.91,-16.75,1,1,1000]
 FEATURE_MAXS = [30,42,95,40,1.62,-0.5,4,7,7000]
-CATEGORICAL_FEATURES = []
-CATEGORICAL_DIMS = []
-TOTAL_FEATURE_DIM = len(FEATURE_COLUMNS)
 INITIAL_IMAGE = True
 
 # Stable diffusion defaults
@@ -43,6 +40,7 @@ SD_GRAD_CLIP = 1.0
 SD_DDP_TIMEOUT_MINUTES = 30
 SD_VAE_CKPT = "checkpoints/diffusion/d_vae_epoch_70.pth"
 SD_FREEZE_VAE = False
+SD_COLOR_GUIDANCE_SCALE = 50.0
 
 # ddp
 DEVICE_IDS = [0, 1]

@@ -324,7 +324,7 @@ def _run_validation(
                 targets,         
                 sample_dir,
                 epoch,
-                prefix=f"d_{cfg.VERSION_NAME.lower()}",
+                prefix=f"sd_{cfg.VERSION_NAME.lower()}",
                 num_samples=batch_size,
             )
             
@@ -377,26 +377,26 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 
     # Safety check: ensure dataloaders are not empty
     if len(train_loader) == 0:
-        raise ValueError(f"[D] ERROR: Training dataloader is empty! Check dataset configuration.")
+        raise ValueError(f"[SD] ERROR: Training dataloader is empty! Check dataset configuration.")
     if val_loader and len(val_loader) == 0:
-        print(f"[D] WARNING: Validation dataloader is empty!")
+        print(f"[SD] WARNING: Validation dataloader is empty!")
     
     if rank == 0:
-        print(f"[D] Training batches per epoch: {len(train_loader)}")
-        print(f"[D] Validation batches per epoch: {len(val_loader) if val_loader else 0}")
+        print(f"[SD] Training batches per epoch: {len(train_loader)}")
+        print(f"[SD] Validation batches per epoch: {len(val_loader) if val_loader else 0}")
 
     sample_train_features = train_loader.dataset.input_data[0]
     sample_val_features = val_loader.dataset.input_data[0]
     
-    print(f"[D] Training features: {sample_train_features.shape}")
-    print(f"[D] Validation features: {sample_val_features.shape}")
+    print(f"[SD] Training features: {sample_train_features.shape}")
+    print(f"[SD] Validation features: {sample_val_features.shape}")
     
     # Load pretrained VAE encoder and decoder (frozen)
     vae_encoder, vae_decoder = _load_vae(cfg.SD_VAE_CKPT, device)
 
     # Model works in latent space (4 channels) not RGB space
+    # Enable initial image conditioning if config flag is set
     num_features = len(cfg.FEATURE_COLUMNS)
-    feature_dim  = num_features * cfg.SD_EMB_DIM
     base_model = StableDiffusionConditioned(
         latent_channels=4,
         emb_dim=cfg.SD_EMB_DIM,
@@ -404,12 +404,12 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         use_initial_image=cfg.INITIAL_IMAGE,
     )
 
-    feature_dim  = num_features * cfg.SD_EMB_DIM
+    feature_dim = num_features * cfg.SD_EMB_DIM
     if cfg.INITIAL_IMAGE:
-        print(f"[D] Initial image conditioning ENABLED "
+        print(f"[SD] Initial image conditioning ENABLED "
               f"(feature_dim={feature_dim} → concat → {feature_dim * 2})")
     else:
-        print(f"[D] Initial image conditioning DISABLED (feature_dim={feature_dim})")
+        print(f"[SD] Initial image conditioning DISABLED (feature_dim={feature_dim})")
 
     diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
@@ -446,15 +446,15 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             if "ema_state_dict" in ckpt:
                 ema_helper.ema.load_state_dict(ckpt["ema_state_dict"])
                 if rank == 0:
-                    print(f"[D] Loaded EMA weights from checkpoint")
+                    print(f"[SD] Loaded EMA weights from checkpoint")
             if rank == 0:
-                print(f"[D] Resumed from {checkpoint_path} at epoch {start_epoch + 1}")
+                print(f"[SD] Resumed from {checkpoint_path} at epoch {start_epoch + 1}")
         elif rank == 0:
-            print(f"[D] Checkpoint {checkpoint_path} not found, starting from scratch")
+            print(f"[SD] Checkpoint {checkpoint_path} not found, starting from scratch")
     elif retrain and not checkpoint_path:
         # Auto-detect latest checkpoint
         if os.path.exists(save_dir):
-            ckpts = [f for f in os.listdir(save_dir) if f.startswith("d_") and f.endswith(".pth")]
+            ckpts = [f for f in os.listdir(save_dir) if f.startswith("sd_") and f.endswith(".pth")]
             if ckpts:
                 ckpts.sort(key=lambda x: int(x.split("_")[-1].replace(".pth", "")))
                 latest_ckpt = os.path.join(save_dir, ckpts[-1])
@@ -463,13 +463,13 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 if "ema_state_dict" in ckpt:
                     ema_helper.ema.load_state_dict(ckpt["ema_state_dict"])
                     if rank == 0:
-                        print(f"[D] Loaded EMA weights from checkpoint")
+                        print(f"[SD] Loaded EMA weights from checkpoint")
                 if rank == 0:
-                    print(f"[D] Auto-resumed from {latest_ckpt} at epoch {start_epoch + 1}")
+                    print(f"[SD] Auto-resumed from {latest_ckpt} at epoch {start_epoch + 1}")
             elif rank == 0:
-                print(f"[D] No checkpoints found in {save_dir}, starting from scratch")
+                print(f"[SD] No checkpoints found in {save_dir}, starting from scratch")
         elif rank == 0:
-            print(f"[D] No checkpoint directory found, starting from scratch")
+            print(f"[SD] No checkpoint directory found, starting from scratch")
 
     metrics_logger = MetricsLogger(log_dir, f"diffusion_{version}_log.csv") if rank == 0 else None
     clip_model = clip_preprocess = None
@@ -493,10 +493,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 
             # Debug: Print first batch info
             if batch_idx == 0 and rank == 0:
-                print(f"[D] Epoch {epoch} - batch 0/{len(train_loader)} "
+                print(f"[SD] Epoch {epoch} - batch 0/{len(train_loader)} "
                       f"features: {features.shape}, targets: {targets.shape}")
                 if cfg.INITIAL_IMAGE:
-                    print(f"[D] Initial images: {initial_images.shape}")
+                    print(f"[SD] Initial images: {initial_images.shape}")
 
             optimizer.zero_grad()
             with amp_ctx():
@@ -544,7 +544,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 noise_loss_val      = loss_metrics.get('noise_loss', loss.item())
                 perceptual_loss_val = loss_metrics.get('perceptual_loss', 0.0)
                 print(
-                    f"[D] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
+                    f"[SD] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
                     f"Loss: {loss.item():.4f} | "
                     f"Noise: {noise_loss_val:.4f} | "
                     f"Percep: {perceptual_loss_val:.4f} | "
@@ -553,7 +553,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         
         # End of batch loop - log completion
         if rank == 0:
-            print(f"[D] Epoch {epoch} - Completed all {len(train_loader)} batches in {time.time() - start_time:.2f}s")
+            print(f"[SD] Epoch {epoch} - Completed all {len(train_loader)} batches in {time.time() - start_time:.2f}s")
 
         loss_tensor = torch.tensor([epoch_loss, steps], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -561,15 +561,15 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         avg_loss = (loss_tensor[0] / total_steps).item()
 
         if rank == 0:
-            print(f"[D] Rank {rank} finished all_reduce for epoch {epoch}")
+            print(f"[SD] Rank {rank} finished all_reduce for epoch {epoch}")
         
         # Keep all ranks in sync before validation to avoid collective timeouts
         if dist.is_initialized():
             if rank == 0:
-                print(f"[D] Rank {rank} entering first barrier before validation")
+                print(f"[SD] Rank {rank} entering first barrier before validation")
             dist.barrier()
             if rank == 0:
-                print(f"[D] Rank {rank} passed first barrier")
+                print(f"[SD] Rank {rank} passed first barrier")
 
         val_metrics = None
         should_validate = (
@@ -578,7 +578,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             and (cfg.SD_VAL_EPOCH <= 1 or epoch % cfg.SD_VAL_EPOCH == 0)
         )
         if should_validate:
-            print(f"[D] Rank {rank} starting validation")
+            print(f"[SD] Rank {rank} starting validation")
             # Use EMA model for validation on rank 0, raw model on other ranks
             val_model = ema_helper.ema if rank == 0 else model
             val_pipeline = ema_pipeline if rank == 0 else pipeline
@@ -605,7 +605,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             if val_metrics:
                 # Print main metrics
                 print(
-                    f"[D] Epoch {epoch} Loss: {avg_loss:.4f} | "
+                    f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | "
                     f"Val L1: {val_metrics['val_l1']:.4f}, PSNR: {val_metrics['val_psnr']:.2f}, "
                     f"SSIM: {val_metrics['val_ssim']:.4f}, CLIP: {val_metrics['val_clip']:.4f}, "
                     f"RGB Dist: {val_metrics['val_rgb_dist']:.4f} | "
@@ -615,22 +615,22 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 # Print per-timestep denoising losses
                 timestep_keys = [k for k in val_metrics.keys() if k.startswith('val_loss_t')]
                 if timestep_keys:
-                    print(f"[D] Denoising quality by timestep:")
+                    print(f"[SD] Denoising quality by timestep:")
                     for key in sorted(timestep_keys, key=lambda x: int(x.split('t')[1])):
                         t = int(key.split('t')[1])
                         loss = val_metrics[key]
-                        quality = "Good" if loss < 0.05 else "Learning" if loss < 0.1 else "Poor"
+                        quality = "✓ Good" if loss < 0.05 else "⚠ Learning" if loss < 0.1 else "✗ Poor"
                         print(f"     t={t:3d}: loss={loss:.4f} {quality}")
                     
                     # Always print prediction variance for collapse detection
                     pred_var = val_metrics.get('pred_variance', 0)
                     if pred_var < 0.1:
-                        var_status = "MODE COLLAPSE!"
+                        var_status = "⚠️ MODE COLLAPSE!"
                     elif pred_var < 0.3:
-                        var_status = "Low (risky)"
+                        var_status = "⚠ Low (risky)"
                     else:
-                        var_status = "Healthy"
-                    print(f"[D] Pred Variance: {pred_var:.4f} {var_status}")
+                        var_status = "✓ Healthy"
+                    print(f"[SD] Pred Variance: {pred_var:.4f} {var_status}")
                 
                 # Log all metrics including per-timestep losses
                 log_dict = {
@@ -649,7 +649,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 metrics_logger.log(log_dict)
                 
             else:
-                print(f"[D] Epoch {epoch} Loss: {avg_loss:.4f} | Time: {elapsed:.2f}s")
+                print(f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | Time: {elapsed:.2f}s")
                 metrics_logger.log({"epoch": epoch, "train_loss": avg_loss})
 
             if should_validate:
@@ -657,7 +657,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                     model, optimizer, epoch, save_dir, version,
                     ema_model=ema_helper.ema,
                 )
-                print(f"[D] Checkpoint saved: {saved_path}")
+                print(f"[SD] Checkpoint saved: {saved_path}")
 
     _cleanup_ddp()
 
@@ -665,7 +665,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 def train_distributed(epochs, retrain, checkpoint_path, version):
     device_ids = getattr(cfg, "DEVICE_IDS", None)
     if not device_ids or len(device_ids) < 2:
-        raise RuntimeError("Diffusion training requires at least two devices listed in DEVICE_IDS")
+        raise RuntimeError("Stable diffusion training requires at least two devices listed in DEVICE_IDS")
 
     mp.spawn(
         _ddp_worker,
@@ -676,7 +676,7 @@ def train_distributed(epochs, retrain, checkpoint_path, version):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train diffusion model conditioned on features and an optional initial image")
+    parser = argparse.ArgumentParser(description="Train stable diffusion conditioned on features and an optional initial image")
     parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--retrain", type=int, default=0)
     parser.add_argument("--checkpoint", type=str, default="")
@@ -687,7 +687,7 @@ def main() -> None:
     # Note: retrain=1 means RESUME training, retrain=0 means start fresh
     # Checkpoint path is optional - if not provided, auto-detects latest
 
-    print(f"Launching diffusion DDP training on devices {cfg.DEVICE_IDS}")
+    print(f"Launching stable diffusion DDP training on devices {cfg.DEVICE_IDS}")
     train_distributed(
         epochs=args.epochs,
         retrain=retrain_flag,

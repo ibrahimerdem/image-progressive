@@ -36,27 +36,27 @@ class TimeEmbedding(nn.Module):
 
 
 class FeatureEmbedding(nn.Module):
-    def __init__(self, input_dim: int, num_tokens: int, embed_dim: int = 512):
+    def __init__(self, num_features: int = 9, embed_dim: int = 512):
         super().__init__()
-        self.num_tokens = num_tokens
+        self.num_features = num_features
         self.embed_dim = embed_dim
-        hidden = max(input_dim * 16, embed_dim * 4)
+        hidden = max(num_features * 256, embed_dim * 4)
         self.projection = nn.Sequential(
-            nn.Linear(input_dim, hidden),
+            nn.Linear(num_features, hidden),
             nn.SiLU(),
-            nn.Linear(hidden, num_tokens * embed_dim),
+            nn.Linear(hidden, num_features * embed_dim),
         )
     
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         B, F = features.shape
-        return self.projection(features)  # [B, num_tokens * embed_dim]
+        return self.projection(features)  # [B, num_features * embed_dim]
 
 
 class ImageEmbedding(nn.Module):
     def __init__(self, in_channels: int = 3, embed_dim: int = 512, image_size: int = 128):
         super().__init__()
         # Input: [B, 3, 128, 128]
-        # Output: [B, num_tokens * embed_dim]  (matches FeatureEmbedding output dim)
+        # Output: [B, 9 * embed_dim]  (matches FeatureEmbedding output dim)
         self.encoder = nn.Sequential(
             # 128×128 → 64×64
             nn.Conv2d(in_channels, 64, kernel_size=4, stride=2, padding=1),
@@ -227,7 +227,7 @@ class ImprovedUNet(nn.Module):
         # ---- encoder ----
         # 64×64
         self.inc   = ResidualBlock(in_channels, C, time_dim, context_dim)
-        # 64×64 → 32×32
+        # 64×64 → 32×32  (self-attn added at this resolution)
         self.down1 = DownBlock(C,  C2, time_dim, context_dim, attn=True)
         # 32×32 → 16×16
         self.down2 = DownBlock(C2, C4, time_dim, context_dim, attn=True)
@@ -420,17 +420,16 @@ class GaussianDiffusion(nn.Module):
 class StableDiffusionConditioned(nn.Module):
     def __init__(self, latent_channels=4, emb_dim=512, base_channels=64, use_initial_image=False):
         super().__init__()
-        num_tokens   = len(cfg.FEATURE_COLUMNS)   # 9 context tokens
-        input_dim    = cfg.TOTAL_FEATURE_DIM       # 20 (continuous + one-hot categoricals)
-        time_dim     = emb_dim * 2
+        num_features = len(cfg.FEATURE_COLUMNS)   # 9
+        time_dim     = emb_dim * 2                # 1536
         self.emb_dim          = emb_dim
-        self.num_features     = num_tokens
+        self.num_features     = num_features
         self.use_initial_image = use_initial_image
 
-        self.feature_projection = FeatureEmbedding(input_dim=input_dim, num_tokens=num_tokens, embed_dim=emb_dim)
+        self.feature_projection = FeatureEmbedding(num_features=num_features, embed_dim=emb_dim)
         self.time_embedding     = TimeEmbedding(time_dim)
 
-        # Image conditioning: output also [B, num_fea9 (continuous features only
+        # Image conditioning: output also [B, num_features * emb_dim] → same token layout
         if use_initial_image:
             self.image_projection = ImageEmbedding(embed_dim=emb_dim)
 
