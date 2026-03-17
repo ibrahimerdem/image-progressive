@@ -430,7 +430,7 @@ class StableDiffusionConditioned(nn.Module):
         self.feature_projection = FeatureEmbedding(input_dim=input_dim, num_tokens=num_tokens, embed_dim=emb_dim)
         self.time_embedding     = TimeEmbedding(time_dim)
 
-        # Image conditioning: output also [B, num_features * emb_dim] → same token layout
+        # Image conditioning: output also [B, num_fea9 (continuous features only
         if use_initial_image:
             self.image_projection = ImageEmbedding(embed_dim=emb_dim)
 
