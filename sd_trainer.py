@@ -39,26 +39,26 @@ def _load_vae(checkpoint_path, device):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"VAE checkpoint not found: {checkpoint_path}")
     
-    print(f"[SD] Loading pretrained VAE from {checkpoint_path}")
+    print(f"[D] Loading pretrained VAE from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     
-    print(f"[SD] Checkpoint type: {type(checkpoint)}")
+    print(f"[D] Checkpoint type: {type(checkpoint)}")
     if isinstance(checkpoint, dict):
-        print(f"[SD] Checkpoint keys: {list(checkpoint.keys())[:10]}")
+        print(f"[D] Checkpoint keys: {list(checkpoint.keys())[:10]}")
         
         # Check if encoder/decoder are stored as nested dicts (common format)
         if 'encoder' in checkpoint and 'decoder' in checkpoint:
-            print(f"[SD] Found 'encoder' and 'decoder' as top-level keys")
+            print(f"[D] Found 'encoder' and 'decoder' as top-level keys")
             encoder_weights = checkpoint['encoder']
             decoder_weights = checkpoint['decoder']
             
             # Check if they are state_dicts or need further unwrapping
             if isinstance(encoder_weights, dict):
-                print(f"[SD] Encoder has {len(encoder_weights)} keys")
-                print(f"[SD] Sample encoder keys: {list(encoder_weights.keys())[:3]}")
+                print(f"[D] Encoder has {len(encoder_weights)} keys")
+                print(f"[D] Sample encoder keys: {list(encoder_weights.keys())[:3]}")
             if isinstance(decoder_weights, dict):
-                print(f"[SD] Decoder has {len(decoder_weights)} keys")
-                print(f"[SD] Sample decoder keys: {list(decoder_weights.keys())[:3]}")
+                print(f"[D] Decoder has {len(decoder_weights)} keys")
+                print(f"[D] Sample decoder keys: {list(decoder_weights.keys())[:3]}")
             
             vae_encoder = VAE_Encoder().to(device)
             vae_decoder = VAE_Decoder().to(device)
@@ -66,16 +66,16 @@ def _load_vae(checkpoint_path, device):
             # Load the state dicts
             try:
                 vae_encoder.load_state_dict(encoder_weights, strict=True)
-                print(f"[SD] ✓ Loaded encoder weights ({len(encoder_weights)} keys)")
+                print(f"[D] Loaded encoder weights ({len(encoder_weights)} keys)")
             except Exception as e:
-                print(f"[SD] ✗ Failed to load encoder: {e}")
+                print(f"[D] Failed to load encoder: {e}")
                 raise
             
             try:
                 vae_decoder.load_state_dict(decoder_weights, strict=True)
-                print(f"[SD] ✓ Loaded decoder weights ({len(decoder_weights)} keys)")
+                print(f"[D] Loaded decoder weights ({len(decoder_weights)} keys)")
             except Exception as e:
-                print(f"[SD] ✗ Failed to load decoder: {e}")
+                print(f"[D] Failed to load decoder: {e}")
                 raise
             
             # Freeze VAE parameters
@@ -87,15 +87,15 @@ def _load_vae(checkpoint_path, device):
             vae_encoder.eval()
             vae_decoder.eval()
             
-            print(f"[SD] VAE loaded and frozen successfully")
+            print(f"[D] VAE loaded and frozen successfully")
             return vae_encoder, vae_decoder
         
         # Check for common checkpoint formats
         if 'model_state_dict' in checkpoint:
-            print(f"[SD] Found 'model_state_dict', using it")
+            print(f"[D] Found 'model_state_dict', using it")
             checkpoint = checkpoint['model_state_dict']
         elif 'state_dict' in checkpoint:
-            print(f"[SD] Found 'state_dict', using it")
+            print(f"[D] Found 'state_dict', using it")
             checkpoint = checkpoint['state_dict']
     
     vae_encoder = VAE_Encoder().to(device)
@@ -108,9 +108,9 @@ def _load_vae(checkpoint_path, device):
     
     # Pattern 2: Direct weights (no prefix)
     if not encoder_state and not decoder_state:
-        print(f"[SD] No 'encoder.'/'decoder.' prefix found, checking sample keys...")
+        print(f"[D] No 'encoder.'/'decoder.' prefix found, checking sample keys...")
         sample_keys = list(checkpoint.keys())[:5]
-        print(f"[SD] Sample keys: {sample_keys}")
+        print(f"[D] Sample keys: {sample_keys}")
         
         # Try to split by checking if keys match encoder/decoder structure
         encoder_param_names = set(n for n, _ in vae_encoder.named_parameters())
@@ -119,31 +119,31 @@ def _load_vae(checkpoint_path, device):
         encoder_state = {k: v for k, v in checkpoint.items() if k in encoder_param_names}
         decoder_state = {k: v for k, v in checkpoint.items() if k in decoder_param_names}
         
-        print(f"[SD] Matched by parameter names: encoder={len(encoder_state)}, decoder={len(decoder_state)}")
+        print(f"[D] Matched by parameter names: encoder={len(encoder_state)}, decoder={len(decoder_state)}")
     
     # Load encoder weights
     if encoder_state:
         try:
             vae_encoder.load_state_dict(encoder_state, strict=True)
-            print(f"[SD] ✓ Loaded encoder weights ({len(encoder_state)} keys)")
+            print(f"[D] Loaded encoder weights ({len(encoder_state)} keys)")
         except Exception as e:
-            print(f"[SD] ✗ Failed to load encoder: {e}")
+            print(f"[D] Failed to load encoder: {e}")
             raise
     else:
-        print(f"[SD] ✗ WARNING: No encoder weights found in checkpoint")
-        print(f"[SD] Expected encoder keys like: {list(vae_encoder.state_dict().keys())[:3]}")
+        print(f"[D] WARNING: No encoder weights found in checkpoint")
+        print(f"[D] Expected encoder keys like: {list(vae_encoder.state_dict().keys())[:3]}")
     
     # Load decoder weights
     if decoder_state:
         try:
             vae_decoder.load_state_dict(decoder_state, strict=True)
-            print(f"[SD] ✓ Loaded decoder weights ({len(decoder_state)} keys)")
+            print(f"[D] Loaded decoder weights ({len(decoder_state)} keys)")
         except Exception as e:
-            print(f"[SD] ✗ Failed to load decoder: {e}")
+            print(f"[D] Failed to load decoder: {e}")
             raise
     else:
-        print(f"[SD] ✗ WARNING: No decoder weights found in checkpoint")
-        print(f"[SD] Expected decoder keys like: {list(vae_decoder.state_dict().keys())[:3]}")
+        print(f"[D] WARNING: No decoder weights found in checkpoint")
+        print(f"[D] Expected decoder keys like: {list(vae_decoder.state_dict().keys())[:3]}")
     
     if not encoder_state or not decoder_state:
         raise RuntimeError("Failed to load VAE weights. Check checkpoint format.")
@@ -157,7 +157,7 @@ def _load_vae(checkpoint_path, device):
     vae_encoder.eval()
     vae_decoder.eval()
     
-    print(f"[SD] VAE loaded and frozen successfully")
+    print(f"[D] VAE loaded and frozen successfully")
     return vae_encoder, vae_decoder
 
 
@@ -377,19 +377,19 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 
     # Safety check: ensure dataloaders are not empty
     if len(train_loader) == 0:
-        raise ValueError(f"[SD] ERROR: Training dataloader is empty! Check dataset configuration.")
+        raise ValueError(f"[D] ERROR: Training dataloader is empty! Check dataset configuration.")
     if val_loader and len(val_loader) == 0:
-        print(f"[SD] WARNING: Validation dataloader is empty!")
+        print(f"[D] WARNING: Validation dataloader is empty!")
     
     if rank == 0:
-        print(f"[SD] Training batches per epoch: {len(train_loader)}")
-        print(f"[SD] Validation batches per epoch: {len(val_loader) if val_loader else 0}")
+        print(f"[D] Training batches per epoch: {len(train_loader)}")
+        print(f"[D] Validation batches per epoch: {len(val_loader) if val_loader else 0}")
 
     sample_train_features = train_loader.dataset.input_data[0]
     sample_val_features = val_loader.dataset.input_data[0]
     
-    print(f"[SD] Training features: {sample_train_features.shape}")
-    print(f"[SD] Validation features: {sample_val_features.shape}")
+    print(f"[D] Training features: {sample_train_features.shape}")
+    print(f"[D] Validation features: {sample_val_features.shape}")
     
     # Load pretrained VAE encoder and decoder (frozen)
     vae_encoder, vae_decoder = _load_vae(cfg.SD_VAE_CKPT, device)
@@ -406,10 +406,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 
     feature_dim = num_features * cfg.SD_EMB_DIM
     if cfg.INITIAL_IMAGE:
-        print(f"[SD] Initial image conditioning ENABLED "
+        print(f"[D] Initial image conditioning ENABLED "
               f"(feature_dim={feature_dim} → concat → {feature_dim * 2})")
     else:
-        print(f"[SD] Initial image conditioning DISABLED (feature_dim={feature_dim})")
+        print(f"[D] Initial image conditioning DISABLED (feature_dim={feature_dim})")
 
     diffusion = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
@@ -446,11 +446,11 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             if "ema_state_dict" in ckpt:
                 ema_helper.ema.load_state_dict(ckpt["ema_state_dict"])
                 if rank == 0:
-                    print(f"[SD] Loaded EMA weights from checkpoint")
+                    print(f"[D] Loaded EMA weights from checkpoint")
             if rank == 0:
-                print(f"[SD] Resumed from {checkpoint_path} at epoch {start_epoch + 1}")
+                print(f"[D] Resumed from {checkpoint_path} at epoch {start_epoch + 1}")
         elif rank == 0:
-            print(f"[SD] Checkpoint {checkpoint_path} not found, starting from scratch")
+            print(f"[D] Checkpoint {checkpoint_path} not found, starting from scratch")
     elif retrain and not checkpoint_path:
         # Auto-detect latest checkpoint
         if os.path.exists(save_dir):
@@ -463,13 +463,13 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 if "ema_state_dict" in ckpt:
                     ema_helper.ema.load_state_dict(ckpt["ema_state_dict"])
                     if rank == 0:
-                        print(f"[SD] Loaded EMA weights from checkpoint")
+                        print(f"[D] Loaded EMA weights from checkpoint")
                 if rank == 0:
-                    print(f"[SD] Auto-resumed from {latest_ckpt} at epoch {start_epoch + 1}")
+                    print(f"[D] Auto-resumed from {latest_ckpt} at epoch {start_epoch + 1}")
             elif rank == 0:
-                print(f"[SD] No checkpoints found in {save_dir}, starting from scratch")
+                print(f"[D] No checkpoints found in {save_dir}, starting from scratch")
         elif rank == 0:
-            print(f"[SD] No checkpoint directory found, starting from scratch")
+            print(f"[D] No checkpoint directory found, starting from scratch")
 
     metrics_logger = MetricsLogger(log_dir, f"diffusion_{version}_log.csv") if rank == 0 else None
     clip_model = clip_preprocess = None
@@ -493,10 +493,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
 
             # Debug: Print first batch info
             if batch_idx == 0 and rank == 0:
-                print(f"[SD] Epoch {epoch} - batch 0/{len(train_loader)} "
+                print(f"[D] Epoch {epoch} - batch 0/{len(train_loader)} "
                       f"features: {features.shape}, targets: {targets.shape}")
                 if cfg.INITIAL_IMAGE:
-                    print(f"[SD] Initial images: {initial_images.shape}")
+                    print(f"[D] Initial images: {initial_images.shape}")
 
             optimizer.zero_grad()
             with amp_ctx():
@@ -544,7 +544,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 noise_loss_val      = loss_metrics.get('noise_loss', loss.item())
                 perceptual_loss_val = loss_metrics.get('perceptual_loss', 0.0)
                 print(
-                    f"[SD] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
+                    f"[D] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
                     f"Loss: {loss.item():.4f} | "
                     f"Noise: {noise_loss_val:.4f} | "
                     f"Percep: {perceptual_loss_val:.4f} | "
@@ -553,7 +553,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         
         # End of batch loop - log completion
         if rank == 0:
-            print(f"[SD] Epoch {epoch} - Completed all {len(train_loader)} batches in {time.time() - start_time:.2f}s")
+            print(f"[D] Epoch {epoch} - Completed all {len(train_loader)} batches in {time.time() - start_time:.2f}s")
 
         loss_tensor = torch.tensor([epoch_loss, steps], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -561,15 +561,15 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         avg_loss = (loss_tensor[0] / total_steps).item()
 
         if rank == 0:
-            print(f"[SD] Rank {rank} finished all_reduce for epoch {epoch}")
+            print(f"[D] Rank {rank} finished all_reduce for epoch {epoch}")
         
         # Keep all ranks in sync before validation to avoid collective timeouts
         if dist.is_initialized():
             if rank == 0:
-                print(f"[SD] Rank {rank} entering first barrier before validation")
+                print(f"[D] Rank {rank} entering first barrier before validation")
             dist.barrier()
             if rank == 0:
-                print(f"[SD] Rank {rank} passed first barrier")
+                print(f"[D] Rank {rank} passed first barrier")
 
         val_metrics = None
         should_validate = (
@@ -578,7 +578,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             and (cfg.SD_VAL_EPOCH <= 1 or epoch % cfg.SD_VAL_EPOCH == 0)
         )
         if should_validate:
-            print(f"[SD] Rank {rank} starting validation")
+            print(f"[D] Rank {rank} starting validation")
             # Use EMA model for validation on rank 0, raw model on other ranks
             val_model = ema_helper.ema if rank == 0 else model
             val_pipeline = ema_pipeline if rank == 0 else pipeline
@@ -605,7 +605,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             if val_metrics:
                 # Print main metrics
                 print(
-                    f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | "
+                    f"[D] Epoch {epoch} Loss: {avg_loss:.4f} | "
                     f"Val L1: {val_metrics['val_l1']:.4f}, PSNR: {val_metrics['val_psnr']:.2f}, "
                     f"SSIM: {val_metrics['val_ssim']:.4f}, CLIP: {val_metrics['val_clip']:.4f}, "
                     f"RGB Dist: {val_metrics['val_rgb_dist']:.4f} | "
@@ -615,7 +615,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 # Print per-timestep denoising losses
                 timestep_keys = [k for k in val_metrics.keys() if k.startswith('val_loss_t')]
                 if timestep_keys:
-                    print(f"[SD] Denoising quality by timestep:")
+                    print(f"[D] Denoising quality by timestep:")
                     for key in sorted(timestep_keys, key=lambda x: int(x.split('t')[1])):
                         t = int(key.split('t')[1])
                         loss = val_metrics[key]
@@ -630,7 +630,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                         var_status = "⚠ Low (risky)"
                     else:
                         var_status = "✓ Healthy"
-                    print(f"[SD] Pred Variance: {pred_var:.4f} {var_status}")
+                    print(f"[D] Pred Variance: {pred_var:.4f} {var_status}")
                 
                 # Log all metrics including per-timestep losses
                 log_dict = {
@@ -649,7 +649,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 metrics_logger.log(log_dict)
                 
             else:
-                print(f"[SD] Epoch {epoch} Loss: {avg_loss:.4f} | Time: {elapsed:.2f}s")
+                print(f"[D] Epoch {epoch} Loss: {avg_loss:.4f} | Time: {elapsed:.2f}s")
                 metrics_logger.log({"epoch": epoch, "train_loss": avg_loss})
 
             if should_validate:
@@ -657,7 +657,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                     model, optimizer, epoch, save_dir, version,
                     ema_model=ema_helper.ema,
                 )
-                print(f"[SD] Checkpoint saved: {saved_path}")
+                print(f"[D] Checkpoint saved: {saved_path}")
 
     _cleanup_ddp()
 
