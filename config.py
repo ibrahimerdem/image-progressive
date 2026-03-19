@@ -40,7 +40,6 @@ SD_GRAD_CLIP = 1.0
 SD_DDP_TIMEOUT_MINUTES = 30
 SD_VAE_CKPT = "checkpoints/diffusion/d_vae_epoch_70.pth"
 SD_FREEZE_VAE = False
-SD_COLOR_GUIDANCE_SCALE = 50.0
 
 # ddp
 DEVICE_IDS = [0, 1]
