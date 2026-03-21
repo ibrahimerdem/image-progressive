@@ -232,7 +232,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
         # Save checkpoint every VAL_EPOCH epochs
         if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
             os.makedirs("checkpoints/diffusion", exist_ok=True)
-            ckpt_path = f"checkpoints/diffusion/d_vae_epoch_{epoch+1}.pth"
+            ckpt_path = f"checkpoints/diffusion/d_vae_scale_epoch_{epoch+1}.pth"
             torch.save({
                 'epoch': epoch,
                 'encoder': vae_encoder.module.state_dict(),
