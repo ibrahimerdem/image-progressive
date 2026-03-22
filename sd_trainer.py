@@ -301,6 +301,12 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         print(f"[VAE] Latent range      : [{latent_min:.4f}, {latent_max:.4f}]")
         print(f"[VAE] Suggested LATENT_SCALE = {1.0 / latent_std.item():.4f}")
 
+        print(f"[VAE] cfg.VAE_SCALE = {cfg.VAE_SCALE}")
+        noise2 = torch.randn_like(noise)
+        latent_unscaled = (latent / cfg.VAE_SCALE)
+        print(f"[VAE] Unscaled std  : {latent_unscaled.std():.4f}  (should be ~{5.7491/0.1739:.1f} if scale applied)")
+        print(f"[VAE] Scaled std    : {latent.std():.4f}")
+
 
     num_features = len(cfg.FEATURE_COLUMNS)
     base_model = StableDiffusionConditioned(

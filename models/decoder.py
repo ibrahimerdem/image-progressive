@@ -169,7 +169,6 @@ class VAE_Decoder(nn.Sequential):
     def forward(self, x):
         # x: (Batch_Size, 4, Height / 8, Width / 8)
         
-        # Remove the scaling added by the Encoder.
         x /= cfg.VAE_SCALE
 
         for module in self:
