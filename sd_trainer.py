@@ -184,7 +184,6 @@ def _measure_denoising_quality(
                 device=device
             )
             targets_latent = vae_encoder(targets, noise_for_vae)
-            # Note: VAE encoder already scales by 0.18215
         else:
             targets_latent = targets
         
