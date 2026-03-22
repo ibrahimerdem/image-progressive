@@ -39,6 +39,9 @@ SD_ATTENTION_HEADS = 4
 SD_EMA_DECAY = 0.999
 SD_GRAD_CLIP = 1.0
 SD_DDP_TIMEOUT_MINUTES = 30
+
+VAE_SCALE = 0.1739
+
 SD_VAE_CKPT = "checkpoints/diffusion/diffusion_pytorch_model.bin"
 SD_FREEZE_VAE = False
 

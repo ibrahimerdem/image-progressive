@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from models.attention import SelfAttention
+import config as cfg
 
 
 class VAE_AttentionBlock(nn.Module):
@@ -41,7 +42,6 @@ class VAE_AttentionBlock(nn.Module):
 
         # (Batch_Size, Features, Height, Width)
         return x 
-
 
 class VAE_ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -83,7 +83,6 @@ class VAE_ResidualBlock(nn.Module):
         # (Batch_Size, Out_Channels, Height, Width) -> (Batch_Size, Out_Channels, Height, Width)
         return x + self.residual_layer(residue)
 
-
 class VAE_Decoder(nn.Sequential):
     def __init__(self):
         super().__init__(
@@ -113,7 +112,7 @@ class VAE_Decoder(nn.Sequential):
             
             # Repeats the rows and columns of the data by scale_factor (like when you resize an image by doubling its size).
             # (Batch_Size, 512, Height / 8, Width / 8) -> (Batch_Size, 512, Height / 4, Width / 4)
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Upsample(scale_factor=2),
             
             # (Batch_Size, 512, Height / 4, Width / 4) -> (Batch_Size, 512, Height / 4, Width / 4)
             nn.Conv2d(512, 512, kernel_size=3, padding=1), 
@@ -128,7 +127,7 @@ class VAE_Decoder(nn.Sequential):
             VAE_ResidualBlock(512, 512), 
             
             # (Batch_Size, 512, Height / 4, Width / 4) -> (Batch_Size, 512, Height / 2, Width / 2)
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), 
+            nn.Upsample(scale_factor=2), 
             
             # (Batch_Size, 512, Height / 2, Width / 2) -> (Batch_Size, 512, Height / 2, Width / 2)
             nn.Conv2d(512, 512, kernel_size=3, padding=1), 
@@ -143,7 +142,7 @@ class VAE_Decoder(nn.Sequential):
             VAE_ResidualBlock(256, 256), 
             
             # (Batch_Size, 256, Height / 2, Width / 2) -> (Batch_Size, 256, Height, Width)
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), 
+            nn.Upsample(scale_factor=2), 
             
             # (Batch_Size, 256, Height, Width) -> (Batch_Size, 256, Height, Width)
             nn.Conv2d(256, 256, kernel_size=3, padding=1), 
@@ -171,7 +170,7 @@ class VAE_Decoder(nn.Sequential):
         # x: (Batch_Size, 4, Height / 8, Width / 8)
         
         # Remove the scaling added by the Encoder.
-        x /= 0.18215
+        x /= cfg.VAE_SCALE
 
         for module in self:
             x = module(x)

@@ -34,204 +34,7 @@ from utils.training import (
     save_random_sample_pairs,
 )
 
-
-def _load_pretrained_sd_vae(checkpoint_path: str, device: torch.device):
-    """
-    Load a pretrained Stable Diffusion VAE (KL-f8) from various checkpoint formats.
-    Compatible with:
-      - sd-vae-ft-mse / sd-vae-ft-ema  (standalone, keys: encoder.X / decoder.X)
-      - v1-5-pruned.ckpt                (full SD, keys: first_stage_model.encoder.X / ...)
-      - Your custom format              (keys: {"encoder": state_dict, "decoder": state_dict})
-    """
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"VAE checkpoint not found: {checkpoint_path}")
-
-    print(f"[VAE] Loading pretrained VAE from {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-
-    # Unwrap top-level wrappers (e.g. Lightning / training checkpoints)
-    for key in ("state_dict", "model_state_dict"):
-        if isinstance(ckpt, dict) and key in ckpt and "encoder" not in ckpt:
-            ckpt = ckpt[key]
-            break
-
-    vae_encoder = VAE_Encoder().to(device)
-    vae_decoder = VAE_Decoder().to(device)
-
-    # ── Format 1: your custom {"encoder": sd, "decoder": sd} ──────────────
-    if isinstance(ckpt, dict) and "encoder" in ckpt and "decoder" in ckpt:
-        vae_encoder.load_state_dict(ckpt["encoder"], strict=True)
-        vae_decoder.load_state_dict(ckpt["decoder"], strict=True)
-        print("[VAE] Loaded from custom {encoder, decoder} format")
-
-    # ── Format 2: full SD ckpt  first_stage_model.encoder.* ───────────────
-    elif any(k.startswith("first_stage_model.") for k in ckpt):
-        enc_sd = {
-            k.replace("first_stage_model.encoder.", ""): v
-            for k, v in ckpt.items()
-            if k.startswith("first_stage_model.encoder.")
-        }
-        dec_sd = {
-            k.replace("first_stage_model.decoder.", ""): v
-            for k, v in ckpt.items()
-            if k.startswith("first_stage_model.decoder.")
-        }
-        # Also need quant_conv / post_quant_conv if your arch has them
-        # (your VAE folds them into the final Conv2d layers, so skip)
-        vae_encoder.load_state_dict(enc_sd, strict=False)
-        vae_decoder.load_state_dict(dec_sd, strict=False)
-        print("[VAE] Loaded from full SD checkpoint (first_stage_model.*)")
-
-    # ── Format 3: standalone sd-vae-ft-mse  encoder.* / decoder.* ─────────
-    elif any(k.startswith("encoder.") for k in ckpt):
-        enc_sd = {k.replace("encoder.", ""): v for k, v in ckpt.items() if k.startswith("encoder.")}
-        dec_sd = {k.replace("decoder.", ""): v for k, v in ckpt.items() if k.startswith("decoder.")}
-        vae_encoder.load_state_dict(enc_sd, strict=False)
-        vae_decoder.load_state_dict(dec_sd, strict=False)
-        print("[VAE] Loaded from standalone sd-vae-ft-* format (encoder.* / decoder.*)")
-
-    else:
-        sample = list(ckpt.keys())[:6]
-        raise RuntimeError(
-            f"[VAE] Unrecognised checkpoint format. Sample keys: {sample}\n"
-            "Supported: custom {{encoder,decoder}}, full SD (first_stage_model.*), "
-            "sd-vae-ft-mse (encoder.*/decoder.*)"
-        )
-
-    for p in vae_encoder.parameters():
-        p.requires_grad = False
-    for p in vae_decoder.parameters():
-        p.requires_grad = False
-    vae_encoder.eval()
-    vae_decoder.eval()
-    print("[VAE] Frozen and ready.")
-    return vae_encoder, vae_decoder
-
-
-def _load_vae(checkpoint_path, device):
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"VAE checkpoint not found: {checkpoint_path}")
-    
-    print(f"[D] Loading pretrained VAE from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    
-    print(f"[D] Checkpoint type: {type(checkpoint)}")
-    if isinstance(checkpoint, dict):
-        print(f"[D] Checkpoint keys: {list(checkpoint.keys())[:10]}")
-        
-        # Check if encoder/decoder are stored as nested dicts (common format)
-        if 'encoder' in checkpoint and 'decoder' in checkpoint:
-            print(f"[D] Found 'encoder' and 'decoder' as top-level keys")
-            encoder_weights = checkpoint['encoder']
-            decoder_weights = checkpoint['decoder']
-            
-            # Check if they are state_dicts or need further unwrapping
-            if isinstance(encoder_weights, dict):
-                print(f"[D] Encoder has {len(encoder_weights)} keys")
-                print(f"[D] Sample encoder keys: {list(encoder_weights.keys())[:3]}")
-            if isinstance(decoder_weights, dict):
-                print(f"[D] Decoder has {len(decoder_weights)} keys")
-                print(f"[D] Sample decoder keys: {list(decoder_weights.keys())[:3]}")
-            
-            vae_encoder = VAE_Encoder().to(device)
-            vae_decoder = VAE_Decoder().to(device)
-            
-            # Load the state dicts
-            try:
-                vae_encoder.load_state_dict(encoder_weights, strict=True)
-                print(f"[D] Loaded encoder weights ({len(encoder_weights)} keys)")
-            except Exception as e:
-                print(f"[D] Failed to load encoder: {e}")
-                raise
-            
-            try:
-                vae_decoder.load_state_dict(decoder_weights, strict=True)
-                print(f"[D] Loaded decoder weights ({len(decoder_weights)} keys)")
-            except Exception as e:
-                print(f"[D] Failed to load decoder: {e}")
-                raise
-            
-            # Freeze VAE parameters
-            for param in vae_encoder.parameters():
-                param.requires_grad = False
-            for param in vae_decoder.parameters():
-                param.requires_grad = False
-            
-            vae_encoder.eval()
-            vae_decoder.eval()
-            
-            print(f"[D] VAE loaded and frozen successfully")
-            return vae_encoder, vae_decoder
-        
-        # Check for common checkpoint formats
-        if 'model_state_dict' in checkpoint:
-            print(f"[D] Found 'model_state_dict', using it")
-            checkpoint = checkpoint['model_state_dict']
-        elif 'state_dict' in checkpoint:
-            print(f"[D] Found 'state_dict', using it")
-            checkpoint = checkpoint['state_dict']
-    
-    vae_encoder = VAE_Encoder().to(device)
-    vae_decoder = VAE_Decoder().to(device)
-    
-    # Try multiple key patterns
-    # Pattern 1: encoder.X.Y, decoder.X.Y
-    encoder_state = {k.replace('encoder.', ''): v for k, v in checkpoint.items() if k.startswith('encoder.')}
-    decoder_state = {k.replace('decoder.', ''): v for k, v in checkpoint.items() if k.startswith('decoder.')}
-    
-    # Pattern 2: Direct weights (no prefix)
-    if not encoder_state and not decoder_state:
-        print(f"[D] No 'encoder.'/'decoder.' prefix found, checking sample keys...")
-        sample_keys = list(checkpoint.keys())[:5]
-        print(f"[D] Sample keys: {sample_keys}")
-        
-        # Try to split by checking if keys match encoder/decoder structure
-        encoder_param_names = set(n for n, _ in vae_encoder.named_parameters())
-        decoder_param_names = set(n for n, _ in vae_decoder.named_parameters())
-        
-        encoder_state = {k: v for k, v in checkpoint.items() if k in encoder_param_names}
-        decoder_state = {k: v for k, v in checkpoint.items() if k in decoder_param_names}
-        
-        print(f"[D] Matched by parameter names: encoder={len(encoder_state)}, decoder={len(decoder_state)}")
-    
-    # Load encoder weights
-    if encoder_state:
-        try:
-            vae_encoder.load_state_dict(encoder_state, strict=True)
-            print(f"[D] Loaded encoder weights ({len(encoder_state)} keys)")
-        except Exception as e:
-            print(f"[D] Failed to load encoder: {e}")
-            raise
-    else:
-        print(f"[D] WARNING: No encoder weights found in checkpoint")
-        print(f"[D] Expected encoder keys like: {list(vae_encoder.state_dict().keys())[:3]}")
-    
-    # Load decoder weights
-    if decoder_state:
-        try:
-            vae_decoder.load_state_dict(decoder_state, strict=True)
-            print(f"[D] Loaded decoder weights ({len(decoder_state)} keys)")
-        except Exception as e:
-            print(f"[D] Failed to load decoder: {e}")
-            raise
-    else:
-        print(f"[D] WARNING: No decoder weights found in checkpoint")
-        print(f"[D] Expected decoder keys like: {list(vae_decoder.state_dict().keys())[:3]}")
-    
-    if not encoder_state or not decoder_state:
-        raise RuntimeError("Failed to load VAE weights. Check checkpoint format.")
-    
-    # Freeze VAE parameters
-    for param in vae_encoder.parameters():
-        param.requires_grad = False
-    for param in vae_decoder.parameters():
-        param.requires_grad = False
-    
-    vae_encoder.eval()
-    vae_decoder.eval()
-    
-    print(f"[D] VAE loaded and frozen successfully")
-    return vae_encoder, vae_decoder
+from vae_loader import load_vae
 
 
 def _measure_denoising_quality(
@@ -466,10 +269,39 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     print(f"[D] Validation features: {sample_val_features.shape}")
     
     # Load pretrained VAE encoder and decoder (frozen)
-    vae_encoder, vae_decoder = _load_pretrained_sd_vae(cfg.SD_VAE_CKPT, device)
+    vae_encoder, vae_decoder = load_vae(cfg.SD_VAE_CKPT, device)
 
-    # Model works in latent space (4 channels) not RGB space
-    # Enable initial image conditioning if config flag is set
+    _, val_loader_diag, _ = create_dataloaders(
+        batch_size=1,
+        num_workers=0,          # <-- critical: no forked workers for this quick check
+        pin_memory=False,
+        distributed=False,
+    )
+
+    with torch.no_grad():
+        batch = next(iter(val_loader_diag))
+        test_img = batch[2][:1].to(device)           # target image, shape [1, 3, 512, 512]
+        
+        noise = torch.randn(1, 4,
+                            test_img.shape[2] // 8,
+                            test_img.shape[3] // 8,
+                            device=device)
+        
+        latent = vae_encoder(test_img, noise)
+        recon  = vae_decoder(latent)
+        
+        recon_loss = torch.nn.functional.l1_loss(recon, test_img)
+        latent_std  = latent.std()
+        latent_mean = latent.mean()
+        latent_min  = latent.min()
+        latent_max  = latent.max()
+        
+        print(f"[VAE] Reconstruction L1 : {recon_loss:.4f}  (target < 0.05)")
+        print(f"[VAE] Latent mean/std   : {latent_mean:.4f} / {latent_std:.4f}")
+        print(f"[VAE] Latent range      : [{latent_min:.4f}, {latent_max:.4f}]")
+        print(f"[VAE] Suggested LATENT_SCALE = {1.0 / latent_std.item():.4f}")
+
+
     num_features = len(cfg.FEATURE_COLUMNS)
     base_model = StableDiffusionConditioned(
         latent_channels=4,

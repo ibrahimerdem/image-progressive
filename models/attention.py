@@ -1,8 +1,7 @@
-import math
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
+from torch import nn
+from torch.nn import functional as F
+import math
 
 class SelfAttention(nn.Module):
     def __init__(self, n_heads, d_embed, in_proj_bias=True, out_proj_bias=True):
@@ -64,7 +63,6 @@ class SelfAttention(nn.Module):
         
         # (Batch_Size, Seq_Len, Dim)
         return output
-
 
 class CrossAttention(nn.Module):
     def __init__(self, n_heads, d_embed, d_cross, in_proj_bias=True, out_proj_bias=True):
