@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, final
 
 import torch
 import torch.nn as nn
@@ -337,28 +337,20 @@ class GaussianDiffusion(nn.Module):
         latent_shape=None,
         initial_images=None,
         temperature=1.0,
+        eta=0.0,
     ):
-        """DDPM ancestral sampler (Algorithm 2 in Ho et al. 2020).
 
-        temperature > 1.0 increases stochastic noise at each step, producing
-        sharper/noisier outputs. temperature=0.0 gives fully deterministic DDIM.
-        """
         steps = steps or self.timesteps
-        if latent_shape is None:
-            shape = (features.size(0), cfg.CHANNELS, cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH)
-        else:
-            shape = latent_shape
+        shape = latent_shape if latent_shape is not None else (
+            features.size(0), cfg.CHANNELS, cfg.TARGET_HEIGHT, cfg.TARGET_WIDTH)
 
         img = torch.randn(shape, device=features.device)
         intermediates = []
 
-        # Build descending timestep schedule (T-1 → 0)
         if steps < self.timesteps:
-            # Uniform stride: pick `steps` evenly spaced indices spanning [0, T-1].
-            # torch.linspace guarantees endpoints are exactly 0 and T-1.
             indices = torch.linspace(0, self.timesteps - 1, steps).round().long().clamp(0, self.timesteps - 1)
-            indices = torch.unique(indices)                    # remove duplicates from rounding
-            timestep_schedule = torch.flip(indices, [0])      # descending: T-1 → 0
+            indices = torch.unique(indices)
+            timestep_schedule = torch.flip(indices, [0])
         else:
             timestep_schedule = torch.arange(self.timesteps - 1, -1, -1, dtype=torch.long)
 
@@ -368,7 +360,6 @@ class GaussianDiffusion(nn.Module):
             with torch.no_grad():
                 epsilon = model(img, t, features, initial_images)
 
-            # --- alpha_bar at current and previous timestep in the schedule ---
             alpha_bar_t = self._extract(self.alphas_cumprod, t, img.shape)
 
             is_last = (step_idx == len(timestep_schedule) - 1)
@@ -380,41 +371,30 @@ class GaussianDiffusion(nn.Module):
                     img.shape,
                 )
             else:
-                # t == 0: no noise added, use alpha_bar=1 (clean signal)
                 alpha_bar_prev = torch.ones_like(alpha_bar_t)
 
-            # --- effective single-step alpha for this schedule stride ---
-            # When steps < timesteps, each "step" covers multiple real timesteps.
-            # The correct effective alpha_t for the stride is:
-            #   alpha_eff = alpha_bar_t / alpha_bar_prev
-            # This reduces to the true alpha_t when stride == 1.
-            alpha_eff  = alpha_bar_t / alpha_bar_prev.clamp(min=1e-8)
-            beta_eff   = 1.0 - alpha_eff
+            sqrt_alpha_bar_t = alpha_bar_t.sqrt().clamp(min=1e-8)
+            sqrt_one_minus   = (1.0 - alpha_bar_t).clamp(min=1e-8).sqrt()
+            x0_pred = (img - sqrt_one_minus * epsilon) / sqrt_alpha_bar_t
+            x0_pred = torch.clamp(x0_pred, -1.5, 1.5)
 
-            # posterior variance: beta_tilde = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * beta_eff
-            beta_tilde = (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t).clamp(min=1e-8) * beta_eff
-            beta_tilde = beta_tilde.clamp(min=0.0)
+            sigma = eta * (
+                (1 - alpha_bar_prev) / (1 - alpha_bar_t).clamp(min=1e-8)
+                * (1 - alpha_bar_t / alpha_bar_prev.clamp(min=1e-8))
+            ).clamp(min=0).sqrt()
 
-            # --- DDPM posterior mean ---
-            # mu_theta = 1/sqrt(alpha_eff) * (x_t - beta_eff/sqrt(1-alpha_bar_t) * eps)
-            coeff = beta_eff / (1.0 - alpha_bar_t).clamp(min=1e-8).sqrt()
-            mean  = (img - coeff * epsilon) / alpha_eff.clamp(min=1e-8).sqrt()
+            direction = (1 - alpha_bar_prev - sigma ** 2).clamp(min=0).sqrt() * epsilon
 
-            # --- stochastic term (zero at final step t==0) ---
-            if not is_last:
-                noise = torch.randn_like(img)
-                img   = mean + beta_tilde.sqrt() * noise * temperature
-            else:
-                img   = mean
+            img = alpha_bar_prev.sqrt() * x0_pred + direction
+
+            if not is_last and eta > 0:
+                img = img + sigma * torch.randn_like(img) * temperature
 
             if save_intermediates and step_idx % 10 == 0:
                 intermediates.append((timestep.item(), img.clone()))
 
-        # Latents: let the decoder handle range; images: clamp to [-1, 1]
         final = img if latent_shape is not None else torch.clamp(img, -1.0, 1.0)
-        if save_intermediates:
-            return final, intermediates
-        return final
+        return (final, intermediates) if save_intermediates else final
 
 
 class StableDiffusionConditioned(nn.Module):
@@ -439,7 +419,7 @@ class StableDiffusionConditioned(nn.Module):
             latent_channels,
             base_channels=base_channels,
             time_dim=time_dim,
-            context_dim=emb_dim,        # ← per-token dimension
+            context_dim=emb_dim,
         )
         self.time_scale    = nn.Parameter(torch.tensor(1.0))
         self.feature_scale = nn.Parameter(torch.tensor(3.0))
@@ -481,7 +461,7 @@ class StableDiffusionPipeline:
         self.vae_decoder = vae_decoder
 
     def sample(self, features: torch.Tensor, steps: Optional[int] = None, save_intermediates: bool = False,
-               initial_images: Optional[torch.Tensor] = None, temperature: float = 1.0):
+               initial_images: Optional[torch.Tensor] = None, temperature: float = 1.0, eta: float = 0.0):
         if self.vae_encoder is not None and self.vae_decoder is not None:
             batch_size = features.size(0)
             latent_h = cfg.TARGET_HEIGHT // 8
@@ -494,6 +474,7 @@ class StableDiffusionPipeline:
                 latent_shape=latent_shape,
                 initial_images=initial_images,
                 temperature=temperature,
+                eta=eta,
             )
 
             if save_intermediates and isinstance(result, tuple):
@@ -510,11 +491,12 @@ class StableDiffusionPipeline:
             return self.schedule.sample(self.model, features, steps,
                                         save_intermediates=save_intermediates,
                                         initial_images=initial_images,
-                                        temperature=temperature)
+                                        temperature=temperature,
+                                        eta=eta)
 
 
 class ModelEMA:
-    def __init__(self, model: nn.Module, decay: float = 0.9995):
+    def __init__(self, model, decay=0.999):
         import copy
         self.decay = decay
         self.ema = copy.deepcopy(model)

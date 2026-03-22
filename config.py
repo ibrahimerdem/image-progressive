@@ -1,7 +1,7 @@
 import os
 
 RUN_NAME = "diffusion"
-VERSION_NAME = "temperature_scaling"
+VERSION_NAME = "temperature_pretrained_vae"
 
 # Files
 DATA_DIR = "data"
@@ -26,19 +26,20 @@ INITIAL_IMAGE = True
 # Stable diffusion defaults
 SD_LR = 0.00005
 SD_TIMESTEPS = 1000      
-SD_SAMPLE_STEPS = 25     
+SD_SAMPLE_STEPS = 50     
 SD_EMB_DIM = 768
 SD_BASE_CHANNELS = 256
 SD_VAL_STEPS = 50
 SD_VAL_EPOCH = 10
 SD_SAMPLE_BATCH = 2
-SD_SAMPLE_TEMPERATURE = 0.85
+SD_SAMPLE_TEMPERATURE = 1.2
+SD_SAMPLER_ETA = 1.0
 SD_LOG_INTERVAL = 100   
 SD_ATTENTION_HEADS = 4
 SD_EMA_DECAY = 0.999
 SD_GRAD_CLIP = 1.0
 SD_DDP_TIMEOUT_MINUTES = 30
-SD_VAE_CKPT = "checkpoints/diffusion/d_vae_scale_epoch_70.pth"
+SD_VAE_CKPT = "checkpoints/diffusion/diffusion_pytorch_model.bin"
 SD_FREEZE_VAE = False
 
 # ddp

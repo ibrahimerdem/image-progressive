@@ -35,6 +35,79 @@ from utils.training import (
 )
 
 
+def _load_pretrained_sd_vae(checkpoint_path: str, device: torch.device):
+    """
+    Load a pretrained Stable Diffusion VAE (KL-f8) from various checkpoint formats.
+    Compatible with:
+      - sd-vae-ft-mse / sd-vae-ft-ema  (standalone, keys: encoder.X / decoder.X)
+      - v1-5-pruned.ckpt                (full SD, keys: first_stage_model.encoder.X / ...)
+      - Your custom format              (keys: {"encoder": state_dict, "decoder": state_dict})
+    """
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"VAE checkpoint not found: {checkpoint_path}")
+
+    print(f"[VAE] Loading pretrained VAE from {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+
+    # Unwrap top-level wrappers (e.g. Lightning / training checkpoints)
+    for key in ("state_dict", "model_state_dict"):
+        if isinstance(ckpt, dict) and key in ckpt and "encoder" not in ckpt:
+            ckpt = ckpt[key]
+            break
+
+    vae_encoder = VAE_Encoder().to(device)
+    vae_decoder = VAE_Decoder().to(device)
+
+    # ── Format 1: your custom {"encoder": sd, "decoder": sd} ──────────────
+    if isinstance(ckpt, dict) and "encoder" in ckpt and "decoder" in ckpt:
+        vae_encoder.load_state_dict(ckpt["encoder"], strict=True)
+        vae_decoder.load_state_dict(ckpt["decoder"], strict=True)
+        print("[VAE] Loaded from custom {encoder, decoder} format")
+
+    # ── Format 2: full SD ckpt  first_stage_model.encoder.* ───────────────
+    elif any(k.startswith("first_stage_model.") for k in ckpt):
+        enc_sd = {
+            k.replace("first_stage_model.encoder.", ""): v
+            for k, v in ckpt.items()
+            if k.startswith("first_stage_model.encoder.")
+        }
+        dec_sd = {
+            k.replace("first_stage_model.decoder.", ""): v
+            for k, v in ckpt.items()
+            if k.startswith("first_stage_model.decoder.")
+        }
+        # Also need quant_conv / post_quant_conv if your arch has them
+        # (your VAE folds them into the final Conv2d layers, so skip)
+        vae_encoder.load_state_dict(enc_sd, strict=False)
+        vae_decoder.load_state_dict(dec_sd, strict=False)
+        print("[VAE] Loaded from full SD checkpoint (first_stage_model.*)")
+
+    # ── Format 3: standalone sd-vae-ft-mse  encoder.* / decoder.* ─────────
+    elif any(k.startswith("encoder.") for k in ckpt):
+        enc_sd = {k.replace("encoder.", ""): v for k, v in ckpt.items() if k.startswith("encoder.")}
+        dec_sd = {k.replace("decoder.", ""): v for k, v in ckpt.items() if k.startswith("decoder.")}
+        vae_encoder.load_state_dict(enc_sd, strict=False)
+        vae_decoder.load_state_dict(dec_sd, strict=False)
+        print("[VAE] Loaded from standalone sd-vae-ft-* format (encoder.* / decoder.*)")
+
+    else:
+        sample = list(ckpt.keys())[:6]
+        raise RuntimeError(
+            f"[VAE] Unrecognised checkpoint format. Sample keys: {sample}\n"
+            "Supported: custom {{encoder,decoder}}, full SD (first_stage_model.*), "
+            "sd-vae-ft-mse (encoder.*/decoder.*)"
+        )
+
+    for p in vae_encoder.parameters():
+        p.requires_grad = False
+    for p in vae_decoder.parameters():
+        p.requires_grad = False
+    vae_encoder.eval()
+    vae_decoder.eval()
+    print("[VAE] Frozen and ready.")
+    return vae_encoder, vae_decoder
+
+
 def _load_vae(checkpoint_path, device):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"VAE checkpoint not found: {checkpoint_path}")
@@ -298,10 +371,12 @@ def _run_validation(
             if cfg.INITIAL_IMAGE:
                 samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
                                           initial_images=initial_images,
-                                          temperature=cfg.SD_SAMPLE_TEMPERATURE)
+                                          temperature=cfg.SD_SAMPLE_TEMPERATURE,
+                                          eta=cfg.SD_SAMPLER_ETA)
             else:
                 samples = pipeline.sample(features, steps=val_steps, save_intermediates=False,
-                                          temperature=cfg.SD_SAMPLE_TEMPERATURE)
+                                          temperature=cfg.SD_SAMPLE_TEMPERATURE,
+                                          eta=cfg.SD_SAMPLER_ETA)
                 
         batch_size = targets.size(0)
 
@@ -391,7 +466,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     print(f"[D] Validation features: {sample_val_features.shape}")
     
     # Load pretrained VAE encoder and decoder (frozen)
-    vae_encoder, vae_decoder = _load_vae(cfg.SD_VAE_CKPT, device)
+    vae_encoder, vae_decoder = _load_pretrained_sd_vae(cfg.SD_VAE_CKPT, device)
 
     # Model works in latent space (4 channels) not RGB space
     # Enable initial image conditioning if config flag is set
