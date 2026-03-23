@@ -278,35 +278,33 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
         distributed=False,
     )
 
-    with torch.no_grad():
-        batch = next(iter(val_loader_diag))
-        test_img = batch[2][:1].to(device)           # target image, shape [1, 3, 512, 512]
-        
-        noise = torch.randn(1, 4,
-                            test_img.shape[2] // 8,
-                            test_img.shape[3] // 8,
-                            device=device)
-        
-        latent = vae_encoder(test_img, noise)
-        recon  = vae_decoder(latent)
-        
-        recon_loss = torch.nn.functional.l1_loss(recon, test_img)
-        latent_std  = latent.std()
-        latent_mean = latent.mean()
-        latent_min  = latent.min()
-        latent_max  = latent.max()
-        
-        print(f"[VAE] Reconstruction L1 : {recon_loss:.4f}  (target < 0.05)")
-        print(f"[VAE] Latent mean/std   : {latent_mean:.4f} / {latent_std:.4f}")
-        print(f"[VAE] Latent range      : [{latent_min:.4f}, {latent_max:.4f}]")
-        print(f"[VAE] Suggested LATENT_SCALE = {1.0 / latent_std.item():.4f}")
+    raw_stds = []
+    raw_means = []
 
-        print(f"[VAE] cfg.VAE_SCALE = {cfg.VAE_SCALE}")
-        noise2 = torch.randn_like(noise)
-        latent_unscaled = (latent / cfg.VAE_SCALE)
-        print(f"[VAE] Unscaled std  : {latent_unscaled.std():.4f}  (should be ~{5.7491/0.1739:.1f} if scale applied)")
-        print(f"[VAE] Scaled std    : {latent.std():.4f}")
+    for i, batch in enumerate(val_loader_diag):
+        if i >= 50:  # 50 images is enough for a stable estimate
+            break
+        img = batch[2][:1].to(device)  # [1, 3, 512, 512]
 
+        # Zero noise → deterministic mean (no stochastic variance contamination)
+        noise = torch.zeros(1, 4, img.shape[2] // 8, img.shape[3] // 8, device=device)
+
+        with torch.no_grad():
+            latent_scaled = vae_encoder(img, noise)
+            # Undo the scaling the encoder applied internally
+            latent_raw = latent_scaled / cfg.VAE_SCALE
+
+        raw_stds.append(latent_raw.std().item())
+        raw_means.append(latent_raw.mean().item())
+
+    mean_raw_std  = sum(raw_stds)  / len(raw_stds)
+    mean_raw_mean = sum(raw_means) / len(raw_means)
+    correct_scale = 1.0 / mean_raw_std
+
+    print(f"[VAE] Raw latent mean (avg over dataset) : {mean_raw_mean:.4f}  (target ~0.0)")
+    print(f"[VAE] Raw latent std  (avg over dataset) : {mean_raw_std:.4f}")
+    print(f"[VAE] Correct VAE_SCALE                  : {correct_scale:.4f}  (current: {cfg.VAE_SCALE})")
+    print(f"[VAE] Verification - scaled std will be  : {mean_raw_std * correct_scale:.4f}  (target 1.0)")
 
     num_features = len(cfg.FEATURE_COLUMNS)
     base_model = StableDiffusionConditioned(

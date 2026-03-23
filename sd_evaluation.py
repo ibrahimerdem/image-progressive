@@ -22,32 +22,8 @@ from utils.training import (
     compute_clip_metrics_batch,
 )
 from utils.dataset import create_dataloaders
+from vae_loader import load_vae
 import config as cfg
-
-
-def load_vae(checkpoint_path, device):
-
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"VAE checkpoint not found: {checkpoint_path}")
-    
-    print(f"Loading VAE from: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Load encoder and decoder
-    vae_encoder = VAE_Encoder().to(device)
-    vae_decoder = VAE_Decoder().to(device)
-    
-    if 'encoder' in checkpoint and 'decoder' in checkpoint:
-        vae_encoder.load_state_dict(checkpoint['encoder'])
-        vae_decoder.load_state_dict(checkpoint['decoder'])
-    else:
-        raise ValueError("VAE checkpoint must contain 'encoder' and 'decoder' keys")
-    
-    vae_encoder.eval()
-    vae_decoder.eval()
-    
-    print("VAE loaded successfully")
-    return vae_encoder, vae_decoder
 
 
 def load_sd_model_from_checkpoint(checkpoint_path, vae_checkpoint_path, device):
@@ -57,20 +33,16 @@ def load_sd_model_from_checkpoint(checkpoint_path, vae_checkpoint_path, device):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Load VAE
+
     vae_encoder, vae_decoder = load_vae(vae_checkpoint_path, device)
     
-    # Freeze VAE
     for param in vae_encoder.parameters():
         param.requires_grad = False
     for param in vae_decoder.parameters():
         param.requires_grad = False
     
-    # Create diffusion schedule (using default beta values)
     schedule = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
     
-    # Create SD model (matching sd_trainer.py API)
     sd_model = StableDiffusionConditioned(
         latent_channels=4,
         emb_dim=cfg.SD_EMB_DIM,
@@ -78,7 +50,6 @@ def load_sd_model_from_checkpoint(checkpoint_path, vae_checkpoint_path, device):
         use_initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
-    # Load model weights (use EMA if available)
     if 'ema_state_dict' in checkpoint:
         print("Loading EMA weights")
         sd_model.load_state_dict(checkpoint['ema_state_dict'])
@@ -127,11 +98,9 @@ def evaluate_test_set(
     
     print(f"Test set size: {len(test_loader.dataset)} samples")
     print(f"Inference steps: {num_inference_steps}")
-    
-    # Load CLIP model for metrics
+
     clip_model, clip_preprocess = load_clip_model(device)
-    
-    # Initialize metrics
+
     l1_loss = nn.L1Loss()
     total_l1 = 0.0
     total_psnr = 0.0
@@ -139,8 +108,7 @@ def evaluate_test_set(
     total_clip = 0.0
     total_rgb_dist = 0.0
     total_count = 0
-    
-    # Output directories
+
     output_dir = "outputs/sd"
     generated_dir = os.path.join(output_dir, "generated")
     target_dir_out = os.path.join(output_dir, "target")
@@ -168,6 +136,7 @@ def evaluate_test_set(
                 save_intermediates=False,
                 initial_images=input_image,
                 temperature=cfg.SD_SAMPLE_TEMPERATURE,
+                eta=cfg.SD_SAMPLER_ETA
             )
 
             l1 = l1_loss(generated_images, target_image).item()
