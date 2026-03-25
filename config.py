@@ -24,7 +24,7 @@ CATEGORICAL_DIMS = [5, 6]
 TOTAL_FEATURE_DIM = len(FEATURE_COLUMNS) + sum(CATEGORICAL_DIMS)
 INITIAL_IMAGE = True
 
-# gan training defaults
+# training defaults
 NOISE_DIM = 128
 FIXED_G_LR = 0.0001
 FIXED_D_LR = 0.0001
