@@ -1,12 +1,17 @@
 import argparse
 import os
 import csv
+import io
+import numpy as np
+
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import autocast, GradScaler
+
+from torchvision.transforms.functional import to_pil_image
 
 import config as cfg
 from utils.dataset import create_dataloaders
@@ -15,29 +20,24 @@ from models.encoder import VAE_Encoder
 from models.decoder import VAE_Decoder
 
 
-def setup_ddp(rank: int, world_size: int) -> None:
+def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12356'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
 
-def cleanup_ddp() -> None:
+def cleanup_ddp():
     dist.destroy_process_group()
 
 
 def encode_with_kl(encoder_module, x, noise):
-    """
-    Run encoder Sequential layers manually to extract mean and log_variance
-    before reparameterization, so KL is computed correctly.
-    Returns (latent, kl_loss).
-    """
-    import torch.nn.functional as F
+
     for module in encoder_module:
         if getattr(module, 'stride', None) == (2, 2):
             x = F.pad(x, (0, 1, 0, 1))
         x = module(x)
-    # x is now (B, 8, H/8, W/8) — mean and log_variance concatenated
+    
     mean, log_variance = torch.chunk(x, 2, dim=1)
     log_variance = torch.clamp(log_variance, -30, 20)
     stdev = (log_variance.exp()).sqrt()
@@ -47,7 +47,7 @@ def encode_with_kl(encoder_module, x, noise):
     return latent, kl_loss
 
 
-def train_worker(rank: int, world_size: int, args) -> None:
+def train_worker(rank, world_size, args):
     setup_ddp(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
@@ -111,7 +111,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
         epoch_kl = 0.0
         num_batches = 0
 
-        for batch_idx, (_, __, target_img, ___) in enumerate(train_loader):
+        for batch_idx, (target_img,) in enumerate(train_loader):
             target_img = target_img.to(device)
             batch_size = target_img.shape[0]
 
@@ -160,10 +160,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
         val_tgt_kb = val_rec_kb = val_tgt_std = val_rec_std = 0.0
         val_psnr = val_ssim = 0.0
         if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
-            import io as _io
-            import math as _math
-            import numpy as _np
-            from torchvision.transforms.functional import to_pil_image
+            
 
             vae_encoder.eval()
             vae_decoder.eval()
@@ -171,7 +168,7 @@ def train_worker(rank: int, world_size: int, args) -> None:
             val_num_batches = 0
 
             with torch.no_grad():
-                for _, __, target_img, ___ in val_loader:
+                for (target_img,) in val_loader:
                     target_img = target_img.to(device)
                     B = target_img.size(0)
 
@@ -183,16 +180,15 @@ def train_worker(rank: int, world_size: int, args) -> None:
                     latents, _ = encode_with_kl(vae_encoder.module, target_img, noise)
                     reconstructed = torch.clamp(vae_decoder(latents), -1.0, 1.0)
 
-                    # Convert [-1,1] → [0,1] → PIL → PNG bytes in memory
                     tgt_01 = (target_img.cpu() + 1) / 2
                     rec_01 = (reconstructed.cpu() + 1) / 2
 
                     for i in range(B):
-                        tgt_arr = _np.array(to_pil_image(tgt_01[i].clamp(0,1)))
-                        rec_arr = _np.array(to_pil_image(rec_01[i].clamp(0,1)))
+                        tgt_arr = np.array(to_pil_image(tgt_01[i].clamp(0,1)))
+                        rec_arr = np.array(to_pil_image(rec_01[i].clamp(0,1)))
 
-                        buf_t = _io.BytesIO()
-                        buf_r = _io.BytesIO()
+                        buf_t = io.BytesIO()
+                        buf_r = io.BytesIO()
                         to_pil_image(tgt_01[i].clamp(0,1)).save(buf_t, format='PNG')
                         to_pil_image(rec_01[i].clamp(0,1)).save(buf_r, format='PNG')
 
@@ -229,7 +225,6 @@ def train_worker(rank: int, world_size: int, args) -> None:
             ])
             log_file.flush()
 
-        # Save checkpoint every VAL_EPOCH epochs
         if rank == 0 and (epoch + 1) % cfg.VAL_EPOCH == 0:
             os.makedirs("checkpoints/diffusion", exist_ok=True)
             ckpt_path = f"checkpoints/diffusion/d_vae_scale_epoch_{epoch+1}.pth"
