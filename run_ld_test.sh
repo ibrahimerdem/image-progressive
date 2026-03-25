@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 set -e
 
-# Script to run SD model test evaluation
-# Usage: ./run_sd_test.sh <sd_checkpoint_path> [vae_checkpoint_path] [device] [batch_size] [inference_steps]
-
-SD_CHECKPOINT=${1:-checkpoints/sd/sd_ddp_epoch_0050.pth}
+CHECKPOINT=${1:-""}
 VAE_CHECKPOINT=${2:-""}
 DEVICE=${3:-cuda:0}
 BATCH_SIZE=${4:-4}
 INFERENCE_STEPS=${5:-50}
 
-if [ ! -f "${SD_CHECKPOINT}" ]; then
-  echo "Error: SD checkpoint not found: ${SD_CHECKPOINT}"
+if [ ! -f "${CHECKPOINT}" ]; then
+  echo "Error: SD checkpoint not found: ${CHECKPOINT}"
   echo "Usage: ./run_sd_test.sh <sd_checkpoint> [vae_checkpoint] [device] [batch_size] [inference_steps]"
-  echo "Note: VAE checkpoint is optional, defaults to config.SD_VAE_CKPT"
+  echo "Note: VAE checkpoint is optional, defaults to config.VAE_CKPT"
   exit 1
 fi
 
@@ -29,13 +26,13 @@ if [ -d ".venv" ]; then
 fi
 
 echo "============================================"
-echo "SD Model Test Evaluation"
+echo "Test Evaluation"
 echo "============================================"
-echo "SD Checkpoint:   ${SD_CHECKPOINT}"
+echo "Checkpoint:   ${CHECKPOINT}"
 if [ -n "${VAE_CHECKPOINT}" ]; then
   echo "VAE Checkpoint:  ${VAE_CHECKPOINT}"
 else
-  echo "VAE Checkpoint:  (from config.SD_VAE_CKPT)"
+  echo "VAE Checkpoint:  (from config.VAE_CKPT)"
 fi
 echo "Device:          ${DEVICE}"
 echo "Batch Size:      ${BATCH_SIZE}"
@@ -44,15 +41,15 @@ echo "============================================"
 echo ""
 
 if [ -n "${VAE_CHECKPOINT}" ]; then
-  python sd_evaluation.py \
-    --checkpoint "${SD_CHECKPOINT}" \
+  python ld_evaluation.py \
+    --checkpoint "${CHECKPOINT}" \
     --vae_checkpoint "${VAE_CHECKPOINT}" \
     --device "${DEVICE}" \
     --batch_size "${BATCH_SIZE}" \
     --inference_steps "${INFERENCE_STEPS}"
 else
-  python sd_evaluation.py \
-    --checkpoint "${SD_CHECKPOINT}" \
+  python ld_evaluation.py \
+    --checkpoint "${CHECKPOINT}" \
     --device "${DEVICE}" \
     --batch_size "${BATCH_SIZE}" \
     --inference_steps "${INFERENCE_STEPS}"

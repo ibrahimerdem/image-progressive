@@ -7,10 +7,10 @@ from torchvision import transforms
 from PIL import Image
 import numpy as np
 
-from models.stable_diffusion import (
+from models.latent_diffusion import (
     GaussianDiffusion,
-    StableDiffusionConditioned,
-    StableDiffusionPipeline,
+    LatentDiffusionConditioned,
+    LatentDiffusionPipeline,
 )
 from models.encoder import VAE_Encoder
 from models.decoder import VAE_Decoder
@@ -31,8 +31,7 @@ def load_vae(checkpoint_path, device):
     
     print(f"Loading VAE from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Load encoder and decoder
+
     vae_encoder = VAE_Encoder().to(device)
     vae_decoder = VAE_Decoder().to(device)
     
@@ -49,56 +48,51 @@ def load_vae(checkpoint_path, device):
     return vae_encoder, vae_decoder
 
 
-def load_sd_model_from_checkpoint(checkpoint_path, vae_checkpoint_path, device):
-    print(f"Loading SD checkpoint from: {checkpoint_path}")
+def load_model_from_checkpoint(checkpoint_path, vae_checkpoint_path, device):
+    print(f"Loading checkpoint from: {checkpoint_path}")
     
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Load VAE
+
     vae_encoder, vae_decoder = load_vae(vae_checkpoint_path, device)
-    
-    # Freeze VAE
+
     for param in vae_encoder.parameters():
         param.requires_grad = False
     for param in vae_decoder.parameters():
         param.requires_grad = False
     
-    # Create diffusion schedule (using default beta values)
-    schedule = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
+    schedule = GaussianDiffusion(timesteps=cfg.TIMESTEPS).to(device)
     
-    # Create SD model (matching sd_trainer.py API)
-    sd_model = StableDiffusionConditioned(
+    model = LatentDiffusionConditioned(
         latent_channels=4,
-        emb_dim=cfg.SD_EMB_DIM,
-        base_channels=cfg.SD_BASE_CHANNELS,
+        emb_dim=cfg.EMB_DIM,
+        base_channels=cfg.BASE_CHANNELS,
         use_initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
-    
-    # Load model weights (use EMA if available)
+
     if 'ema_state_dict' in checkpoint:
         print("Loading EMA weights")
-        sd_model.load_state_dict(checkpoint['ema_state_dict'])
+        model.load_state_dict(checkpoint['ema_state_dict'])
     elif 'model_state_dict' in checkpoint:
-        sd_model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'])
     else:
-        sd_model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint)
     
-    sd_model.eval()
+    model.eval()
  
-    pipeline = StableDiffusionPipeline(
-        model=sd_model,
+    pipeline = LatentDiffusionPipeline(
+        model=model,
         schedule=schedule,
         vae_encoder=vae_encoder,
         vae_decoder=vae_decoder
     )
     
     epoch = checkpoint.get('epoch', 'unknown')
-    print(f"Successfully loaded SD model from epoch {epoch}")
+    print(f"Successfully loaded model from epoch {epoch}")
     
-    return pipeline, sd_model, schedule
+    return pipeline, model, schedule
 
 
 def evaluate_test_set(
@@ -111,7 +105,7 @@ def evaluate_test_set(
 ):
 
     print("\n" + "="*60)
-    print("EVALUATING SD MODEL ON TEST DATASET")
+    print("EVALUATING MODEL ON TEST DATASET")
     print("="*60)
 
     _, _, test_loader = create_dataloaders(
@@ -126,20 +120,17 @@ def evaluate_test_set(
     
     print(f"Test set size: {len(test_loader.dataset)} samples")
     print(f"Inference steps: {num_inference_steps}")
-    
-    # Load CLIP model for metrics
+
     clip_model, clip_preprocess = load_clip_model(device)
     
-    # Initialize metrics
     l1_loss = nn.L1Loss()
     total_l1 = 0.0
     total_psnr = 0.0
     total_ssim = 0.0
     total_clip = 0.0
     total_count = 0
-    
-    # Output directory for samples
-    output_dir = "outputs/sd"
+
+    output_dir = "outputs/diffusion"
     if save_samples:
         os.makedirs(output_dir, exist_ok=True)
     
@@ -178,17 +169,15 @@ def evaluate_test_set(
             if save_samples and batch_idx == 0:
                 num_samples = min(8, batch_size_local)
                 for i in range(num_samples):
-                    # Denormalize images (from [-1, 1] to [0, 1])
+                    
                     input_img = (input_image[i].cpu() + 1) / 2
                     generated_img = (generated_images[i].cpu() + 1) / 2
                     target_img = (target_image[i].cpu() + 1) / 2
                     
-                    # Clamp to [0, 1]
                     input_img = torch.clamp(input_img, 0, 1)
                     generated_img = torch.clamp(generated_img, 0, 1)
                     target_img = torch.clamp(target_img, 0, 1)
-                    
-                    # Convert to PIL and save
+
                     to_pil = transforms.ToPILImage()
                     
                     input_pil = to_pil(input_img)
@@ -211,7 +200,7 @@ def evaluate_test_set(
     
     # Print results
     print("\n" + "="*60)
-    print("SD MODEL TEST SET RESULTS")
+    print("MODEL TEST SET RESULTS")
     print("="*60)
     print(f"Total samples evaluated: {total_count}")
     print(f"Inference steps: {num_inference_steps}")
@@ -239,9 +228,9 @@ def evaluate_test_set(
         'time_per_sample': elapsed_time / total_count,
     }
     
-    results_file = os.path.join(output_dir, "sd_test_results.txt")
+    results_file = os.path.join(output_dir, "test_results.txt")
     with open(results_file, 'w') as f:
-        f.write("SD MODEL TEST SET EVALUATION RESULTS\n")
+        f.write("MODEL TEST SET EVALUATION RESULTS\n")
         f.write("="*60 + "\n")
         for key, value in results.items():
             f.write(f"{key}: {value}\n")
@@ -252,18 +241,18 @@ def evaluate_test_set(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Evaluation for Stable Diffusion Model")
+    parser = argparse.ArgumentParser(description="Test Evaluation for Diffusion Model")
     parser.add_argument(
         '--checkpoint',
         type=str,
         required=True,
-        help='Path to SD model checkpoint'
+        help='Path to model checkpoint'
     )
     parser.add_argument(
         '--vae_checkpoint',
         type=str,
-        default=cfg.SD_VAE_CKPT,
-        help='Path to VAE checkpoint (default: from config.SD_VAE_CKPT)'
+        default=cfg.VAE_CKPT,
+        help='Path to VAE checkpoint (default: from config.py)'
     )
     parser.add_argument(
         '--device',
@@ -307,7 +296,7 @@ def main():
     print(f"Using device: {device}")
     
     # Load model
-    pipeline, sd_model, schedule = load_sd_model_from_checkpoint(
+    pipeline, _, _ = load_model_from_checkpoint(
         args.checkpoint,
         args.vae_checkpoint,
         device

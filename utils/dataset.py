@@ -12,10 +12,9 @@ import config as cfg
 
 class CustomDataset(Dataset):
 
-    def __init__(self, split="train", use_simple_features=False):
+    def __init__(self, split="train"):
         assert split in {"train", "val", "test"}
         self.split = split
-        self.use_simple_features = use_simple_features
 
         self.img_width = cfg.IMG_WIDTH
         self.img_height = cfg.IMG_HEIGHT
@@ -107,9 +106,9 @@ def create_dataloaders(
     rank=0,
     world_size=1,
 ):
-    train_dataset = CustomDataset(split="train", use_simple_features=False)
-    val_dataset = CustomDataset(split="val", use_simple_features=False)
-    test_dataset = CustomDataset(split="test", use_simple_features=False)
+    train_dataset = CustomDataset(split="train")
+    val_dataset = CustomDataset(split="val")
+    test_dataset = CustomDataset(split="test")
 
     train_sampler = None
     val_sampler = None

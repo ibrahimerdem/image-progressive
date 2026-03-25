@@ -183,7 +183,7 @@ class DownBlock(nn.Module):
     def __init__(self, in_channels, out_channels, time_dim, feature_dim, attn):
         super().__init__()
         self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim)
-        self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
+        self.attn = AttentionBlock(out_channels, cfg.ATTENTION_HEADS) if attn else None
         self.downsample = nn.AvgPool2d(2)
 
     def forward(self, x, time_emb, feature_emb):
@@ -197,7 +197,7 @@ class UpBlock(nn.Module):
     def __init__(self, in_channels, out_channels, time_dim, feature_dim, attn):
         super().__init__()
         self.res = ResidualBlock(in_channels, out_channels, time_dim, feature_dim)
-        self.attn = AttentionBlock(out_channels, cfg.SD_ATTENTION_HEADS) if attn else None
+        self.attn = AttentionBlock(out_channels, cfg.ATTENTION_HEADS) if attn else None
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
 
     def forward(self, x, skip, time_emb, feature_emb):
@@ -275,7 +275,6 @@ class GaussianDiffusion(nn.Module):
 
         if vae_encoder is not None:
             with torch.no_grad():
-                # VAE encoder expects noise for reparameterization
                 noise_for_vae = torch.randn(
                     x_start.size(0), 4, 
                     x_start.size(2) // 8, x_start.size(3) // 8,
@@ -350,17 +349,15 @@ class GaussianDiffusion(nn.Module):
             x_prev = sqrt_alpha_bar_prev * pred_x0 + dir_xt
             img = x_prev
             if save_intermediates and step_idx % 10 == 0:
-                # Save intermediates without clamping (decoder will handle it)
                 intermediates.append((timestep.item(), img.clone()))
-        
-        # Final output: don't clamp latents, let decoder handle it
+
         final = img if latent_shape is not None else torch.clamp(img, -1.0, 1.0)
         if save_intermediates:
             return final, intermediates
         return final
 
 
-class StableDiffusionConditioned(nn.Module):
+class LatentDiffusionConditioned(nn.Module):
     def __init__(self, latent_channels=4, emb_dim=512, base_channels=64, use_initial_image=False):
         super().__init__()
         cond_dim = emb_dim * 2
@@ -407,7 +404,7 @@ class StableDiffusionConditioned(nn.Module):
         return output
 
 
-class StableDiffusionPipeline:
+class LatentDiffusionPipeline:
     def __init__(self, model, schedule, 
                  vae_encoder=None, vae_decoder=None):
         self.model = model

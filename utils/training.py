@@ -13,73 +13,7 @@ import clip
 from PIL import Image
 
 
-def save_checkpoint(
-    generator,
-    discriminator,
-    optimizer_g,
-    optimizer_d,
-    epoch,
-    loss,
-    filename,
-    scheduler_g=None,
-    scheduler_d=None,
-):
-    checkpoint = {
-        'epoch': epoch,
-        'loss': loss,
-        'generator_state_dict': generator.state_dict(),
-        'discriminator_state_dict': discriminator.state_dict(),
-        'optimizer_g_state_dict': optimizer_g.state_dict(),
-        'optimizer_d_state_dict': optimizer_d.state_dict()
-    }
-
-    if scheduler_g is not None:
-        checkpoint['scheduler_g_state_dict'] = scheduler_g.state_dict()
-    if scheduler_d is not None:
-        checkpoint['scheduler_d_state_dict'] = scheduler_d.state_dict()
-
-    torch.save(checkpoint, filename)
-    print(f"Checkpoint saved: {filename}")
-
-def load_checkpoint(
-    filename,
-    generator,
-    discriminator,
-    optimizer_g=None,
-    optimizer_d=None,
-    scheduler_g=None,
-    scheduler_d=None,
-):
-    checkpoint = torch.load(filename, map_location='cpu', weights_only=False)
-    if 'generator_state_dict' in checkpoint:
-        generator.load_state_dict(checkpoint['generator_state_dict'])
-    else:
-        generator.load_state_dict(checkpoint['model_state_dict'])
-
-    if 'discriminator_state_dict' in checkpoint:
-        discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
-    else:
-        print("Warning: discriminator state not found in checkpoint; using current weights.")
-
-    if optimizer_g is not None:
-        if "optimizer_g_state_dict" in checkpoint:
-            optimizer_g.load_state_dict(checkpoint['optimizer_g_state_dict'])
-    if optimizer_d is not None:
-        if 'optimizer_d_state_dict' in checkpoint:
-            optimizer_d.load_state_dict(checkpoint['optimizer_d_state_dict'])
-
-    if scheduler_g is not None and 'scheduler_g_state_dict' in checkpoint:
-        scheduler_g.load_state_dict(checkpoint['scheduler_g_state_dict'])
-    if scheduler_d is not None and 'scheduler_d_state_dict' in checkpoint:
-        scheduler_d.load_state_dict(checkpoint['scheduler_d_state_dict'])
-
-    epoch = checkpoint.get('epoch', 0)
-    loss = checkpoint.get('loss', 0.0)
-
-    print(f"Checkpoint loaded: {filename} (epoch {epoch})")
-    return epoch, loss
-
-def denormalize_image(image: torch.Tensor) -> torch.Tensor:
+def denormalize_image(image):
     return (image + 1) / 2
 
 def calculate_psnr(img1, img2):
@@ -126,18 +60,16 @@ def visualize_results(
         axes = axes.reshape(1, -1)
     
     for i in range(num_samples):
-        # Detach and denormalize images
+     
         initial = denormalize_image(initial_images[i].detach()).cpu().permute(1, 2, 0)
         generated = denormalize_image(generated_images[i].detach()).cpu().permute(1, 2, 0)
         target = denormalize_image(target_images[i].detach()).cpu().permute(1, 2, 0)
-        
-        # Convert to float32 and clip to [0, 1]
+
         initial = np.clip(initial.float().numpy(), 0, 1).astype(np.float32)
         generated = np.clip(generated.float().numpy(), 0, 1).astype(np.float32)
         target = np.clip(target.float().numpy(), 0, 1).astype(np.float32)
-        
-        # Plot
-        axes[i, 0]. imshow(initial)
+
+        axes[i, 0].imshow(initial)
         axes[i, 0].set_title('Initial Image')
         axes[i, 0].axis('off')
         
@@ -315,18 +247,15 @@ def save_diffusion_intermediates(intermediates, sample_dir, epoch, sample_idx=0)
 
 def calculate_avg_rgb_distance(fake_images, real_images):
 
-    # Convert from [-1, 1] to [0, 1]
     fake_01 = (fake_images + 1.0) / 2.0
     real_01 = (real_images + 1.0) / 2.0
 
-    # Calculate mean RGB values per image: [B, C, H, W] -> [B, C]
-    fake_mean_rgb = fake_01.mean(dim=[2, 3])  # Average over spatial dimensions
+
+    fake_mean_rgb = fake_01.mean(dim=[2, 3])  
     real_mean_rgb = real_01.mean(dim=[2, 3])
 
-    # Calculate Euclidean distance in RGB space
     rgb_dist = torch.sqrt(((fake_mean_rgb - real_mean_rgb) ** 2).sum(dim=1))  # [B]
 
-    # Scale to 0-255 range and return average
     rgb_dist_255 = rgb_dist * 255.0
 
     return rgb_dist_255.mean().item()
