@@ -103,7 +103,6 @@ class Generator(nn.Module):
         self.deconv3 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(128)
 
-        # Self-attention at 32x32 resolution (moved here to save memory)
         self.attn = SelfAttention(128)
 
         # deconv4: 32x32x128 -> 64x64x64
@@ -133,10 +132,8 @@ class Generator(nn.Module):
             # Concatenate: [B, num_features * embed_dim] + [B, num_features * embed_dim]
             combined_emb = torch.cat([feature_emb, image_emb], dim=1)
         else:
-            # Use only feature embedding
             combined_emb = feature_emb
 
-        # Add noise
         noise_flat = noise.view(noise.shape[0], -1)  # [B, noise_dim]
         combined_features = torch.cat([noise_flat, combined_emb], dim=1)  # [B, noise_dim + emb_dim]
 
@@ -147,8 +144,7 @@ class Generator(nn.Module):
         z = F.relu(self.bn1(self.deconv1(z)))  # [B, 512, 8, 8]
         z = F.relu(self.bn2(self.deconv2(z)))  # [B, 256, 16, 16]
         z = F.relu(self.bn3(self.deconv3(z)))  # [B, 128, 32, 32]
-        
-        # Apply self-attention at 32x32 resolution (saves memory)
+
         z = self.attn(z)  # [B, 128, 32, 32]
         
         z = F.relu(self.bn4(self.deconv4(z)))  # [B, 64, 64, 64]     
@@ -192,7 +188,6 @@ class Discriminator(nn.Module):
         self.bn5 = nn.BatchNorm2d(512)
         self.relu5 = nn.LeakyReLU(0.2, inplace=False)
 
-        # At 16x16 resolution: 512 image features + 4608 features per spatial location
         self.output = nn.Conv2d(512 + feature_emb_dim, 1, 4, 1, 0, bias=False)
         self.sigmoid = nn.Sigmoid()
 

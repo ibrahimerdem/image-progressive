@@ -34,10 +34,11 @@ def train(
     version=None
 ):
 
-    save_dir = "checkpoints"
+    save_dir = os.path.join("checkpoints", "gan")
     log_dir = os.path.join(save_dir, "logs")
     sample_dir = os.path.join(save_dir, "samples")
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
     os.makedirs(sample_dir, exist_ok=True)
 
     model_name = name if name else "model"
@@ -69,7 +70,6 @@ def train(
         else:
             print(f"Checkpoint path {checkpoint_path} not found, starting from scratch")
 
-    # Prepare CLIP for validation metrics
     clip_model, clip_preprocess = load_clip_model(device)
 
     for epoch in range(start_epoch + 1, start_epoch + num_epochs + 1):
@@ -90,7 +90,6 @@ def train(
             embeddings = input_feat.to(device)
             batch_size = images.size(0)
 
-            # --- Train Discriminator ---
             d_optimizer.zero_grad()
 
             noise = torch.randn(batch_size, cfg.NOISE_DIM, 1, 1, device=device)
@@ -109,7 +108,6 @@ def train(
             d_loss.backward()
             d_optimizer.step()
 
-            # --- Train Generator ---
             g_optimizer.zero_grad()
 
             noise = torch.randn(batch_size, cfg.NOISE_DIM, 1, 1, device=device)
@@ -140,7 +138,6 @@ def train(
         avg_g_loss = epoch_g_loss / len(train_loader)
 
         if (val_loader is not None) and (cfg.VAL_EPOCH <= 1 or (epoch) % cfg.VAL_EPOCH == 0):
-            # --- Validation: reconstruction + CLIP score + PSNR/SSIM + RGB distance ---
             val_l1_total = 0.0
             val_psnr_sum = 0.0
             val_ssim_sum = 0.0
@@ -153,7 +150,7 @@ def train(
 
             with torch.no_grad():
                 for val_batch_idx, (v_input_image, v_input_feat, v_target_image, _) in enumerate(val_loader):
-                    # Always use initial image (required)
+
                     v_input_image = v_input_image.to(device)
 
                     v_images = v_target_image.to(device)
@@ -163,25 +160,20 @@ def train(
                     noise = torch.randn(bs, cfg.NOISE_DIM, 1, 1, device=device)
                     v_fake = generator(noise, v_embeddings, v_input_image)
 
-                    # Reconstruction L1
                     val_l1 = l1_loss(v_fake, v_images).item()
                     val_l1_total += val_l1 * bs
 
-                    # PSNR / SSIM (batch-averaged, weight by batch size)
                     batch_psnr = calculate_psnr(v_fake, v_images)
                     batch_ssim = calculate_ssim(v_fake, v_images)
                     val_psnr_sum += batch_psnr * bs
                     val_ssim_sum += batch_ssim * bs
 
-                    # CLIP similarity
                     clip_sum_batch, _ = compute_clip_metrics_batch(v_fake, v_images, clip_model, clip_preprocess, device)
                     val_clip_sum += clip_sum_batch
-                    
-                    # Average RGB distance
+
                     rgb_dist = calculate_avg_rgb_distance(v_fake, v_images)
                     val_rgb_dist_sum += rgb_dist * bs
 
-                    # Save random sample pairs once per validation
                     if val_batch_idx == 0:
                         save_random_sample_pairs(
                             v_input_image if v_input_image is not None else v_images,
@@ -223,7 +215,7 @@ def train(
                 }
             )
         else:
-            # Log train-only metrics
+
             elapsed = time.time() - start_time
             print(
                 f"Epoch [{epoch}/{start_epoch + num_epochs}] - "
@@ -239,7 +231,6 @@ def train(
                 }
             )
 
-        # Optional: save checkpoint every epoch (user can thin these later)
         ckpt_path = os.path.join(save_dir, f"{model_name}_{ver}_epoch_{epoch}.pth")
         checkpoint = {
             "epoch": epoch,
@@ -278,7 +269,6 @@ def _ddp_train_worker(
     _setup_ddp(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
-    # Reduce workers for DDP to prevent deadlocks (max 2 per GPU)
     num_workers = min(cfg.NUM_WORKERS, 2)
     
     train_loader, val_loader, _ = create_dataloaders(
@@ -332,7 +322,7 @@ def _ddp_train_worker(
     generator = DDP(generator, device_ids=[rank], find_unused_parameters=False)
     discriminator = DDP(discriminator, device_ids=[rank])
 
-    save_dir = "checkpoints"
+    save_dir = os.path.join("checkpoints", "gan")
     log_dir = os.path.join(save_dir, "logs")
     sample_dir = os.path.join(save_dir, "samples")
     if rank == 0:
@@ -364,14 +354,12 @@ def _ddp_train_worker(
         for input_image, input_feat, target_image, wrong_image in train_loader:
             batch_time = time.time()
 
-            # Non-blocking transfers to prevent synchronization issues
             input_image = input_image.to(device, non_blocking=True)
             images = target_image.to(device, non_blocking=True)
             wrong_images = wrong_image.to(device, non_blocking=True)
             embeddings = input_feat.to(device, non_blocking=True)
             batch_size_local = images.size(0)
 
-            # --- Train Discriminator ---
             d_optimizer.zero_grad()
 
             noise = torch.randn(batch_size_local, cfg.NOISE_DIM, 1, 1, device=device)
@@ -388,11 +376,10 @@ def _ddp_train_worker(
 
             d_loss = d_loss_real + d_loss_wrong + d_loss_fake
             d_loss.backward()
-            # Add gradient clipping to prevent gradient explosion
+
             torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
             d_optimizer.step()
 
-            # --- Train Generator ---
             g_optimizer.zero_grad()
 
             noise = torch.randn(batch_size_local, cfg.NOISE_DIM, 1, 1, device=device)
@@ -407,7 +394,7 @@ def _ddp_train_worker(
 
             g_loss = g_bce + g_l1 + g_l2
             g_loss.backward()
-            # Add gradient clipping to prevent gradient explosion
+
             torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
             g_optimizer.step()
 
@@ -415,10 +402,8 @@ def _ddp_train_worker(
             epoch_g_loss += g_loss.item()
             num_batches += 1
 
-        # Synchronize all processes before aggregating metrics
         dist.barrier()
-        
-        # All-reduce train losses across ranks
+
         loss_tensor = torch.tensor([epoch_d_loss, epoch_g_loss, num_batches], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
         total_d_loss, total_g_loss, total_batches = loss_tensor.tolist()
@@ -426,7 +411,7 @@ def _ddp_train_worker(
         avg_g_loss = total_g_loss / max(total_batches, 1)
 
         if (val_loader is not None) and (cfg.VAL_EPOCH <= 1 or epoch % cfg.VAL_EPOCH == 0):
-            # --- Validation metrics ---
+
             generator.eval()
             discriminator.eval()
 
@@ -439,7 +424,7 @@ def _ddp_train_worker(
 
             with torch.no_grad():
                 for val_batch_idx, (v_input_image, v_input_feat, v_target_image, _) in enumerate(val_loader):
-                    # Non-blocking transfers for validation
+
                     v_input_image = v_input_image.to(device, non_blocking=True)
                     v_images = v_target_image.to(device, non_blocking=True)
                     v_embeddings = v_input_feat.to(device, non_blocking=True)
@@ -458,8 +443,7 @@ def _ddp_train_worker(
 
                     clip_sum_batch, _ = compute_clip_metrics_batch(v_fake, v_images, clip_model, clip_preprocess, device)
                     val_clip_sum += clip_sum_batch
-                    
-                    # Average RGB distance
+
                     rgb_dist = calculate_avg_rgb_distance(v_fake, v_images)
                     val_rgb_dist_sum += rgb_dist * bs
 
@@ -476,7 +460,6 @@ def _ddp_train_worker(
 
                     val_count += bs
 
-            # Synchronize all processes before aggregating validation metrics
             dist.barrier()
             
             val_tensor = torch.tensor(
@@ -523,7 +506,6 @@ def _ddp_train_worker(
                     }
                 )
 
-                # Save checkpoint after validation
                 val_ckpt = os.path.join(save_dir, f"{model_name}_{ver}_epoch_{epoch}.pth")
                 torch.save(
                     {
@@ -630,11 +612,9 @@ def main() -> None:
         )
         return
 
-    # Single-GPU / CPU path
     device_index = device_ids[0] if torch.cuda.is_available() else None
     device = torch.device(f"cuda:{device_index}" if device_index is not None else "cpu")
 
-    # Build dataloaders
     train_loader, val_loader, _ = create_dataloaders(
         batch_size=cfg.BATCH_SIZE_PER_GPU,
         num_workers=cfg.NUM_WORKERS,
@@ -642,7 +622,7 @@ def main() -> None:
         distributed=False,
     )
 
-    # Dataset / feature info for the user
+
     train_dataset = train_loader.dataset
     val_dataset = val_loader.dataset
 

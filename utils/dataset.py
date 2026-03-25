@@ -16,7 +16,6 @@ class CustomDataset(Dataset):
         assert split in {"train", "val", "test"}
         self.split = split
 
-        # Image & feature config
         self.img_width = cfg.IMG_WIDTH
         self.img_height = cfg.IMG_HEIGHT
         self.imgh_width = cfg.TARGET_WIDTH
@@ -64,10 +63,9 @@ class CustomDataset(Dataset):
         continuous_cols = [c for c in feature_cols if c not in categorical_features]
 
         continuous_data = df[continuous_cols].astype(np.float32)
-        
-        # Optional normalization to [-1, 1] for continuous features
+
         if cfg.FEATURE_NORMALIZATION and cfg.FEATURE_MAXS and cfg.FEATURE_MINS:
-            # Build mapping for continuous features only
+
             continuous_mins = []
             continuous_maxs = []
             for col in continuous_cols:
@@ -88,23 +86,18 @@ class CustomDataset(Dataset):
         else:
             continuous_data = continuous_data.values
         
-        # Process categorical features with one-hot encoding
         categorical_data_list = []
         if categorical_features:
             for i, cat_col in enumerate(categorical_features):
-                # Get unique categories and create mapping
                 unique_cats = sorted(df[cat_col].unique())
                 cat_to_idx = {cat: idx for idx, cat in enumerate(unique_cats)}
-                
-                # Convert to indices
+
                 indices = df[cat_col].map(cat_to_idx).values
-                
-                # One-hot encode
+
                 num_categories = len(unique_cats)
                 one_hot = np.eye(num_categories, dtype=np.float32)[indices]
                 categorical_data_list.append(one_hot)
-        
-        # Combine continuous and categorical features
+
         if categorical_data_list:
             categorical_data = np.concatenate(categorical_data_list, axis=1)
             input_array = np.concatenate([continuous_data, categorical_data], axis=1).astype(np.float32)
@@ -163,14 +156,13 @@ class CustomDataset(Dataset):
 
 
 def create_dataloaders(
-    batch_size: int,
-    num_workers: int = 4,
-    pin_memory: bool = True,
-    distributed: bool = False,
-    rank: int = 0,
-    world_size: int = 1,
+    batch_size,
+    num_workers=4,
+    pin_memory=True,
+    distributed= False,
+    rank=0,
+    world_size=1,
 ):
-    """Build train/val/test loaders from the shared data/ layout."""
 
     train_dataset = CustomDataset(split="train")
     val_dataset = CustomDataset(split="val")
