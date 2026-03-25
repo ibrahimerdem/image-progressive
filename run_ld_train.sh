@@ -25,11 +25,11 @@ fi
 export CUDA_VISIBLE_DEVICES="${DEVICE_IDS}"
 echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
-echo "Launching Stable Diffusion training for ${EPOCHS} epochs (retrain=${RETRAIN}, checkpoint=${CHECKPOINT})"
+echo "Launching training for ${EPOCHS} epochs (retrain=${RETRAIN}, checkpoint=${CHECKPOINT})"
 
 EXTRA_ARGS=()
 if [ -n "${CHECKPOINT}" ]; then
   EXTRA_ARGS+=(--checkpoint "${CHECKPOINT}")
 fi
 
-python sd_trainer.py --epochs "${EPOCHS}" --retrain "${RETRAIN}" "${EXTRA_ARGS[@]}"
+python ld_trainer.py --epochs "${EPOCHS}" --retrain "${RETRAIN}" "${EXTRA_ARGS[@]}"

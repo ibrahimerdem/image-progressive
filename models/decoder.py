@@ -43,6 +43,7 @@ class VAE_AttentionBlock(nn.Module):
         # (Batch_Size, Features, Height, Width)
         return x 
 
+
 class VAE_ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -82,6 +83,7 @@ class VAE_ResidualBlock(nn.Module):
         
         # (Batch_Size, Out_Channels, Height, Width) -> (Batch_Size, Out_Channels, Height, Width)
         return x + self.residual_layer(residue)
+
 
 class VAE_Decoder(nn.Sequential):
     def __init__(self):

@@ -4,16 +4,13 @@ import time
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from PIL import Image
-import numpy as np
 
-from models.stable_diffusion import (
+from models.latent_diffusion import (
     GaussianDiffusion,
-    StableDiffusionConditioned,
-    StableDiffusionPipeline,
+    LatentDiffusionConditioned,
+    LatentDiffusionPipeline,
 )
-from models.encoder import VAE_Encoder
-from models.decoder import VAE_Decoder
+
 from utils.training import (
     calculate_avg_rgb_distance,
     calculate_psnr,
@@ -21,13 +18,14 @@ from utils.training import (
     load_clip_model,
     compute_clip_metrics_batch,
 )
+
 from utils.dataset import create_dataloaders
-from vae_loader import load_vae
+from utils.vae_loader import load_vae
 import config as cfg
 
 
-def load_sd_model_from_checkpoint(checkpoint_path, vae_checkpoint_path, device):
-    print(f"Loading SD checkpoint from: {checkpoint_path}")
+def load_model_from_checkpoint(checkpoint_path, vae_checkpoint_path, device):
+    print(f"Loading checkpoint from: {checkpoint_path}")
     
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -41,36 +39,36 @@ def load_sd_model_from_checkpoint(checkpoint_path, vae_checkpoint_path, device):
     for param in vae_decoder.parameters():
         param.requires_grad = False
     
-    schedule = GaussianDiffusion(timesteps=cfg.SD_TIMESTEPS).to(device)
+    schedule = GaussianDiffusion(timesteps=cfg.TIMESTEPS).to(device)
     
-    sd_model = StableDiffusionConditioned(
+    model = LatentDiffusionConditioned(
         latent_channels=4,
-        emb_dim=cfg.SD_EMB_DIM,
-        base_channels=cfg.SD_BASE_CHANNELS,
+        emb_dim=cfg.EMB_DIM,
+        base_channels=cfg.BASE_CHANNELS,
         use_initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
     if 'ema_state_dict' in checkpoint:
         print("Loading EMA weights")
-        sd_model.load_state_dict(checkpoint['ema_state_dict'])
+        model.load_state_dict(checkpoint['ema_state_dict'])
     elif 'model_state_dict' in checkpoint:
-        sd_model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'])
     else:
-        sd_model.load_state_dict(checkpoint)
+        model.load_state_dict(checkpoint)
     
-    sd_model.eval()
+    model.eval()
  
-    pipeline = StableDiffusionPipeline(
-        model=sd_model,
+    pipeline = LatentDiffusionPipeline(
+        model=model,
         schedule=schedule,
         vae_encoder=vae_encoder,
         vae_decoder=vae_decoder
     )
     
     epoch = checkpoint.get('epoch', 'unknown')
-    print(f"Successfully loaded SD model from epoch {epoch}")
+    print(f"Successfully loaded model from epoch {epoch}")
     
-    return pipeline, sd_model, schedule
+    return pipeline, model, schedule
 
 
 def evaluate_test_set(
@@ -79,11 +77,11 @@ def evaluate_test_set(
     batch_size=8,
     num_workers=2,
     save_samples=True,
-    num_inference_steps=cfg.SD_SAMPLE_STEPS,
+    num_inference_steps=50,
 ):
 
     print("\n" + "="*60)
-    print("EVALUATING SD MODEL ON TEST DATASET")
+    print("EVALUATING MODEL ON TEST DATASET")
     print("="*60)
 
     _, _, test_loader = create_dataloaders(
@@ -135,8 +133,8 @@ def evaluate_test_set(
                 steps=num_inference_steps,
                 save_intermediates=False,
                 initial_images=input_image,
-                temperature=cfg.SD_SAMPLE_TEMPERATURE,
-                eta=cfg.SD_SAMPLER_ETA
+                temperature=cfg.SAMPLE_TEMPERATURE,
+                eta=cfg.SAMPLER_ETA
             )
 
             l1 = l1_loss(generated_images, target_image).item()
@@ -180,7 +178,7 @@ def evaluate_test_set(
     
     # Print results
     print("\n" + "="*60)
-    print("SD MODEL TEST SET RESULTS")
+    print("TEST RESULTS")
     print("="*60)
     print(f"Total samples evaluated: {total_count}")
     print(f"Inference steps: {num_inference_steps}")
@@ -212,9 +210,9 @@ def evaluate_test_set(
         'time_per_sample': elapsed_time / total_count,
     }
     
-    results_file = os.path.join(output_dir, "sd_test_results.txt")
+    results_file = os.path.join(output_dir, "test_results.txt")
     with open(results_file, 'w') as f:
-        f.write("SD MODEL TEST SET EVALUATION RESULTS\n")
+        f.write("TEST SET EVALUATION RESULTS\n")
         f.write("="*60 + "\n")
         for key, value in results.items():
             f.write(f"{key}: {value}\n")
@@ -225,18 +223,18 @@ def evaluate_test_set(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Evaluation for Stable Diffusion Model")
+    parser = argparse.ArgumentParser(description="Test Evaluation")
     parser.add_argument(
         '--checkpoint',
         type=str,
         required=True,
-        help='Path to SD model checkpoint'
+        help='Path to model checkpoint'
     )
     parser.add_argument(
         '--vae_checkpoint',
         type=str,
-        default=cfg.SD_VAE_CKPT,
-        help='Path to VAE checkpoint (default: from config.SD_VAE_CKPT)'
+        default=cfg.VAE_CKPT,
+        help='Path to VAE checkpoint'
     )
     parser.add_argument(
         '--no_save_samples',
@@ -245,30 +243,27 @@ def main():
     )
     
     args = parser.parse_args()
-    
-    # Setup device
+
     device_str = f"cuda:{cfg.DEVICE_IDS[0]}" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_str)
     
     print(f"Using device: {device}")
     print(f"Batch size:   {cfg.BATCH_SIZE_PER_GPU} (from config)")
-    print(f"Inference steps: {cfg.SD_SAMPLE_STEPS} (from config)")
+    print(f"Inference steps: {cfg.SAMPLE_STEPS} (from config)")
     
-    # Load model
-    pipeline, sd_model, schedule = load_sd_model_from_checkpoint(
+    pipeline, _, _ = load_model_from_checkpoint(
         args.checkpoint,
         args.vae_checkpoint,
         device
     )
-    
-    # Evaluate on test set
+
     evaluate_test_set(
         pipeline,
         device,
         batch_size=cfg.BATCH_SIZE_PER_GPU,
         num_workers=cfg.NUM_WORKERS,
         save_samples=not args.no_save_samples,
-        num_inference_steps=cfg.SD_SAMPLE_STEPS
+        num_inference_steps=cfg.SAMPLE_STEPS
     )
 
 

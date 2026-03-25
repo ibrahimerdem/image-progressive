@@ -1,10 +1,9 @@
 import torch
 from models.encoder import VAE_Encoder
 from models.decoder import VAE_Decoder
-import os
 
 
-def remap_hf_encoder_keys(hf_sd: dict) -> dict:
+def remap_hf_encoder_keys(hf_sd):
     """
     Maps HuggingFace Diffusers VAE encoder keys → your sequential VAE_Encoder keys.
     
@@ -49,17 +48,14 @@ def remap_hf_encoder_keys(hf_sd: dict) -> dict:
         """Map an AttentionBlock. HF uses query/key/value separately; yours uses in_proj (combined)."""
         mapping[f"{src_prefix}.group_norm.weight"] = f"{dst_idx}.groupnorm.weight"
         mapping[f"{src_prefix}.group_norm.bias"]   = f"{dst_idx}.groupnorm.bias"
-        # HF stores Q, K, V separately — must be concatenated into in_proj
-        # Handled manually below; mark with special sentinel
+
         mapping[f"__attn_qkv__{src_prefix}"] = f"{dst_idx}.attention.in_proj"
         mapping[f"{src_prefix}.proj_attn.weight"] = f"{dst_idx}.attention.out_proj.weight"
         mapping[f"{src_prefix}.proj_attn.bias"]   = f"{dst_idx}.attention.out_proj.bias"
 
-    # ── conv_in ──────────────────────────────────────────────────────────
     mapping["conv_in.weight"] = "0.weight"
     mapping["conv_in.bias"]   = "0.bias"
 
-    # ── down_blocks ──────────────────────────────────────────────────────
     res("down_blocks.0.resnets.0", 1)
     res("down_blocks.0.resnets.1", 2)
     mapping["down_blocks.0.downsamplers.0.conv.weight"] = "3.weight"
@@ -78,12 +74,10 @@ def remap_hf_encoder_keys(hf_sd: dict) -> dict:
     res("down_blocks.3.resnets.0", 10)
     res("down_blocks.3.resnets.1", 11)
 
-    # ── mid_block ────────────────────────────────────────────────────────
     res("mid_block.resnets.0", 12)
     attn("mid_block.attentions.0", 13)
     res("mid_block.resnets.1", 14)
 
-    # ── output ───────────────────────────────────────────────────────────
     mapping["conv_norm_out.weight"] = "15.weight"
     mapping["conv_norm_out.bias"]   = "15.bias"
     mapping["conv_out.weight"]      = "17.weight"
@@ -91,16 +85,11 @@ def remap_hf_encoder_keys(hf_sd: dict) -> dict:
     mapping["quant_conv.weight"]    = "18.weight"
     mapping["quant_conv.bias"]      = "18.bias"
 
-
-    # ── Build remapped state dict ─────────────────────────────────────────
     new_sd = {}
     for hf_key, hf_val in hf_sd.items():
         if hf_key in mapping:
             new_sd[mapping[hf_key]] = hf_val
-        # Skip sentinel keys — handled below
 
-    # ── Merge Q/K/V → in_proj ────────────────────────────────────────────
-    # Your SelfAttention.in_proj = Linear(d, 3*d) storing [W_q; W_k; W_v]
     for sentinel, dst_prefix in mapping.items():
         if not sentinel.startswith("__attn_qkv__"):
             continue
@@ -115,7 +104,7 @@ def remap_hf_encoder_keys(hf_sd: dict) -> dict:
     return new_sd
 
 
-def remap_hf_decoder_keys(hf_sd: dict) -> dict:
+def remap_hf_decoder_keys(hf_sd):
     """
     Maps HuggingFace Diffusers VAE decoder keys → your sequential VAE_Decoder keys.
 
@@ -169,18 +158,15 @@ def remap_hf_decoder_keys(hf_sd: dict) -> dict:
         mapping[f"{src_prefix}.proj_attn.weight"]  = f"{dst_idx}.attention.out_proj.weight"
         mapping[f"{src_prefix}.proj_attn.bias"]    = f"{dst_idx}.attention.out_proj.bias"
 
-    # ── post_quant_conv + conv_in ─────────────────────────────────────────
     mapping["post_quant_conv.weight"] = "0.weight"
     mapping["post_quant_conv.bias"]   = "0.bias"
     mapping["conv_in.weight"]         = "1.weight"
     mapping["conv_in.bias"]           = "1.bias"
 
-    # ── mid_block ────────────────────────────────────────────────────────
     res("mid_block.resnets.0", 2)
     attn("mid_block.attentions.0", 3)
     res("mid_block.resnets.1", 4)
 
-    # ── up_blocks ────────────────────────────────────────────────────────
     res("up_blocks.0.resnets.0", 5)
     res("up_blocks.0.resnets.1", 6)
     res("up_blocks.0.resnets.2", 7)
@@ -203,19 +189,16 @@ def remap_hf_decoder_keys(hf_sd: dict) -> dict:
     res("up_blocks.3.resnets.1", 21)
     res("up_blocks.3.resnets.2", 22)
 
-    # ── output ───────────────────────────────────────────────────────────
     mapping["conv_norm_out.weight"] = "23.weight"
     mapping["conv_norm_out.bias"]   = "23.bias"
     mapping["conv_out.weight"]      = "25.weight"
     mapping["conv_out.bias"]        = "25.bias"
 
-    # ── Build remapped state dict ─────────────────────────────────────────
     new_sd = {}
     for hf_key, hf_val in hf_sd.items():
         if hf_key in mapping:
             new_sd[mapping[hf_key]] = hf_val
 
-    # ── Merge Q/K/V → in_proj ────────────────────────────────────────────
     for sentinel, dst_prefix in mapping.items():
         if not sentinel.startswith("__attn_qkv__"):
             continue
@@ -233,7 +216,6 @@ def remap_hf_decoder_keys(hf_sd: dict) -> dict:
 def load_vae(checkpoint_path: str, device: torch.device):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    # Unwrap common wrappers
     for wrapper in ("state_dict", "model_state_dict"):
         if isinstance(ckpt, dict) and wrapper in ckpt \
                 and "encoder" not in ckpt and "decoder" not in ckpt:
@@ -244,21 +226,18 @@ def load_vae(checkpoint_path: str, device: torch.device):
     vae_encoder = VAE_Encoder().to(device)
     vae_decoder = VAE_Decoder().to(device)
 
-    # ── Format 1: custom {"encoder": sd, "decoder": sd} ──────────────────
     if "encoder" in ckpt and "decoder" in ckpt \
             and isinstance(ckpt["encoder"], dict):
         vae_encoder.load_state_dict(ckpt["encoder"], strict=True)
         vae_decoder.load_state_dict(ckpt["decoder"], strict=True)
         print("[VAE] Loaded: custom {encoder, decoder} format")
 
-    # ── Format 2: "encoder.down_blocks.*" — HF keys with prefix ──────────
     elif any(k.startswith("encoder.down_blocks.") for k in keys):
         enc_hf = {k[len("encoder."):]: v for k, v in ckpt.items()
                 if k.startswith("encoder.")}
         dec_hf = {k[len("decoder."):]: v for k, v in ckpt.items()
                 if k.startswith("decoder.")}
 
-        # quant_conv / post_quant_conv live at top level without prefix
         if "quant_conv.weight" in ckpt:
             enc_hf["quant_conv.weight"] = ckpt["quant_conv.weight"]
             enc_hf["quant_conv.bias"]   = ckpt["quant_conv.bias"]
@@ -274,7 +253,6 @@ def load_vae(checkpoint_path: str, device: torch.device):
         if miss_d: print(f"[VAE] Decoder missing: {miss_d}")
         print("[VAE] Loaded: HF-prefixed format (encoder.down_blocks.*)")
 
-    # ── Format 3: bare HF keys "down_blocks.*" ───────────────────────────
     elif any(k.startswith("down_blocks.") for k in keys):
         enc_sd = remap_hf_encoder_keys(ckpt)
         dec_sd = remap_hf_decoder_keys(ckpt)
@@ -284,7 +262,6 @@ def load_vae(checkpoint_path: str, device: torch.device):
         if miss_d: print(f"[VAE] Decoder missing: {miss_d}")
         print("[VAE] Loaded: bare HF format (down_blocks.*)")
 
-    # ── Format 4: full SD ckpt "first_stage_model.*" ─────────────────────
     elif any(k.startswith("first_stage_model.") for k in keys):
         enc_hf = {k[len("first_stage_model.encoder."):]: v for k, v in ckpt.items()
                   if k.startswith("first_stage_model.encoder.")}
@@ -294,7 +271,7 @@ def load_vae(checkpoint_path: str, device: torch.device):
         dec_sd = remap_hf_decoder_keys(dec_hf)
         vae_encoder.load_state_dict(enc_sd, strict=False)
         vae_decoder.load_state_dict(dec_sd, strict=False)
-        print("[VAE] Loaded: full SD checkpoint (first_stage_model.*)")
+        print("[VAE] Loaded: full checkpoint (first_stage_model.*)")
 
     else:
         sample = list(ckpt.keys())[:8]
