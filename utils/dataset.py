@@ -11,11 +11,9 @@ import config as cfg
 
 
 class CustomDataset(Dataset):
-
-    def __init__(self, split="train", use_simple_features=False):
+    def __init__(self, split="train"):
         assert split in {"train", "val", "test"}
         self.split = split
-        self.use_simple_features = use_simple_features
 
         self.img_width = cfg.IMG_WIDTH
         self.img_height = cfg.IMG_HEIGHT
@@ -35,7 +33,10 @@ class CustomDataset(Dataset):
 
         self.feature_cols = cfg.FEATURE_COLUMNS
         
-        self.input_data, self.initial_paths, self.target_paths = self._load_data()
+        self.input_data, self.initial_paths, self.target_paths, self.target_data = self._load_data()
+
+        self.feature_min_max = (cfg.FEATURE_MINS, cfg.FEATURE_MAXS)
+        self.target_min_max = (cfg.TARGET_MINS, cfg.TARGET_MAXS)
 
         self.transform_initial = transforms.Compose([
             transforms.Resize((self.img_height, self.img_width)),
@@ -49,35 +50,48 @@ class CustomDataset(Dataset):
             transforms.Normalize(mean=[0.5] * self.channels, std=[0.5] * self.channels),
         ])
 
+        if self.feature_min_max:
+            self.feature_mins = torch.tensor(self.feature_min_max[0], dtype=torch.float32)
+            self.feature_maxs = torch.tensor(self.feature_min_max[1], dtype=torch.float32)
+
+        if self.target_min_max:
+            self.target_mins = torch.tensor(self.target_min_max[0], dtype=torch.float32)
+            self.target_maxs = torch.tensor(self.target_min_max[1], dtype=torch.float32)
+
     def _load_data(self):
         df = pd.read_csv(self.csv_path)
-        
-        maxs = np.array(cfg.FEATURE_MAXS, dtype=np.float32)
-        mins = np.array(cfg.FEATURE_MINS, dtype=np.float32)
-        
+                
         input_data = []
         initial_paths = []
         target_paths = []
+        target_data = []
         
         for _, row in df.iterrows():
             features = row[self.feature_cols].values.astype(np.float32)
-    
-            scaled_feats = (features - mins) / (maxs - mins)
+            scaled_feats = (features - self.feature_mins.numpy()) / (self.feature_maxs.numpy() - self.feature_mins.numpy())
             scaled_feats = np.clip(scaled_feats, 0, 1)
+
+            target = row[self.feature_cols].values.astype(np.float32)
+            scaled_target = (target - self.target_mins.numpy()) / (self.target_maxs.numpy() - self.target_mins.numpy())
+            scaled_target = np.clip(scaled_target, 0, 1)
             
             input_data.append(scaled_feats)
             initial_paths.append(row['initial_filename'])
             target_paths.append(row['target_filename'])
+            target_data.append(scaled_target)
         
         input_data = np.array(input_data, dtype=np.float32)
-        return input_data, initial_paths, target_paths
+        target_data = np.array(target_data, dtype=np.float32)
+        return input_data, initial_paths, target_paths, target_data
 
     def __len__(self):
         return len(self.initial_paths)
 
     def __getitem__(self, idx):
-        input_feat = torch.tensor(self.input_data[idx], dtype=torch.float32)
         
+        input_feat = torch.tensor(self.input_data[idx], dtype=torch.float32)
+        target_feat = torch.tensor(self.target_data[idx], dtype=torch.float32)
+
         initial_path = os.path.join(self.initial_dir, self.initial_paths[idx])
         target_path = os.path.join(self.target_dir, self.target_paths[idx])
 
@@ -87,17 +101,11 @@ class CustomDataset(Dataset):
         initial_img = self.transform_initial(initial_img)
         target_img = self.transform_target(target_img)
 
-        num_samples = len(self.initial_paths)
-        wrong_idx = np.random.randint(0, num_samples - 1)
-        if wrong_idx >= idx:
-            wrong_idx += 1
-        
-        wrong_path = os.path.join(self.target_dir, self.target_paths[wrong_idx])
-        wrong_img = Image.open(wrong_path).convert("RGB")
-        wrong_img = self.transform_target(wrong_img)
-        
-        return initial_img, input_feat, target_img, wrong_img
+        if self.transform:
+            image = self.transform(image)
 
+        return input_feat, initial_img, target_img, target_feat
+    
 
 def create_dataloaders(
     batch_size,
@@ -107,9 +115,9 @@ def create_dataloaders(
     rank=0,
     world_size=1,
 ):
-    train_dataset = CustomDataset(split="train", use_simple_features=False)
-    val_dataset = CustomDataset(split="val", use_simple_features=False)
-    test_dataset = CustomDataset(split="test", use_simple_features=False)
+    train_dataset = CustomDataset(split="train")
+    val_dataset = CustomDataset(split="val")
+    test_dataset = CustomDataset(split="test")
 
     train_sampler = None
     val_sampler = None

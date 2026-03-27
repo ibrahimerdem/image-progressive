@@ -1,7 +1,7 @@
 import os
 
-RUN_NAME = "diffusion"
-VERSION_NAME = "temperature_pretrained_vae"
+RUN_NAME = "reverse"
+VERSION_NAME = "basic"
 
 # Files
 DATA_DIR = "data"
@@ -10,41 +10,34 @@ TARGET_DIR = os.path.join(DATA_DIR, "target")
 TRAIN_CSV = os.path.join(DATA_DIR, "training_features.csv")
 VAL_CSV = os.path.join(DATA_DIR, "validation_features.csv")
 TEST_CSV = os.path.join(DATA_DIR, "test_features.csv")
+OUTPUT_DIR = os.path.join("outputs", RUN_NAME, VERSION_NAME)
 
 # Dataset
-IMG_WIDTH = 128
-IMG_HEIGHT = 128
+IMG_WIDTH = 224
+IMG_HEIGHT = 224
 TARGET_WIDTH = 512
 TARGET_HEIGHT = 512
 CHANNELS = 3
-FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_raw", "cielab_a_raw", "cielab_b_raw", "bleaching", "duration", "concentration"]
+FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_raw", "cielab_a_raw", "cielab_b_raw"]
 FEATURE_NORMALIZATION = True
-FEATURE_MINS = [5.6,15,0,16.87,-1.91,-16.75,1,1,1000]
-FEATURE_MAXS = [30,42,95,40,1.62,-0.5,4,7,7000]
-INITIAL_IMAGE = True
+FEATURE_MINS = [5.6,15,0,16.87,-1.91,-16.75]
+FEATURE_MAXS = [30,42,95,40,1.62,-0.5]
+TARGET_FEATURE_COLUMNS = ["bleaching", "duration", "concentration"]
+TARGET_MINS = [1,1,1000]
+TARGET_MAXS = [4,7,7000]
+INITIAL_IMAGE = False
+IMAGE_ENCODER = "resnet50"  # Options: "resnet50", "unet"
 
-# diffusion defaults
+# training defaults
 LR = 0.00005
-TIMESTEPS = 1000      
-SAMPLE_STEPS = 50     
-EMB_DIM = 768
-BASE_CHANNELS = 256
-VAL_EPOCH = 10
-SAMPLE_TEMPERATURE = 1.0
-SAMPLER_ETA = 1.0
-LOG_INTERVAL = 100   
-ATTENTION_HEADS = 4
-EMA_DECAY = 0.999
 GRAD_CLIP = 1.0
-DDP_TIMEOUT_MINUTES = 30
+LOG_INTERVAL = 100
+VAL_INTERVAL = 10
 
-# vae
-VAE_SCALE = 0.173
-VAE_CKPT = "checkpoints/diffusion/diffusion_pytorch_model.bin"
-FREEZE_VAE = False
 
 # ddp
 DEVICE_IDS = [0, 1]
 WORLD_SIZE = len(DEVICE_IDS)
+DDP_TIMEOUT = 30
 BATCH_SIZE_PER_GPU = 4
 NUM_WORKERS = 4
