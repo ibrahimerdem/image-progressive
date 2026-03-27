@@ -374,12 +374,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 if cfg.INITIAL_IMAGE:
                     loss_dict = diffusion.p_loss(model, targets, features,
                                                  vae_encoder=vae_encoder,
-                                                 vae_decoder=vae_decoder,
                                                  initial_images=initial_images)
                 else:
                     loss_dict = diffusion.p_loss(model, targets, features,
-                                                 vae_encoder=vae_encoder,
-                                                 vae_decoder=vae_decoder)
+                                                 vae_encoder=vae_encoder)
                 loss = loss_dict['loss']
                 loss_metrics = loss_dict.get('metrics', {})
 
