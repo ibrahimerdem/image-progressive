@@ -32,31 +32,21 @@ class CustomDataset(Dataset):
             self.csv_path = cfg.TEST_CSV
 
         self.feature_cols = cfg.FEATURE_COLUMNS
+        self.target_cols = cfg.TARGET_FEATURE_COLUMNS
         
         self.input_data, self.initial_paths, self.target_paths, self.target_data = self._load_data()
-
-        self.feature_min_max = (cfg.FEATURE_MINS, cfg.FEATURE_MAXS)
-        self.target_min_max = (cfg.TARGET_MINS, cfg.TARGET_MAXS)
 
         self.transform_initial = transforms.Compose([
             transforms.Resize((self.img_height, self.img_width)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5] * self.channels, std=[0.5] * self.channels),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
 
         self.transform_target = transforms.Compose([
             transforms.Resize((self.imgh_height, self.imgh_width)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5] * self.channels, std=[0.5] * self.channels),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
-
-        if self.feature_min_max:
-            self.feature_mins = torch.tensor(self.feature_min_max[0], dtype=torch.float32)
-            self.feature_maxs = torch.tensor(self.feature_min_max[1], dtype=torch.float32)
-
-        if self.target_min_max:
-            self.target_mins = torch.tensor(self.target_min_max[0], dtype=torch.float32)
-            self.target_maxs = torch.tensor(self.target_min_max[1], dtype=torch.float32)
 
     def _load_data(self):
         df = pd.read_csv(self.csv_path)
@@ -65,15 +55,26 @@ class CustomDataset(Dataset):
         initial_paths = []
         target_paths = []
         target_data = []
+
+        self.feature_min_max = (cfg.FEATURE_MINS, cfg.FEATURE_MAXS)
+        self.target_min_max = (cfg.TARGET_MINS, cfg.TARGET_MAXS)
+
+        if self.feature_min_max:
+            self.feature_mins = torch.tensor(self.feature_min_max[0], dtype=torch.float32)
+            self.feature_maxs = torch.tensor(self.feature_min_max[1], dtype=torch.float32)
+
+        if self.target_min_max:
+            self.target_mins = torch.tensor(self.target_min_max[0], dtype=torch.float32)
+            self.target_maxs = torch.tensor(self.target_min_max[1], dtype=torch.float32)
         
         for _, row in df.iterrows():
             features = row[self.feature_cols].values.astype(np.float32)
-            scaled_feats = (features - self.feature_mins.numpy()) / (self.feature_maxs.numpy() - self.feature_mins.numpy())
-            scaled_feats = np.clip(scaled_feats, 0, 1)
+            scaled_feats = 2 * (features - self.feature_mins.numpy()) / (self.feature_maxs.numpy() - self.feature_mins.numpy()) - 1
+            #scaled_feats = np.clip(scaled_feats, -1, 1)
 
-            target = row[self.feature_cols].values.astype(np.float32)
-            scaled_target = (target - self.target_mins.numpy()) / (self.target_maxs.numpy() - self.target_mins.numpy())
-            scaled_target = np.clip(scaled_target, 0, 1)
+            target = row[self.target_cols].values.astype(np.float32)
+            scaled_target = 2 * (target - self.target_mins.numpy()) / (self.target_maxs.numpy() - self.target_mins.numpy()) - 1
+            #scaled_target = np.clip(scaled_target, -1, 1)
             
             input_data.append(scaled_feats)
             initial_paths.append(row['initial_filename'])
@@ -100,9 +101,6 @@ class CustomDataset(Dataset):
 
         initial_img = self.transform_initial(initial_img)
         target_img = self.transform_target(target_img)
-
-        if self.transform:
-            image = self.transform(image)
 
         return input_feat, initial_img, target_img, target_feat
     

@@ -15,8 +15,8 @@ OUTPUT_DIR = os.path.join("outputs", RUN_NAME, VERSION_NAME)
 # Dataset
 IMG_WIDTH = 224
 IMG_HEIGHT = 224
-TARGET_WIDTH = 512
-TARGET_HEIGHT = 512
+TARGET_WIDTH = 224
+TARGET_HEIGHT = 224
 CHANNELS = 3
 FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_raw", "cielab_a_raw", "cielab_b_raw"]
 FEATURE_NORMALIZATION = True
@@ -26,18 +26,17 @@ TARGET_FEATURE_COLUMNS = ["bleaching", "duration", "concentration"]
 TARGET_MINS = [1,1,1000]
 TARGET_MAXS = [4,7,7000]
 INITIAL_IMAGE = False
-IMAGE_ENCODER = "resnet50"  # Options: "resnet50", "unet"
+IMAGE_ENCODER = "resnet50"
 
 # training defaults
-LR = 0.00005
-GRAD_CLIP = 1.0
+LR = 0.001
+GRAD_CLIP = 0.5
 LOG_INTERVAL = 100
 VAL_INTERVAL = 10
-
 
 # ddp
 DEVICE_IDS = [0, 1]
 WORLD_SIZE = len(DEVICE_IDS)
 DDP_TIMEOUT = 30
-BATCH_SIZE_PER_GPU = 4
+BATCH_SIZE_PER_GPU = 8
 NUM_WORKERS = 4
