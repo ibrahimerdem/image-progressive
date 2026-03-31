@@ -107,7 +107,7 @@ def evaluate_test_set(
     total_rgb_dist = 0.0
     total_count = 0
 
-    output_dir = "outputs/sd"
+    output_dir = "outputs/diffusion"
     generated_dir = os.path.join(output_dir, "generated")
     target_dir_out = os.path.join(output_dir, "target")
     input_dir_out = os.path.join(output_dir, "input")
@@ -120,7 +120,6 @@ def evaluate_test_set(
     
     with torch.no_grad():
         start_time = time.time()
-        
         for batch_idx, (input_image, input_feat, target_image, _) in enumerate(test_loader):
             input_image = input_image.to(device)
             target_image = target_image.to(device)
@@ -128,14 +127,30 @@ def evaluate_test_set(
             
             batch_size_local = target_image.size(0)
 
-            generated_images = pipeline.sample(
+            save_ints = (batch_idx == 4 and save_samples)
+
+            result = pipeline.sample(
                 features=input_feat,
                 steps=num_inference_steps,
-                save_intermediates=False,
+                save_intermediates=save_ints,
                 initial_images=input_image,
                 temperature=cfg.SAMPLE_TEMPERATURE,
                 eta=cfg.SAMPLER_ETA
             )
+
+            if save_ints and isinstance(result, tuple):
+                to_pil = transforms.ToPILImage()
+                generated_images, intermediates = result
+                intermediates_dir = os.path.join(output_dir, "intermediates")
+                os.makedirs(intermediates_dir, exist_ok=True)
+                for t_val, decoded in intermediates:
+                    img_tensor = torch.clamp((decoded[0].cpu() + 1) / 2, 0, 1)
+                    to_pil(img_tensor).save(
+                        os.path.join(intermediates_dir, f"t{t_val:04d}.png")
+                    )
+                print(f"Saved {len(intermediates)} intermediate frames to {intermediates_dir}/")
+            else:
+                generated_images = result
 
             l1 = l1_loss(generated_images, target_image).item()
             psnr = calculate_psnr(generated_images, target_image)
@@ -222,6 +237,88 @@ def evaluate_test_set(
     return results
 
 
+def generate_test_set(
+    pipeline,
+    device,
+    batch_size=8,
+    num_workers=2,
+    num_inference_steps=50,
+):
+
+    print("\n" + "="*60)
+    print("GENERATING IMAGES ON TEST DATASET")
+    print("="*60)
+
+    _, _, test_loader = create_dataloaders(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        distributed=False,
+    )
+    
+    if test_loader is None:
+        raise ValueError("Test dataloader is None. Check if test CSV exists.")
+    
+    print(f"Test set size: {len(test_loader.dataset)} samples")
+    print(f"Inference steps: {num_inference_steps}")
+
+    total_count = 0
+
+    output_dir = "outputs/diffusion"
+    generated_dir = os.path.join(output_dir, "generated")
+
+    os.makedirs(generated_dir, exist_ok=True)
+    
+    pipeline.model.eval()
+    
+    with torch.no_grad():
+        start_time = time.time()
+        
+        for batch_idx, (input_image, input_feat, _, _) in enumerate(test_loader):
+            input_image = input_image.to(device)
+            input_feat = input_feat.to(device)
+            
+            batch_size_local = input_image.size(0)
+
+            generated_images = pipeline.sample(
+                features=input_feat,
+                steps=num_inference_steps,
+                save_intermediates=False,
+                initial_images=input_image,
+                temperature=cfg.SAMPLE_TEMPERATURE,
+                eta=cfg.SAMPLER_ETA
+            )
+
+            total_count += batch_size_local
+            
+            to_pil = transforms.ToPILImage()
+            for i in range(batch_size_local):
+                global_idx = (batch_idx * batch_size) + i
+
+                gen_img   = torch.clamp((generated_images[i].cpu() + 1) / 2, 0, 1)
+
+                to_pil(gen_img).save(os.path.join(generated_dir, f"{global_idx:05d}.png"))
+            
+            if (batch_idx + 1) % 5 == 0:
+                print(f"Processed {batch_idx + 1}/{len(test_loader)} batches...")
+        
+        elapsed_time = time.time() - start_time
+
+    
+    # Print results
+    print("\n" + "="*60)
+    print("RESULTS")
+    print("="*60)
+    print(f"Total samples evaluated: {total_count}")
+    print(f"Inference steps: {num_inference_steps}")
+    print(f"Evaluation time: {elapsed_time:.2f}s")
+    print(f"Time per sample: {elapsed_time/total_count:.2f}s")
+    print(f"\nGenerated images saved to: {generated_dir}/")
+    print("="*60)
+
+    return generated_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test Evaluation")
     parser.add_argument(
@@ -241,6 +338,12 @@ def main():
         action='store_true',
         help='Do not save sample outputs'
     )
+    parser.add_argument(
+        '--evaluation',
+        type=bool,
+        default=1,
+        help='Evaluation or Generation'
+    )
     
     args = parser.parse_args()
 
@@ -257,14 +360,25 @@ def main():
         device
     )
 
-    evaluate_test_set(
-        pipeline,
-        device,
-        batch_size=cfg.BATCH_SIZE_PER_GPU,
-        num_workers=cfg.NUM_WORKERS,
-        save_samples=not args.no_save_samples,
-        num_inference_steps=cfg.SAMPLE_STEPS
-    )
+    if args.evaluation:
+
+        evaluate_test_set(
+            pipeline,
+            device,
+            batch_size=cfg.BATCH_SIZE_PER_GPU,
+            num_workers=cfg.NUM_WORKERS,
+            save_samples=not args.no_save_samples,
+            num_inference_steps=cfg.SAMPLE_STEPS
+        )
+    else:
+
+        generate_test_set(
+            pipeline,
+            device,
+            batch_size=cfg.BATCH_SIZE_PER_GPU,
+            num_workers=cfg.NUM_WORKERS,
+            num_inference_steps=cfg.SAMPLE_STEPS
+        )
 
 
 if __name__ == '__main__':
