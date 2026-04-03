@@ -1,109 +1,121 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torchvision.models as models
 
 import config as cfg
 
 
-class FeatureEmbedding(nn.Module):
-    def __init__(self, input_dim, embed_dim, embed_out_dim, target_shape):
-        super(FeatureEmbedding, self).__init__()
-        self.target_shape = target_shape
-        self.feat_embedding = nn.Sequential(
-            nn.Linear(input_dim, embed_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(embed_dim, embed_out_dim),
-            nn.BatchNorm1d(embed_out_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(embed_out_dim, int(np.prod(target_shape))),
-            nn.LeakyReLU(0.2, inplace=True)
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResBlock, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+        # Shortcut: match dims if channels or spatial size changes
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(self.conv(x) + self.shortcut(x))
+
+
+class ResNet19(nn.Module):
+
+    def __init__(self, in_channels=3):
+        super(ResNet19, self).__init__()
+
+        # Stem: 1 conv layer
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+        )
+
+        self.stage1 = self._make_stage(64,  64,  num_blocks=1, stride=1)  
+        self.stage2 = self._make_stage(64,  128, num_blocks=1, stride=2)  
+        self.stage3 = self._make_stage(128, 256, num_blocks=1, stride=2)  
+        self.stage4 = self._make_stage(256, 512, num_blocks=2, stride=2)  
+
+        self.gap = nn.AdaptiveAvgPool2d(1)  # → (B, 512, 1, 1)
+
+    def _make_stage(self, in_ch, out_ch, num_blocks, stride):
+        blocks = [ResBlock(in_ch, out_ch, stride=stride)]
+        for _ in range(1, num_blocks):
+            blocks.append(ResBlock(out_ch, out_ch, stride=1))
+        return nn.Sequential(*blocks)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.gap(x)
+        return torch.flatten(x, 1)  # (B, 512)
+
+
+class TabularEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, out_dim=64):
+        super(TabularEncoder, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
-        x = self.feat_embedding(x)
-        batch_size = x.shape[0]
-        return x.view(batch_size, *self.target_shape)
-    
+        return self.net(x)  # (B, out_dim)
+
 
 class Basic_Triplet(nn.Module):
     def __init__(self):
         super(Basic_Triplet, self).__init__()
 
-        self.img_height = cfg.IMG_HEIGHT
-        self.img_width = cfg.IMG_WIDTH
+        self.input_dim    = len(cfg.FEATURE_COLUMNS)
         self.img_channels = cfg.CHANNELS
-        self.input_dim = len(cfg.FEATURE_COLUMNS)
-        self.output_dim = 3
+        self.output_dim   = 3
 
-        self.embed_dim = 128
-        self.embed_out_dim = 512
+        # Image encoder: ResNet-19 from scratch
+        self.image_encoder = ResNet19(in_channels=self.img_channels)
+        # Output: (B, 512)
 
-        self.cond_embedding = FeatureEmbedding(
-            self.input_dim, self.embed_dim, self.embed_out_dim,
-            (self.img_height, self.img_width, self.img_channels),
+        # Tabular encoder
+        self.tab_encoder = TabularEncoder(
+            input_dim=self.input_dim,
+            hidden_dim=128,
+            out_dim=64,
         )
+        # Output: (B, 64)
 
-        # Load a pre-trained ResNet50 model, using 'weights' argument
-        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if cfg.IMAGE_ENCODER=="resnet50" else None)
-
-        # Modify the first convolutional layer of ResNet to accept 6 channels (image + conditional image)
-        original_conv1 = resnet.conv1
-        self.resnet_conv1 = nn.Conv2d(
-            self.img_channels * 2, # Image channels + Condition embedding channels (3 + 3 = 6)
-            original_conv1.out_channels,
-            kernel_size=original_conv1.kernel_size,
-            stride=original_conv1.stride,
-            padding=original_conv1.padding,
-            bias=original_conv1.bias
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(512 + 64, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, self.output_dim),   # (B, 3)
         )
-        # Copy original weights to the first 3 channels and initialize the new 3 channels
-        self.resnet_conv1.weight.data[:, :3, :, :] = original_conv1.weight.data
-        # Initialize new channels with small random values
-        self.resnet_conv1.weight.data[:, 3:, :, :] = torch.randn(
-            self.resnet_conv1.out_channels, self.img_channels, *original_conv1.kernel_size
-        ) * 0.01
-
-        # Reconstruct ResNet's feature extractor with the modified conv1
-        self.resnet_features = nn.Sequential(
-            self.resnet_conv1,
-            resnet.bn1,
-            resnet.relu,
-            resnet.maxpool,
-            resnet.layer1,
-            resnet.layer2,
-            resnet.layer3,
-            resnet.layer4
-        )
-        # The output of resnet_features will be a 2048-channel feature map
-
-        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
-        # The input to fc1 will be 2048 (from ResNet GAP) + self.input_dim (from raw features)
-        self.fc1 = nn.Linear(2048 + self.input_dim, 64)
-        # Changed output dimension to 3 for triplet prediction
-        self.fc2 = nn.Linear(64, self.output_dim)
 
     def forward(self, condition, image):
-        # Create condition embedding (image-like)
-        c1 = self.cond_embedding(condition)
-        # PyTorch uses channels first format (B, C, H, W)
-        c1 = c1.permute(0, 3, 1, 2) # (B, H, W, C) -> (B, C, H, W)
+        # 1. Extract image features via ResNet-19
+        img_feat = self.image_encoder(image)       # (B, 512)
 
-        # Concatenate image and conditional embedding along the channel dimension
-        fused_input = torch.cat([image, c1], dim=1) # Should be (B, 6, H, W)
+        # 2. Encode tabular features
+        tab_feat = self.tab_encoder(condition)     # (B, 64)
 
-        # Pass the fused input through the modified ResNet50
-        resnet_output = self.resnet_features(fused_input)
+        # 3. Fuse and regress
+        fused = torch.cat([img_feat, tab_feat], dim=1)  # (B, 576)
+        out   = self.fusion_mlp(fused)                  # (B, 3)
 
-        # Global pooling on ResNet features
-        y = self.global_avg_pool(resnet_output)
-        y = torch.flatten(y, 1) # Flatten to (batch_size, 2048)
-
-        # Concatenate with original condition input (raw features) for the MLP head
-        y = torch.cat([y, condition], dim=1)
-
-        # MLP head
-        y = self.fc1(y)
-        y = self.fc2(y)
-
-        return y
+        return out
