@@ -1,67 +1,42 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision.models as tv_models
 
 import config as cfg
 
 
-class ResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
-        super(ResBlock, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-        )
-        # Shortcut: match dims if channels or spatial size changes
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels),
-            )
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        return self.relu(self.conv(x) + self.shortcut(x))
+# Feature-vector size for supported encoder names
+_ENCODER_OUT_DIM = {
+    "resnet18":  512,
+    "resnet34":  512,
+    "resnet50":  2048,
+    "resnet101": 2048,
+}
 
 
-class ResNet19(nn.Module):
+def _build_image_encoder(name: str, freeze: bool) -> tuple[nn.Module, int]:
+    """Return (backbone_without_fc, out_dim)."""
+    weights_map = {
+        "resnet18":  tv_models.ResNet18_Weights.DEFAULT,
+        "resnet34":  tv_models.ResNet34_Weights.DEFAULT,
+        "resnet50":  tv_models.ResNet50_Weights.DEFAULT,
+        "resnet101": tv_models.ResNet101_Weights.DEFAULT,
+    }
+    if name not in weights_map:
+        raise ValueError(f"Unsupported IMAGE_ENCODER '{name}'. Choose from: {list(weights_map)}")
 
-    def __init__(self, in_channels=3):
-        super(ResNet19, self).__init__()
+    backbone = getattr(tv_models, name)(weights=weights_map[name])
+    out_dim = _ENCODER_OUT_DIM[name]
 
-        # Stem: 1 conv layer
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-        )
+    # Remove the classification head; keep avgpool so output is (B, out_dim)
+    backbone.fc = nn.Identity()
 
-        self.stage1 = self._make_stage(64,  64,  num_blocks=1, stride=1)  
-        self.stage2 = self._make_stage(64,  128, num_blocks=1, stride=2)  
-        self.stage3 = self._make_stage(128, 256, num_blocks=1, stride=2)  
-        self.stage4 = self._make_stage(256, 512, num_blocks=2, stride=2)  
+    if freeze:
+        for param in backbone.parameters():
+            param.requires_grad = False
 
-        self.gap = nn.AdaptiveAvgPool2d(1)  # → (B, 512, 1, 1)
-
-    def _make_stage(self, in_ch, out_ch, num_blocks, stride):
-        blocks = [ResBlock(in_ch, out_ch, stride=stride)]
-        for _ in range(1, num_blocks):
-            blocks.append(ResBlock(out_ch, out_ch, stride=1))
-        return nn.Sequential(*blocks)
-
-    def forward(self, x):
-        x = self.stem(x)
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.stage4(x)
-        x = self.gap(x)
-        return torch.flatten(x, 1)  # (B, 512)
+    return backbone, out_dim
 
 
 class TabularEncoder(nn.Module):
@@ -83,12 +58,11 @@ class Basic_Triplet(nn.Module):
         super(Basic_Triplet, self).__init__()
 
         self.input_dim    = len(cfg.FEATURE_COLUMNS)
-        self.img_channels = cfg.CHANNELS
         self.output_dim   = 3
 
-        # Image encoder: ResNet-19 from scratch
-        self.image_encoder = ResNet19(in_channels=self.img_channels)
-        # Output: (B, 512)
+        # Pretrained image encoder (backbone only, FC removed)
+        freeze = getattr(cfg, "FREEZE_BACKBONE", True)
+        self.image_encoder, img_feat_dim = _build_image_encoder(cfg.IMAGE_ENCODER, freeze=freeze)
 
         # Tabular encoder
         self.tab_encoder = TabularEncoder(
@@ -99,7 +73,7 @@ class Basic_Triplet(nn.Module):
         # Output: (B, 64)
 
         self.fusion_mlp = nn.Sequential(
-            nn.Linear(512 + 64, 256),
+            nn.Linear(img_feat_dim + 64, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
             nn.Linear(256, 64),

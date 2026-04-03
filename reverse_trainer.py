@@ -184,7 +184,8 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     
     base_model = Basic_Triplet()
     model = DDP(base_model.to(device), device_ids=[cfg.DEVICE_IDS[rank]])
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LR, betas=(0.5, 0.999))
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=cfg.LR, betas=(0.5, 0.999))
     criterion = nn.L1Loss()
 
     use_amp = device.type == "cuda"

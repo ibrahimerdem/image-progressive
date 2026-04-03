@@ -1,7 +1,7 @@
 import os
 
 RUN_NAME = "reverse"
-VERSION_NAME = "basic"
+VERSION_NAME = "resnet50"
 
 # Files
 DATA_DIR = "data"
@@ -15,8 +15,8 @@ OUTPUT_DIR = os.path.join("outputs", RUN_NAME, VERSION_NAME)
 # Dataset
 IMG_WIDTH = 224
 IMG_HEIGHT = 224
-TARGET_WIDTH = 224
-TARGET_HEIGHT = 224
+TARGET_WIDTH = 512
+TARGET_HEIGHT = 512
 CHANNELS = 3
 FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_raw", "cielab_a_raw", "cielab_b_raw"]
 FEATURE_NORMALIZATION = True
@@ -27,6 +27,7 @@ TARGET_MINS = [1,1,1000]
 TARGET_MAXS = [4,7,7000]
 INITIAL_IMAGE = False
 IMAGE_ENCODER = "resnet50"
+FREEZE_BACKBONE = True
 
 # training defaults
 LR = 0.001
