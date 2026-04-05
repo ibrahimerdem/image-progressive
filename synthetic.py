@@ -4,7 +4,7 @@ from collections import defaultdict
 
 REAL_DATA_FILE = "data/training_features.csv"
 OUTPUT_FILE    = "data/synthetic_features.csv"
-N_ROWS         = 4000
+N_ROWS         = 10000
 SEED           = 44
 
 random.seed(SEED)
@@ -30,6 +30,8 @@ TYPE_PROPS = {
     for t, rows in type_rows.items()
 }
 
+
+
 recipe_counter = defaultdict(int)
 
 FIELDNAMES = [
@@ -40,7 +42,7 @@ FIELDNAMES = [
 ]
 
 rows = []
-for _ in range(N_ROWS):
+while len(rows) < N_ROWS:
     type_id = random.randint(1, 50)
     props   = TYPE_PROPS[type_id]
 
@@ -49,26 +51,29 @@ for _ in range(N_ROWS):
     concentration = random.choice(CONCENTRATION_VALUES)
 
     recipe_counter[type_id] += 1
-    recipe = recipe_counter[type_id]
-    repl   = ((recipe - 1) % 3) + 1
+    recipe  = recipe_counter[type_id]
+    n_repls = random.randint(1, 3)
 
-    rows.append({
-        "type"             : type_id,
-        "recipe"           : recipe,
-        "bleaching"        : bleaching,
-        "duration"         : duration,
-        "concentration"    : concentration,
-        "coloring_type"    : props["coloring_type"],
-        "yarn_number"      : props["yarn_number"],
-        "frequency"        : props["frequency"],
-        "knitting"         : props["knitting"],
-        "fabric_elasticity": props["fabric_elasticity"],
-        "cielab_l_raw"     : props["cielab_l_raw"],
-        "cielab_a_raw"     : props["cielab_a_raw"],
-        "cielab_b_raw"     : props["cielab_b_raw"],
-        "initial_filename" : props["initial_filename"],
-        "target_filename"  : f"tip{type_id}-recete{recipe}-repl{repl}.jpg",
-    })
+    for repl in range(1, n_repls + 1):
+        if len(rows) >= N_ROWS:
+            break
+        rows.append({
+            "type"             : type_id,
+            "recipe"           : recipe,
+            "bleaching"        : bleaching,
+            "duration"         : duration,
+            "concentration"    : concentration,
+            "coloring_type"    : props["coloring_type"],
+            "yarn_number"      : props["yarn_number"],
+            "frequency"        : props["frequency"],
+            "knitting"         : props["knitting"],
+            "fabric_elasticity": props["fabric_elasticity"],
+            "cielab_l_raw"     : props["cielab_l_raw"],
+            "cielab_a_raw"     : props["cielab_a_raw"],
+            "cielab_b_raw"     : props["cielab_b_raw"],
+            "initial_filename" : props["initial_filename"],
+            "target_filename"  : "tip44-recete27-repl1.jpg",
+        })
 
 with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
     writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
