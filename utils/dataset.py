@@ -34,6 +34,7 @@ class CustomDataset(Dataset):
 
         self.feature_cols = cfg.FEATURE_COLUMNS
         self.target_cols = cfg.TARGET_FEATURE_COLUMNS
+        self.known_target_cols = getattr(cfg, "KNOWN_TARGET_COLUMNS", [])
         
         self.input_data, self.initial_paths, self.target_paths, self.target_data = self._load_data()
 
@@ -67,11 +68,19 @@ class CustomDataset(Dataset):
         if self.target_min_max:
             self.target_mins = torch.tensor(self.target_min_max[0], dtype=torch.float32)
             self.target_maxs = torch.tensor(self.target_min_max[1], dtype=torch.float32)
-        
+
+        known_mins = np.array(getattr(cfg, "KNOWN_TARGET_MINS", []), dtype=np.float32)
+        known_maxs = np.array(getattr(cfg, "KNOWN_TARGET_MAXS", []), dtype=np.float32)
+
         for _, row in df.iterrows():
             features = row[self.feature_cols].values.astype(np.float32)
             scaled_feats = 2 * (features - self.feature_mins.numpy()) / (self.feature_maxs.numpy() - self.feature_mins.numpy()) - 1
             #scaled_feats = np.clip(scaled_feats, -1, 1)
+
+            if self.known_target_cols:
+                known = row[self.known_target_cols].values.astype(np.float32)
+                scaled_known = 2 * (known - known_mins) / (known_maxs - known_mins) - 1
+                scaled_feats = np.concatenate([scaled_feats, scaled_known])
 
             target = row[self.target_cols].values.astype(np.float32)
             scaled_target = 2 * (target - self.target_mins.numpy()) / (self.target_maxs.numpy() - self.target_mins.numpy()) - 1

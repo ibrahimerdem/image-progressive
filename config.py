@@ -1,6 +1,6 @@
 import os
 
-RUN_NAME = "reverse"
+RUN_NAME = "conditional_reverse_synthetic"
 VERSION_NAME = "resnet50"
 
 # Files
@@ -22,9 +22,13 @@ FEATURE_COLUMNS = ["yarn_number", "frequency", "fabric_elasticity", "cielab_l_ra
 FEATURE_NORMALIZATION = True
 FEATURE_MINS = [5.6,15,0,16.87,-1.91,-16.75]
 FEATURE_MAXS = [30,42,95,40,1.62,-0.5]
-TARGET_FEATURE_COLUMNS = ["bleaching", "duration", "concentration"]
-TARGET_MINS = [1,1,1000]
-TARGET_MAXS = [4,7,7000]
+TARGET_FEATURE_COLUMNS = ["concentration"] #["bleaching", "duration", "concentration"]
+TARGET_MINS = [1000] #[1,1,1000]
+TARGET_MAXS = [7000] #[4,7,7000]
+
+KNOWN_TARGET_COLUMNS = ["bleaching", "duration"]
+KNOWN_TARGET_MINS = [1, 1]
+KNOWN_TARGET_MAXS = [4, 7]
 INITIAL_IMAGE = False
 IMAGE_ENCODER = "resnet50"
 FREEZE_BACKBONE = True

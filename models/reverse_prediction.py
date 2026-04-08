@@ -57,10 +57,9 @@ class Basic_Triplet(nn.Module):
     def __init__(self):
         super(Basic_Triplet, self).__init__()
 
-        self.input_dim    = len(cfg.FEATURE_COLUMNS)
-        self.output_dim   = 3
+        self.input_dim    = len(cfg.FEATURE_COLUMNS) + len(getattr(cfg, "KNOWN_TARGET_COLUMNS", []))
+        self.output_dim   = len(cfg.TARGET_FEATURE_COLUMNS)
 
-        # Pretrained image encoder (backbone only, FC removed)
         freeze = getattr(cfg, "FREEZE_BACKBONE", True)
         self.image_encoder, img_feat_dim = _build_image_encoder(cfg.IMAGE_ENCODER, freeze=freeze)
 
@@ -78,18 +77,14 @@ class Basic_Triplet(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(256, 64),
             nn.ReLU(inplace=True),
-            nn.Linear(64, self.output_dim),   # (B, 3)
+            nn.Linear(64, self.output_dim),   # (B, len(cfg.TARGET_FEATURE_COLUMNS))
         )
 
     def forward(self, condition, image):
-        # 1. Extract image features via ResNet-19
+
         img_feat = self.image_encoder(image)       # (B, 512)
-
-        # 2. Encode tabular features
         tab_feat = self.tab_encoder(condition)     # (B, 64)
-
-        # 3. Fuse and regress
         fused = torch.cat([img_feat, tab_feat], dim=1)  # (B, 576)
-        out   = self.fusion_mlp(fused)                  # (B, 3)
+        out   = self.fusion_mlp(fused)                  # (B, len(cfg.TARGET_FEATURE_COLUMNS))
 
         return out
