@@ -213,7 +213,7 @@ def remap_hf_decoder_keys(hf_sd):
     return new_sd
 
 
-def load_vae(checkpoint_path: str, device: torch.device):
+def load_vae(checkpoint_path: str, device: torch.device, freeze: bool = True):
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     for wrapper in ("state_dict", "model_state_dict"):
@@ -277,10 +277,12 @@ def load_vae(checkpoint_path: str, device: torch.device):
         sample = list(ckpt.keys())[:8]
         raise RuntimeError(f"[VAE] Unrecognised format. Sample keys: {sample}")
 
-    for model in (vae_encoder, vae_decoder):
-        for p in model.parameters():
-            p.requires_grad = False
-        model.eval()
-
-    print("[VAE] Frozen and ready.")
+    if freeze:
+        for model in (vae_encoder, vae_decoder):
+            for p in model.parameters():
+                p.requires_grad = False
+            model.eval()
+        print("[VAE] Frozen and ready.")
+    else:
+        print("[VAE] Loaded (trainable).")
     return vae_encoder, vae_decoder

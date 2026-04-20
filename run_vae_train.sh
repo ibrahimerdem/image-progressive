@@ -2,8 +2,7 @@
 set -e
 
 EPOCHS=${1:-100}
-RETRAIN=${2:-0}
-CHECKPOINT=${3:-}
+RESUME=${2:-}
 
 if [ -d ".venv" ]; then
   # shellcheck disable=SC1091
@@ -25,11 +24,11 @@ fi
 export CUDA_VISIBLE_DEVICES="${DEVICE_IDS}"
 echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
-echo "Launching training for ${EPOCHS} epochs (retrain=${RETRAIN}, checkpoint=${CHECKPOINT})"
+echo "Launching VAE retraining for ${EPOCHS} epochs (resume=${RESUME})"
 
 EXTRA_ARGS=()
-if [ -n "${CHECKPOINT}" ]; then
-  EXTRA_ARGS+=(--checkpoint "${CHECKPOINT}")
+if [ -n "${RESUME}" ]; then
+  EXTRA_ARGS+=(--resume "${RESUME}")
 fi
 
-python ld_trainer.py --epochs "${EPOCHS}" --retrain "${RETRAIN}" "${EXTRA_ARGS[@]}"
+python vae_trainer.py --epochs "${EPOCHS}" "${EXTRA_ARGS[@]}"
