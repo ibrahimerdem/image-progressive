@@ -1,12 +1,12 @@
 import os
 
 RUN_NAME = "diffusion"
-VERSION_NAME = "temperature_pretrained_vae"
+VERSION_NAME = "regional_t1_s50"
 
 # Files
 DATA_DIR = "data"
-INITIAL_DIR = os.path.join(DATA_DIR, "initial")
-TARGET_DIR = os.path.join(DATA_DIR, "target")
+INITIAL_DIR = os.path.join(DATA_DIR, "local_initial")
+TARGET_DIR = os.path.join(DATA_DIR, "local_target")
 TRAIN_CSV = os.path.join(DATA_DIR, "training_features.csv")
 VAL_CSV = os.path.join(DATA_DIR, "validation_features.csv")
 TEST_CSV = os.path.join(DATA_DIR, "test_features.csv")
@@ -29,7 +29,7 @@ TIMESTEPS = 1000
 SAMPLE_STEPS = 50     
 EMB_DIM = 768
 BASE_CHANNELS = 256
-VAL_EPOCH = 10
+VAL_EPOCH = 20
 SAMPLE_TEMPERATURE = 1.0
 SAMPLER_ETA = 1.0
 LOG_INTERVAL = 100   
@@ -39,7 +39,7 @@ GRAD_CLIP = 1.0
 DDP_TIMEOUT_MINUTES = 30
 
 # vae
-VAE_SCALE = 0.173
+VAE_SCALE = 0.2372
 VAE_CKPT = "checkpoints/diffusion/diffusion_pytorch_model.bin"
 FREEZE_VAE = False
 
