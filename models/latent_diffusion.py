@@ -296,6 +296,9 @@ class GaussianDiffusion(nn.Module):
         features,
         vae_encoder=None,
         initial_images=None,
+        vae_decoder=None,
+        rgb_loss_weight=0.0,
+        rgb_loss_max_timestep_ratio=0.7,
     ):
         device = x_start.device
 
@@ -317,10 +320,24 @@ class GaussianDiffusion(nn.Module):
         pred_noise = model(x_t, t, features, initial_images)
         noise_loss = F.mse_loss(pred_noise, noise)
 
+        rgb_loss = torch.zeros((), device=device)
+        if vae_decoder is not None and rgb_loss_weight > 0:
+            max_t = int(rgb_loss_max_timestep_ratio * self.timesteps)
+            gate_mask = t < max_t
+ 
+            if gate_mask.any():
+                x0_pred = self.predict_start(x_t[gate_mask], t[gate_mask], pred_noise[gate_mask])
+                decoded_rgb = vae_decoder(x0_pred)
+                target_rgb = x_start[gate_mask]
+                rgb_loss = F.l1_loss(decoded_rgb, target_rgb)
+ 
+        total_loss = noise_loss + rgb_loss_weight * rgb_loss
+
         return {
-            'loss': noise_loss,
+            'loss': total_loss,
             'metrics': {
                 'noise_loss': noise_loss.item(),
+                'rgb_loss': rgb_loss.item(),
             },
         }
 
@@ -405,13 +422,13 @@ class LatentDiffusionConditioned(nn.Module):
     def __init__(self, latent_channels=4, emb_dim=512, base_channels=64, use_initial_image=False):
         super().__init__()
         num_features = len(cfg.FEATURE_COLUMNS)   # 9
-        time_dim     = emb_dim * 2                # 1536
-        self.emb_dim          = emb_dim
-        self.num_features     = num_features
+        time_dim = emb_dim * 2                # 1536
+        self.emb_dim = emb_dim
+        self.num_features = num_features
         self.use_initial_image = use_initial_image
 
         self.feature_projection = FeatureEmbedding(num_features=num_features, embed_dim=emb_dim)
-        self.time_embedding     = TimeEmbedding(time_dim)
+        self.time_embedding = TimeEmbedding(time_dim)
 
         if use_initial_image:
             self.image_projection = ImageEmbedding(embed_dim=emb_dim)

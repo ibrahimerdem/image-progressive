@@ -320,6 +320,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
     ema_helper.to(device)
     ema_pipeline = LatentDiffusionPipeline(ema_helper.ema, diffusion, vae_encoder, vae_decoder) if rank == 0 else None
 
+    rgb_loss_weight = getattr(cfg, "RGB_LOSS_WEIGHT", 0.05)
+    if rank == 0:
+        print(f"[D] RGB difference loss weight: {rgb_loss_weight}")
+
     save_dir   = os.path.join("checkpoints", "diffusion")
     log_dir    = os.path.join(save_dir, "logs")
     sample_dir = os.path.join(save_dir, "samples")
@@ -374,10 +378,14 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 if cfg.INITIAL_IMAGE:
                     loss_dict = diffusion.p_loss(model, targets, features,
                                                  vae_encoder=vae_encoder,
+                                                 vae_decoder=vae_decoder,
+                                                 rgb_loss_weight=rgb_loss_weight,
                                                  initial_images=initial_images)
                 else:
                     loss_dict = diffusion.p_loss(model, targets, features,
-                                                 vae_encoder=vae_encoder)
+                                                 vae_encoder=vae_encoder,
+                                                 vae_decoder=vae_decoder,
+                                                 rgb_loss_weight=rgb_loss_weight)
                 loss = loss_dict['loss']
                 loss_metrics = loss_dict.get('metrics', {})
 
@@ -412,11 +420,13 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             if (batch_idx + 1) % cfg.LOG_INTERVAL == 0 and rank == 0:
                 noise_loss_val = loss_metrics.get('noise_loss', loss.item())
                 perceptual_loss_val = loss_metrics.get('perceptual_loss', 0.0)
+                rgb_loss_val = loss_metrics.get('rgb_loss', 0.0)
                 print(
                     f"[D] Epoch {epoch} Batch {batch_idx + 1}/{len(train_loader)} "
                     f"Loss: {loss.item():.4f} | "
                     f"Noise: {noise_loss_val:.4f} | "
                     f"Percep: {perceptual_loss_val:.4f} | "
+                    f"RGB: {rgb_loss_val:.4f} | "
                     f"Grad Norm: {grad_norm:.4f}"
                 )
 
