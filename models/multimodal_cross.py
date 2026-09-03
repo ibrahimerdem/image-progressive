@@ -71,6 +71,46 @@ class SelfAttention(nn.Module):
         return out
 
 
+class CrossAttention(nn.Module):
+    """Cross-attention between a spatial feature map and a sequence of
+    conditioning tokens (e.g. per-feature embeddings from FeatureEmbedding /
+    ImageEmbedding). The spatial map provides the queries, the conditioning
+    tokens provide keys/values, letting the GAN attend to the recipe /
+    initial-image conditioning at specific spatial locations.
+    """
+
+    def __init__(self, query_channels, context_dim, num_heads=8):
+        super(CrossAttention, self).__init__()
+        assert query_channels % num_heads == 0, "query_channels must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = query_channels // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.to_q = nn.Conv2d(query_channels, query_channels, 1)
+        self.to_k = nn.Linear(context_dim, query_channels)
+        self.to_v = nn.Linear(context_dim, query_channels)
+        self.to_out = nn.Conv2d(query_channels, query_channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))  # Learnable scalar
+
+    def forward(self, x, context):
+        # x: [B, C, H, W]  context: [B, N, context_dim]
+        B, C, H, W = x.size()
+        N = context.size(1)
+
+        q = self.to_q(x).view(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)  # [B, heads, HW, hd]
+        k = self.to_k(context).view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [B, heads, N, hd]
+        v = self.to_v(context).view(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [B, heads, N, hd]
+
+        attention = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # [B, heads, HW, N]
+        attention = F.softmax(attention, dim=-1)
+
+        out = torch.matmul(attention, v)  # [B, heads, HW, hd]
+        out = out.permute(0, 1, 3, 2).contiguous().view(B, C, H, W)
+        out = self.to_out(out)
+        out = self.gamma * out + x
+        return out
+
+
 class Generator(nn.Module):
     def __init__(self,
                  channels = 3,
@@ -103,7 +143,7 @@ class Generator(nn.Module):
         # FC layer: noise (100) + combined embeddings (9216 or 4608) -> 1024*4*4
         self.fc = nn.Linear(self.noise_dim + combined_emb_dim, 1024 * 4 * 4)
 
-        # Decoder path: 4x4 -> 8x8 -> 16x16 -> 32x32 -> 64x64 -> 128x128 -> 256x256 -> 512x512
+        # Decoder path: 4x4 -> 8x8 -> 16x16 -> 32x32 -> 64x64 -> 128x128 -> 256x256
         # deconv1: 4x4x1024 -> 8x8x512
         self.deconv1 = nn.ConvTranspose2d(1024, 512, kernel_size=4, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(512)
@@ -119,6 +159,10 @@ class Generator(nn.Module):
         # Self-attention at 32x32 resolution (moved here to save memory)
         self.attn = SelfAttention(128)
 
+        # Cross-attention: lets the 32x32 feature map attend directly to the
+        # per-feature conditioning tokens (recipe + optional initial image)
+        self.cross_attn = CrossAttention(128, context_dim=embed_dim, num_heads=8)
+
         # deconv4: 32x32x128 -> 64x64x64
         self.deconv4 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False)
         self.bn4 = nn.BatchNorm2d(64)
@@ -131,8 +175,8 @@ class Generator(nn.Module):
         self.deconv6 = nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1, bias=False)
         self.bn6 = nn.BatchNorm2d(16)
 
-        # deconv7: 256x256x16 -> 512x512x3 (final output)
-        self.deconv7 = nn.ConvTranspose2d(16, self.channels, kernel_size=4, stride=2, padding=1, bias=False)
+        # final_conv: 256x256x16 -> 256x256x3 (no further upsampling, final output)
+        self.final_conv = nn.Conv2d(16, self.channels, kernel_size=3, stride=1, padding=1, bias=False)
         
         self.tanh = nn.Tanh()
 
@@ -152,6 +196,10 @@ class Generator(nn.Module):
         noise_flat = noise.view(noise.shape[0], -1)  # [B, noise_dim]
         combined_features = torch.cat([noise_flat, combined_emb], dim=1)  # [B, noise_dim + emb_dim]
 
+        # Conditioning tokens for cross-attention: reshape the flat embedding
+        # into a sequence of per-feature tokens of size embed_dim
+        context = combined_emb.view(combined_emb.shape[0], -1, self.embed_dim)  # [B, N, embed_dim]
+
         z = self.fc(combined_features)
         z = z.view(z.shape[0], 1024, 4, 4)  # [B, 1024, 4, 4]
 
@@ -162,11 +210,14 @@ class Generator(nn.Module):
         
         # Apply self-attention at 32x32 resolution (saves memory)
         z = self.attn(z)  # [B, 128, 32, 32]
+
+        # Apply cross-attention to conditioning tokens at 32x32 resolution
+        z = self.cross_attn(z, context)  # [B, 128, 32, 32]
         
         z = F.relu(self.bn4(self.deconv4(z)))  # [B, 64, 64, 64]     
         z = F.relu(self.bn5(self.deconv5(z)))  # [B, 32, 128, 128]
         z = F.relu(self.bn6(self.deconv6(z)))  # [B, 16, 256, 256]
-        z = self.tanh(self.deconv7(z))  # [B, 3, 512, 512]
+        z = self.tanh(self.final_conv(z))  # [B, 3, 256, 256]
 
         return z
     
@@ -185,50 +236,52 @@ class Discriminator(nn.Module):
         self.feature_embedding = FeatureEmbedding(num_features=num_features, embed_dim=embed_dim)
         feature_emb_dim = num_features * embed_dim
 
-        # Discriminator convolution layers for 512x512 input
-        # Input: [B, 3, 512, 512]
-        self.conv1 = nn.Conv2d(self.channels, 32, 4, 2, 1)  # -> [B, 32, 256, 256]
+        # Discriminator convolution layers for 256x256 input
+        # Input: [B, 3, 256, 256]
+        self.conv1 = nn.Conv2d(self.channels, 64, 4, 2, 1)  # -> [B, 64, 128, 128]
         self.relu1 = nn.LeakyReLU(0.2, inplace=False)
 
-        self.conv2 = nn.Conv2d(32, 64, 4, 2, 1)  # -> [B, 64, 128, 128]
-        self.bn2 = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(64, 128, 4, 2, 1)  # -> [B, 128, 64, 64]
+        self.bn2 = nn.BatchNorm2d(128)
         self.relu2 = nn.LeakyReLU(0.2, inplace=False)
 
-        self.conv3 = nn.Conv2d(64, 128, 4, 2, 1)  # -> [B, 128, 64, 64]
-        self.bn3 = nn.BatchNorm2d(128)
+        self.conv3 = nn.Conv2d(128, 256, 4, 2, 1)  # -> [B, 256, 32, 32]
+        self.bn3 = nn.BatchNorm2d(256)
         self.relu3 = nn.LeakyReLU(0.2, inplace=False)
-
-        self.conv4 = nn.Conv2d(128, 256, 4, 2, 1)  # -> [B, 256, 32, 32]
-        self.bn4 = nn.BatchNorm2d(256)
-        self.relu4 = nn.LeakyReLU(0.2, inplace=False)
 
         self.attn = SelfAttention(256)
 
-        self.conv5 = nn.Conv2d(256, 512, 4, 2, 1)  # -> [B, 512, 16, 16]
-        self.bn5 = nn.BatchNorm2d(512)
-        self.relu5 = nn.LeakyReLU(0.2, inplace=False)
+        # Cross-attention: lets the 32x32 feature map attend directly to the
+        # per-feature conditioning tokens
+        self.cross_attn = CrossAttention(256, context_dim=embed_dim, num_heads=8)
+
+        self.conv4 = nn.Conv2d(256, 512, 4, 2, 1)  # -> [B, 512, 16, 16]
+        self.bn4 = nn.BatchNorm2d(512)
+        self.relu4 = nn.LeakyReLU(0.2, inplace=False)
 
         # At 16x16 resolution: 512 image features + 4608 text features per spatial location
         self.output = nn.Conv2d(512 + feature_emb_dim, 1, 4, 1, 0, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x, features):
-        x_out = self.relu1(self.conv1(x))        # [B, 32, 256, 256]
-        x_out = self.relu2(self.bn2(self.conv2(x_out)))  # [B, 64, 128, 128]
-        x_out = self.relu3(self.bn3(self.conv3(x_out)))  # [B, 128, 64, 64]
-        x_out = self.relu4(self.bn4(self.conv4(x_out)))  # [B, 256, 32, 32]
+        feature_emb = self.feature_embedding(features)  # [B, num_features * embed_dim]
+        context = feature_emb.view(feature_emb.size(0), -1, self.embed_dim)  # [B, N, embed_dim]
+
+        x_out = self.relu1(self.conv1(x))                # [B, 64, 128, 128]
+        x_out = self.relu2(self.bn2(self.conv2(x_out)))  # [B, 128, 64, 64]
+        x_out = self.relu3(self.bn3(self.conv3(x_out)))  # [B, 256, 32, 32]
 
         x_out = self.attn(x_out)                 # [B, 256, 32, 32]
-        
-        x_out = self.relu5(self.bn5(self.conv5(x_out)))  # [B, 512, 16, 16]
+        x_out = self.cross_attn(x_out, context)  # [B, 256, 32, 32]
+
+        x_out = self.relu4(self.bn4(self.conv4(x_out)))  # [B, 512, 16, 16]
 
         _, _, height, width = x_out.size()
 
-        feature_emb = self.feature_embedding(features)  # [B, num_features * embed_dim]
-        feature_emb = feature_emb.view(feature_emb.size(0), feature_emb.size(1), 1, 1)
-        feature_emb = feature_emb.expand(-1, -1, height, width)
+        feature_emb_map = feature_emb.view(feature_emb.size(0), feature_emb.size(1), 1, 1)
+        feature_emb_map = feature_emb_map.expand(-1, -1, height, width)
 
-        combined = torch.cat([x_out, feature_emb], dim=1)  # [B, 512 + feature_emb_dim, 16, 16]
+        combined = torch.cat([x_out, feature_emb_map], dim=1)  # [B, 512 + feature_emb_dim, 16, 16]
 
         out = self.output(combined)  # [B, 1, 13, 13]
         out = self.sigmoid(out)      # [B, 1, 13, 13]

@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-from models.multimodal_basic import Generator, Discriminator
+from models.multimodal_process import Generator, Discriminator
 from utils.training import (
     calculate_psnr,
     calculate_ssim,
@@ -267,8 +267,7 @@ def train(
                 }
             )
 
-        # Optional: save checkpoint every epoch (user can thin these later)
-        ckpt_path = os.path.join(save_dir, f"{model_name}_{ver}_epoch_{epoch}.pth")
+        ckpt_path = os.path.join(save_dir, f"{model_name}_{ver}.pth")
         checkpoint = {
             "epoch": epoch,
             "generator_state": generator.state_dict(),
@@ -306,7 +305,6 @@ def _ddp_train_worker(
     _setup_ddp(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
-    # Reduce workers for DDP to prevent deadlocks (max 2 per GPU)
     num_workers = min(cfg.NUM_WORKERS, 2)
     
     train_loader, val_loader, _ = create_dataloaders(
@@ -338,7 +336,6 @@ def _ddp_train_worker(
         num_features=feature_dim,
     ).to(device)
 
-    # Convert BatchNorm to SyncBatchNorm for DDP
     generator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(generator)
     discriminator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(discriminator)
 
@@ -364,7 +361,6 @@ def _ddp_train_worker(
         elif rank == 0:
             print(f"[DDP] Checkpoint path {checkpoint_path} not found, starting from scratch")
 
-    # Remove find_unused_parameters to prevent DDP deadlocks
     generator = DDP(generator, device_ids=[rank], find_unused_parameters=False)
     discriminator = DDP(discriminator, device_ids=[rank])
 
@@ -400,7 +396,6 @@ def _ddp_train_worker(
         for input_image, input_feat, target_image, wrong_image in train_loader:
             batch_time = time.time()
 
-            # Non-blocking transfers to prevent synchronization issues
             input_image = input_image.to(device, non_blocking=True)
             images = target_image.to(device, non_blocking=True)
             wrong_images = wrong_image.to(device, non_blocking=True)
@@ -451,10 +446,9 @@ def _ddp_train_worker(
             epoch_g_loss += g_loss.item()
             num_batches += 1
 
-        # Synchronize all processes before aggregating metrics
+
         dist.barrier()
-        
-        # All-reduce train losses across ranks
+
         loss_tensor = torch.tensor([epoch_d_loss, epoch_g_loss, num_batches], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
         total_d_loss, total_g_loss, total_batches = loss_tensor.tolist()
@@ -462,7 +456,7 @@ def _ddp_train_worker(
         avg_g_loss = total_g_loss / max(total_batches, 1)
 
         if (val_loader is not None) and (cfg.VAL_EPOCH <= 1 or epoch % cfg.VAL_EPOCH == 0):
-            # --- Validation metrics ---
+
             generator.eval()
             discriminator.eval()
 
@@ -475,7 +469,7 @@ def _ddp_train_worker(
 
             with torch.no_grad():
                 for val_batch_idx, (v_input_image, v_input_feat, v_target_image, _) in enumerate(val_loader):
-                    # Non-blocking transfers for validation
+
                     v_input_image = v_input_image.to(device, non_blocking=True)
                     v_images = v_target_image.to(device, non_blocking=True)
                     v_embeddings = v_input_feat.to(device, non_blocking=True)
@@ -494,8 +488,7 @@ def _ddp_train_worker(
 
                     clip_sum_batch, _ = compute_clip_metrics_batch(v_fake, v_images, clip_model, clip_preprocess, device)
                     val_clip_sum += clip_sum_batch
-                    
-                    # Average RGB distance
+ 
                     rgb_dist = calculate_avg_rgb_distance(v_fake, v_images)
                     val_rgb_dist_sum += rgb_dist * bs
 
@@ -506,13 +499,12 @@ def _ddp_train_worker(
                             v_images,
                             sample_dir,
                             epoch,
-                            prefix="val_ddp",
+                            prefix="val_cross",
                             num_samples=4,
                         )
 
                     val_count += bs
 
-            # Synchronize all processes before aggregating validation metrics
             dist.barrier()
             
             val_tensor = torch.tensor(
@@ -555,16 +547,10 @@ def _ddp_train_worker(
                         "val_ssim": avg_val_ssim,
                         "val_clip": avg_val_clip,
                         "val_rgb_dist": avg_val_rgb_dist,
-                        "train_g_loss": avg_g_loss,
-                        "val_l1": avg_val_l1,
-                        "val_psnr": avg_val_psnr,
-                        "val_ssim": avg_val_ssim,
-                        "val_clip": avg_val_clip,
                     }
                 )
 
-                # Save checkpoint after validation
-                val_ckpt = os.path.join(save_dir, f"{model_name}_{ver}_epoch_{epoch}.pth")
+                val_ckpt = os.path.join(save_dir, f"{model_name}_{ver}.pth")
                 torch.save(
                     {
                         "generator_state_dict": generator.module.state_dict(),
@@ -593,6 +579,11 @@ def _ddp_train_worker(
                     "epoch": epoch,
                     "train_d_loss": avg_d_loss,
                     "train_g_loss": avg_g_loss,
+                    "val_l1": 0,
+                    "val_psnr": 0,
+                    "val_ssim": 0,
+                    "val_clip": 0,
+                    "val_rgb_dist": 0,
                 }
             )
 
@@ -655,7 +646,6 @@ def main() -> None:
 
     device_ids = getattr(cfg, "DEVICE_IDS", [0])
 
-    # Multi-GPU DDP path
     if len(device_ids) > 1 and torch.cuda.is_available():
         print(
             f"Launching DDP training on devices {device_ids} for {epochs} epochs "
@@ -666,15 +656,13 @@ def main() -> None:
             retrain=retrain_flag,
             checkpoint_path=checkpoint_path,
             name="multimodal_basic",
-            version="ddp",
+            version="process",
         )
         return
 
-    # Single-GPU / CPU path
     device_index = device_ids[0] if torch.cuda.is_available() else None
     device = torch.device(f"cuda:{device_index}" if device_index is not None else "cpu")
 
-    # Build dataloaders
     train_loader, val_loader, _ = create_dataloaders(
         batch_size=cfg.BATCH_SIZE_PER_GPU,
         num_workers=cfg.NUM_WORKERS,
@@ -682,7 +670,6 @@ def main() -> None:
         distributed=False,
     )
 
-    # Dataset / feature info for the user
     train_dataset = train_loader.dataset
     val_dataset = val_loader.dataset
     feature_dim = train_dataset.input_data.shape[1]
@@ -702,14 +689,14 @@ def main() -> None:
     generator = Generator(
         channels=cfg.CHANNELS,
         noise_dim=cfg.NOISE_DIM,
-        embed_dim=cfg.EMBEDDING_OUT_DIM,  # Use EMBEDDING_OUT_DIM as embed_dim
+        embed_dim=cfg.EMBEDDING_OUT_DIM, 
         num_features=feature_dim,
         initial_image=cfg.INITIAL_IMAGE,
     ).to(device)
     
     discriminator = Discriminator(
         channels=cfg.CHANNELS,
-        embed_dim=cfg.EMBEDDING_OUT_DIM,  # Use EMBEDDING_OUT_DIM as embed_dim
+        embed_dim=cfg.EMBEDDING_OUT_DIM,  
         num_features=feature_dim,
     ).to(device)
 
@@ -728,7 +715,7 @@ def main() -> None:
         reload=retrain_flag,
         checkpoint_path=checkpoint_path,
         name="multimodal_basic",
-        version="single"
+        version="process"
     )
 
 

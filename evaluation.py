@@ -16,7 +16,7 @@ from torchvision import transforms
 from PIL import Image
 import pandas as pd
 import numpy as np
-from models.multimodal_basic import Generator
+from models.multimodal_self import Generator
 from utils.training import (
     calculate_psnr,
     calculate_ssim,
