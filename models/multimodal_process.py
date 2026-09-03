@@ -50,23 +50,33 @@ class ImageEmbedding(nn.Module):
     
     
 class SelfAttention(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, num_heads=8):
         super(SelfAttention, self).__init__()
-        self.query = nn.Conv2d(in_channels, in_channels // 8, 1)
-        self.key = nn.Conv2d(in_channels, in_channels // 8, 1)
-        self.value = nn.Conv2d(in_channels, in_channels, 1)
+        assert in_channels % num_heads == 0, "in_channels must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = in_channels // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.to_q = nn.Conv2d(in_channels, in_channels, 1)
+        self.to_k = nn.Conv2d(in_channels, in_channels, 1)
+        self.to_v = nn.Conv2d(in_channels, in_channels, 1)
+        self.to_out = nn.Conv2d(in_channels, in_channels, 1)
         self.gamma = nn.Parameter(torch.zeros(1))  # Learnable scalar
 
     def forward(self, x):
         B, C, H, W = x.size()
-        query = self.query(x).view(B, -1, H * W).permute(0, 2, 1)  # (B, HW, C//8)
-        key = self.key(x).view(B, -1, H * W)  # (B, C//8, HW)
-        attention = torch.bmm(query, key)  # (B, HW, HW)
+        HW = H * W
+
+        q = self.to_q(x).view(B, self.num_heads, self.head_dim, HW).permute(0, 1, 3, 2)  # [B, h, HW, hd]
+        k = self.to_k(x).view(B, self.num_heads, self.head_dim, HW).permute(0, 1, 3, 2)  # [B, h, HW, hd]
+        v = self.to_v(x).view(B, self.num_heads, self.head_dim, HW).permute(0, 1, 3, 2)  # [B, h, HW, hd]
+
+        attention = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # [B, h, HW, HW]
         attention = F.softmax(attention, dim=-1)
 
-        value = self.value(x).view(B, -1, H * W)  # (B, C, HW)
-        out = torch.bmm(value, attention.permute(0, 2, 1))  # (B, C, HW)
-        out = out.view(B, C, H, W)
+        out = torch.matmul(attention, v)  # [B, h, HW, hd]
+        out = out.permute(0, 1, 3, 2).contiguous().view(B, C, H, W)
+        out = self.to_out(out)
         out = self.gamma * out + x
         return out
 
