@@ -14,7 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 import config as cfg
 from torch.amp import autocast, GradScaler
 
-from models.latent_diffusion import (
+from models.latent_diffusion_attn import (
     GaussianDiffusion,
     ModelEMA,
     LatentDiffusionConditioned,
@@ -109,9 +109,11 @@ def _save_checkpoint(model, optimizer, epoch, save_dir, version, ema_model=None)
 
     if ema_model is not None:
         checkpoint["ema_state_dict"] = ema_model.state_dict()
-    
-    filename = os.path.join(save_dir, f"diffusion_{version}_epoch_{epoch:04d}.pth")
-    torch.save(checkpoint, filename)
+
+    filename = os.path.join(save_dir, f"diffusion_{version}.pth")
+    tmp_filename = filename + ".tmp"
+    torch.save(checkpoint, tmp_filename)
+    os.replace(tmp_filename, filename)
     return filename
 
 

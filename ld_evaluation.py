@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 
-from models.latent_diffusion import (
+from models.latent_diffusion_attn import (
     GaussianDiffusion,
     LatentDiffusionConditioned,
     LatentDiffusionPipeline,
