@@ -171,14 +171,15 @@ def evaluate_test_set(
                 to_pil = transforms.ToPILImage()
                 for i in range(batch_size_local):
                     global_idx = (batch_idx * batch_size) + i
+                    target_name = os.path.basename(test_loader.dataset.target_paths[global_idx])
 
                     gen_img   = torch.clamp((generated_images[i].cpu() + 1) / 2, 0, 1)
                     tgt_img   = torch.clamp((target_image[i].cpu()     + 1) / 2, 0, 1)
                     inp_img   = torch.clamp((input_image[i].cpu()      + 1) / 2, 0, 1)
 
-                    to_pil(gen_img).save(os.path.join(generated_dir, f"{global_idx:05d}.png"))
-                    to_pil(tgt_img).save(os.path.join(target_dir_out, f"{global_idx:05d}.png"))
-                    to_pil(inp_img).save(os.path.join(input_dir_out,  f"{global_idx:05d}.png"))
+                    to_pil(gen_img).save(os.path.join(generated_dir, target_name))
+                    to_pil(tgt_img).save(os.path.join(target_dir_out, target_name))
+                    to_pil(inp_img).save(os.path.join(input_dir_out,  target_name))
             
             if (batch_idx + 1) % 5 == 0:
                 print(f"Processed {batch_idx + 1}/{len(test_loader)} batches...")
@@ -294,10 +295,11 @@ def generate_test_set(
             to_pil = transforms.ToPILImage()
             for i in range(batch_size_local):
                 global_idx = (batch_idx * batch_size) + i
+                target_name = os.path.basename(test_loader.dataset.target_paths[global_idx])
 
                 gen_img   = torch.clamp((generated_images[i].cpu() + 1) / 2, 0, 1)
 
-                to_pil(gen_img).save(os.path.join(generated_dir, f"{global_idx:05d}.png"))
+                to_pil(gen_img).save(os.path.join(generated_dir, target_name))
             
             if (batch_idx + 1) % 5 == 0:
                 print(f"Processed {batch_idx + 1}/{len(test_loader)} batches...")

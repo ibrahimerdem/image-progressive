@@ -1,7 +1,7 @@
 import os
 
 RUN_NAME = "diffusion"
-VERSION_NAME = "whole_plusl1"
+VERSION_NAME = "attentional"
 
 # Files
 DATA_DIR = "data"
@@ -29,7 +29,8 @@ TIMESTEPS = 1000
 SAMPLE_STEPS = 50     
 EMB_DIM = 768
 BASE_CHANNELS = 256
-VAL_EPOCH = 10
+VAL_EPOCH = 1001
+SAVE_EPOCH = 1
 SAMPLE_TEMPERATURE = 1.0
 SAMPLER_ETA = 1.0
 LOG_INTERVAL = 100   

@@ -26,6 +26,10 @@ echo "============================================"
 echo "Latent Diffusion Model Test Evaluation"
 echo "============================================"
 echo "LD Checkpoint:   ${LD_CHECKPOINT}"
+echo "Device / Batch / Steps: (from config.py)"
+echo "============================================"
+echo ""
+
 if [ -n "${VAE_CHECKPOINT}" ]; then
   python ld_evaluation.py \
     --checkpoint "${LD_CHECKPOINT}" \
@@ -35,16 +39,4 @@ else
   python ld_evaluation.py \
     --checkpoint "${LD_CHECKPOINT}" \
     "${@:2}"
-fi
-echo "Device / Batch / Steps: (from config.py)"
-echo "============================================"
-echo ""
-
-if [ -n "${VAE_CHECKPOINT}" ]; then
-  python ld_evaluation.py \
-    --checkpoint "${LD_CHECKPOINT}" \
-    --vae_checkpoint "${VAE_CHECKPOINT}"
-else
-  python ld_evaluation.py \
-    --checkpoint "${LD_CHECKPOINT}"
 fi

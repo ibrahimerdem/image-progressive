@@ -456,6 +456,10 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
             and val_loader is not None
             and (cfg.VAL_EPOCH <= 1 or epoch % cfg.VAL_EPOCH == 0)
         )
+        should_save = (
+            rank == 0
+            and (cfg.SAVE_EPOCH <= 1 or epoch % cfg.SAVE_EPOCH == 0)
+        )
         if should_validate:
             print(f"[D] Rank {rank} starting validation")
 
@@ -528,7 +532,7 @@ def _ddp_worker(rank, world_size, epochs, retrain, checkpoint_path, version):
                 print(f"[D] Epoch {epoch} Loss: {avg_loss:.4f} | Time: {elapsed:.2f}s")
                 metrics_logger.log({"epoch": epoch, "train_loss": avg_loss})
 
-            if should_validate:
+            if should_save:
                 saved_path = _save_checkpoint(
                     model, optimizer, epoch, save_dir, version,
                     ema_model=ema_helper.ema,
