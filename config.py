@@ -1,7 +1,7 @@
 import os
 
 RUN_NAME = "diffusion"
-VERSION_NAME = "attentional"
+VERSION_NAME = "attentional_norgb"
 
 # Files
 DATA_DIR = "data"
@@ -37,7 +37,7 @@ LOG_INTERVAL = 100
 ATTENTION_HEADS = 4
 EMA_DECAY = 0.999
 GRAD_CLIP = 1.0
-RGB_LOSS_WEIGHT = 0.05
+RGB_LOSS_WEIGHT = 0.00
 DDP_TIMEOUT_MINUTES = 30
 
 # vae
